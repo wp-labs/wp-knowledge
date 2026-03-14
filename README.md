@@ -22,7 +22,7 @@
 
 ```toml
 [dependencies]
-wp-knowledge = "1.19.2"
+wp-knowledge = "0.10.3"
 ```
 
 ```rust
