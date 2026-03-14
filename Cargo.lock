@@ -2384,7 +2384,7 @@ dependencies = [
 
 [[package]]
 name = "wp-knowledge"
-version = "1.19.2"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "chrono",
