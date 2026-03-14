@@ -2,3 +2,5 @@
 /.run
 /.tmp_udf_*
 /wp_bench_authority.sqlite
+.report
+.run.gxl
