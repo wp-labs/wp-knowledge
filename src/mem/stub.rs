@@ -15,10 +15,6 @@ impl DBQuery for StubMDB {
         Ok(Vec::new())
     }
 
-    fn query_cipher(&self, _table: &str) -> KnowledgeResult<Vec<String>> {
-        Ok(vec![])
-    }
-
     fn query_row_params<P: Params>(&self, _sql: &str, _params: P) -> KnowledgeResult<RowData> {
         Ok(vec![])
     }

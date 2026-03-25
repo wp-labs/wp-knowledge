@@ -38,27 +38,31 @@ fn load_knowdb_v2_and_query() {
     let _root = ensure_packaged_knowdb_initialized();
 
     // 1) 命名参数查询 example
-    let params = [DataField::from_chars(":name".to_string(), "令狐冲".to_string())];
-    let rows =
-        kdb::query_fields("SELECT pinying FROM example WHERE name=:name", &params).expect("query example");
+    let params = [DataField::from_chars(
+        ":name".to_string(),
+        "令狐冲".to_string(),
+    )];
+    let rows = kdb::query_fields("SELECT pinying FROM example WHERE name=:name", &params)
+        .expect("query example");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get_name(), "pinying");
     assert_eq!(rows[0].to_string(), "chars(linghuchong)");
 
     let compat_params = [(":name", &"令狐冲" as &dyn rusqlite::ToSql)];
-    let compat_rows = kdb::query_named("SELECT pinying FROM example WHERE name=:name", &compat_params)
-        .expect("query example via compatibility wrapper");
+    let compat_rows = kdb::query_named(
+        "SELECT pinying FROM example WHERE name=:name",
+        &compat_params,
+    )
+    .expect("query example via compatibility wrapper");
     assert_eq!(compat_rows.len(), 1);
     assert_eq!(compat_rows[0].to_string(), "chars(linghuchong)");
 
-    // 2) 读取词表 address（query_cipher）
-    let vals = kdb::query_cipher("address").expect("cipher address");
-    assert!(vals.iter().any(|v| v == "address_0"));
-
-    // 3) 白名单拦截未知表
-    let err = kdb::query_cipher("not_exist").expect_err("deny unknown table");
-    let msg = format!("{}", err);
-    assert!(msg.contains("not allowed"));
+    // 2) 直接通过通用查询接口读取词表
+    let rows = kdb::query("SELECT value FROM address").expect("query address values");
+    assert!(
+        rows.iter()
+            .any(|row| row[0].to_string() == "chars(address_0)")
+    );
 }
 
 #[test]
@@ -66,7 +70,10 @@ fn query_zone_table_segments() {
     let _root = ensure_packaged_knowdb_initialized();
 
     let query_ip = "10.0.74.45";
-    let ip_param = [DataField::from_chars(":ip".to_string(), query_ip.to_string())];
+    let ip_param = [DataField::from_chars(
+        ":ip".to_string(),
+        query_ip.to_string(),
+    )];
     let rows = kdb::query_fields(
         "SELECT zone FROM zone WHERE ip4_between(:ip, start_ip_int, end_ip_int)=1 LIMIT 1",
         &ip_param,

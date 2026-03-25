@@ -122,7 +122,7 @@
   - 提供 query plan / query request 执行
 
 - `Facade Compatibility Layer`
-  - 暴露现有 `query/query_row/query_named/query_cipher/cache_query`
+  - 暴露现有 `query/query_row/query_named/cache_query`
   - 把老接口适配到新 runtime
 
 ## 核心抽象
@@ -290,7 +290,6 @@ pub struct ResultCacheKey {
 
 - 结果缓存默认关闭
 - 由调用方或规则层显式启用
-- `query_cipher` 可以默认启用全局缓存
 
 #### 失效机制
 
@@ -394,7 +393,6 @@ struct ThreadLocalState {
 - `query_row`
 - `query_named`
 - `query_named_fields`
-- `query_cipher`
 - `cache_query`
 
 但内部改造为：
@@ -501,7 +499,7 @@ reload 流程：
 
 - 接入 `moka`
 - metadata cache 先替换 `COLNAME_CACHE`
-- result cache 先只给 `query_cipher` 和显式声明可缓存的 query 使用
+- result cache 先只给显式声明可缓存的 query 使用
 
 ### 阶段 4：改造 ThreadClonedMDB
 

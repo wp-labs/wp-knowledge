@@ -29,8 +29,6 @@ pub trait DBQuery {
         sql: &str,
         params: &[DataField; 2],
     ) -> KnowledgeResult<RowData>;
-
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>>;
 }
 
 pub trait ToSqlParams<'a, X> {

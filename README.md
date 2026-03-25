@@ -55,7 +55,6 @@ let row = facade::query_row("SELECT COUNT(*) AS total FROM example")?;
 - 不再构建本地 `authority.sqlite`
 - 推荐通过 `facade::query_fields/cache_query_fields` 使用 provider-neutral 参数接口
 - `facade::query_named/cache_query` 仍保留，作为兼容旧版 SQLite 参数调用方式的 wrapper
-- 表白名单仍然由 `allowed_tables` 控制
 
 示例：
 
@@ -65,7 +64,6 @@ version = 2
 [provider]
 kind = "postgres"
 connection_uri = "postgres://user:pass@127.0.0.1:5432/demo"
-allowed_tables = ["cipher_demo", "zone"]
 ```
 
 命名参数在 PostgreSQL 中会自动从 `:name` 重写为 `$1/$2/...`，调用层不需要改 SQL 写法。

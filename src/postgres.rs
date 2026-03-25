@@ -1,10 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use orion_error::{ToStructError, UvsFrom};
 use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, Row};
+use r2d2::{ManageConnection, Pool, PooledConnection};
 use serde_json::Value as JsonValue;
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
@@ -14,38 +15,88 @@ use crate::mem::RowData;
 #[derive(Debug, Clone)]
 pub struct PostgresProviderConfig {
     connection_uri: String,
+    pool_size: u32,
 }
 
 impl PostgresProviderConfig {
     pub fn new(connection_uri: impl Into<String>) -> Self {
         Self {
             connection_uri: connection_uri.into(),
+            pool_size: 8,
         }
     }
 
     pub fn connection_uri(&self) -> &str {
         &self.connection_uri
     }
+
+    pub fn pool_size(&self) -> u32 {
+        self.pool_size
+    }
+
+    pub fn with_pool_size(mut self, pool_size: Option<u32>) -> Self {
+        if let Some(pool_size) = pool_size.filter(|size| *size > 0) {
+            self.pool_size = pool_size;
+        }
+        self
+    }
 }
 
 pub struct PostgresProvider {
-    client: Mutex<Client>,
+    pool: Pool<PostgresConnectionManager>,
+}
+
+#[derive(Debug)]
+struct PostgresConnectionManager {
+    connection_uri: String,
+}
+
+impl PostgresConnectionManager {
+    fn new(connection_uri: impl Into<String>) -> Self {
+        Self {
+            connection_uri: connection_uri.into(),
+        }
+    }
+}
+
+impl ManageConnection for PostgresConnectionManager {
+    type Connection = Client;
+    type Error = postgres::Error;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        Client::connect(&self.connection_uri, NoTls)
+    }
+
+    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
+        conn.simple_query("SELECT 1").map(|_| ())
+    }
+
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        conn.is_closed()
+    }
 }
 
 impl PostgresProvider {
     pub fn connect(config: &PostgresProviderConfig) -> KnowledgeResult<Self> {
-        let client = Client::connect(config.connection_uri(), NoTls).map_err(|err| {
-            KnowledgeReason::from_conf()
-                .to_err()
-                .with_detail(format!("connect postgres failed: {err}"))
-        })?;
-        Ok(Self {
-            client: Mutex::new(client),
-        })
+        let manager = PostgresConnectionManager::new(config.connection_uri());
+        let pool = Pool::builder()
+            .max_size(config.pool_size())
+            .connection_timeout(Duration::from_secs(5))
+            .test_on_check_out(true)
+            .build(manager)
+            .map_err(|err| {
+                KnowledgeReason::from_conf()
+                    .to_err()
+                    .with_detail(format!("create postgres pool failed: {err}"))
+            })?;
+
+        validate_startup(&pool)?;
+
+        Ok(Self { pool })
     }
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        let mut client = self.client.lock().expect("postgres client lock poisoned");
+        let mut client = self.pool_conn("query")?;
         let rows = client.query(sql, &[]).map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
@@ -55,7 +106,7 @@ impl PostgresProvider {
     }
 
     pub fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
-        let mut client = self.client.lock().expect("postgres client lock poisoned");
+        let mut client = self.pool_conn("query_row")?;
         let rows = client.query(sql, &[]).map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
@@ -70,12 +121,16 @@ impl PostgresProvider {
 
     pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
         let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
-        let bind_values: Vec<PostgresBindValue> =
-            ordered_params.iter().map(|field| PostgresBindValue::from(*field)).collect();
-        let bind_refs: Vec<&(dyn ToSql + Sync)> =
-            bind_values.iter().map(PostgresBindValue::as_tosql).collect();
+        let bind_values: Vec<PostgresBindValue> = ordered_params
+            .iter()
+            .map(|field| PostgresBindValue::from(*field))
+            .collect();
+        let bind_refs: Vec<&(dyn ToSql + Sync)> = bind_values
+            .iter()
+            .map(PostgresBindValue::as_tosql)
+            .collect();
 
-        let mut client = self.client.lock().expect("postgres client lock poisoned");
+        let mut client = self.pool_conn("query_named")?;
         let rows = client.query(&rewritten_sql, &bind_refs).map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
@@ -88,27 +143,15 @@ impl PostgresProvider {
         }
     }
 
-    pub fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        let sql = format!("select value from {}", table);
-        let mut client = self.client.lock().expect("postgres client lock poisoned");
-        let rows = client.query(&sql, &[]).map_err(|err| {
-            KnowledgeReason::from_rule()
-                .to_err()
-                .with_detail(format!("postgres query_cipher failed: {err}"))
-        })?;
-
-        let mut values = Vec::with_capacity(rows.len());
-        for row in rows {
-            let value: Option<String> = row.try_get(0).map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres cipher value decode failed: {err}"))
-            })?;
-            if let Some(value) = value {
-                values.push(value);
-            }
-        }
-        Ok(values)
+    fn pool_conn(
+        &self,
+        action: &str,
+    ) -> KnowledgeResult<PooledConnection<PostgresConnectionManager>> {
+        self.pool.get().map_err(|err| {
+            KnowledgeReason::from_conf().to_err().with_detail(format!(
+                "postgres {action} failed to acquire pooled connection: {err}"
+            ))
+        })
     }
 }
 
@@ -155,6 +198,26 @@ impl From<&DataField> for PostgresBindValue {
             Value::MobilePhone(value) => PostgresBindValue::Text(value.0.to_string()),
         }
     }
+}
+
+fn validate_startup(pool: &Pool<PostgresConnectionManager>) -> KnowledgeResult<()> {
+    let mut client = pool.get().map_err(|err| {
+        KnowledgeReason::from_conf().to_err().with_detail(format!(
+            "postgres startup validation failed to acquire pooled connection: {err}"
+        ))
+    })?;
+
+    client
+        .simple_query("SELECT 1")
+        .map_err(|err| validation_err("connection", err))?;
+
+    Ok(())
+}
+
+fn validation_err(stage: &str, err: postgres::Error) -> wp_error::KnowledgeError {
+    KnowledgeReason::from_conf().to_err().with_detail(format!(
+        "postgres startup validation failed during {stage}: connection issue: {err}"
+    ))
 }
 
 fn normalize_param_name(name: &str) -> String {
@@ -311,13 +374,11 @@ fn map_value(row: &Row, idx: usize, name: &str, ty: &Type) -> KnowledgeResult<Da
             .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
             .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
             .pipe(Ok),
-        _ => Err(KnowledgeReason::from_rule()
-            .to_err()
-            .with_detail(format!(
-                "postgres column type not supported yet: {} ({})",
-                name,
-                ty.name()
-            ))),
+        _ => Err(KnowledgeReason::from_rule().to_err().with_detail(format!(
+            "postgres column type not supported yet: {} ({})",
+            name,
+            ty.name()
+        ))),
     }
 }
 
@@ -352,8 +413,11 @@ mod tests {
     #[test]
     fn rewrite_sql_ignores_colons_inside_strings() {
         let params = vec![DataField::from_digit(":id".to_string(), 7)];
-        let (sql, ordered) =
-            rewrite_sql("select ':id' as literal, id from demo where id=:id", &params).unwrap();
+        let (sql, ordered) = rewrite_sql(
+            "select ':id' as literal, id from demo where id=:id",
+            &params,
+        )
+        .unwrap();
         assert_eq!(sql, "select ':id' as literal, id from demo where id=$1");
         assert_eq!(ordered.len(), 1);
     }

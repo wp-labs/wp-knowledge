@@ -121,22 +121,6 @@ impl DBQuery for MemDB {
         super::query_util::query_first_row_cached(&conn, sql, params)
     }
 
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        let sql = format!("select value from {}", table);
-        let conn = self.conn.get().owe_res()?;
-        let mut stmt = conn.prepare(&sql).owe_rule()?;
-        let mut rows = stmt.query([]).owe_rule()?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().owe_rule()? {
-            let x = row.get_ref(0).owe_rule()?;
-            if let rusqlite::types::ValueRef::Text(val) = x {
-                result.push(String::from_utf8(val.to_vec()).owe_conf()?);
-            }
-        }
-
-        Ok(result)
-    }
-
     fn query_row_tdos<P: Params>(
         &self,
         _sql: &str,
@@ -602,18 +586,6 @@ mod tests {
         assert_eq!(row.len(), 2);
         assert_eq!(row[0].get_name(), "the number");
         assert_eq!(row[1].get_name(), "the text");
-        Ok(())
-    }
-
-    #[test]
-    fn test_query_cipher_basic() -> AnyResult<()> {
-        let db = MemDB::instance();
-        db.execute("CREATE TABLE cipher (value TEXT)")?;
-        db.execute("INSERT INTO cipher (value) VALUES ('A')")?;
-        db.execute("INSERT INTO cipher (value) VALUES ('B')")?;
-        let vals = db.query_cipher("cipher")?;
-        assert!(vals.contains(&"A".to_string()));
-        assert!(vals.contains(&"B".to_string()));
         Ok(())
     }
 

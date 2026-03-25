@@ -16,7 +16,10 @@ fn temp_test_dir() -> PathBuf {
         .as_nanos();
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join(".tmp")
-        .join(format!("postgres-testcontainers-{nanos}-{}", std::process::id()));
+        .join(format!(
+            "postgres-testcontainers-{nanos}-{}",
+            std::process::id()
+        ));
     fs::create_dir_all(&dir).expect("create temporary test directory");
     dir
 }
@@ -58,17 +61,11 @@ CREATE TABLE IF NOT EXISTS wp_knowledge_pg_lookup (
     name TEXT NOT NULL,
     pinying TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS wp_knowledge_pg_cipher (
-    value TEXT NOT NULL
-);
 TRUNCATE TABLE wp_knowledge_pg_lookup;
-TRUNCATE TABLE wp_knowledge_pg_cipher;
 INSERT INTO wp_knowledge_pg_lookup (id, name, pinying)
 VALUES
     (1, '令狐冲', 'linghuchong'),
     (2, '小龙女', 'xiaolongnu');
-INSERT INTO wp_knowledge_pg_cipher (value)
-VALUES ('cipher_0'), ('cipher_1');
 "#,
         )
         .expect("seed postgres test data");
@@ -84,13 +81,15 @@ version = 2
 [provider]
 kind = "postgres"
 connection_uri = "{url}"
-allowed_tables = ["wp_knowledge_pg_cipher"]
 "#
         ),
     )
     .expect("write knowdb postgres config");
 
-    let authority_uri = format!("file:{}?mode=rwc&uri=true", tmp.join("unused.sqlite").display());
+    let authority_uri = format!(
+        "file:{}?mode=rwc&uri=true",
+        tmp.join("unused.sqlite").display()
+    );
     kdb::init_thread_cloned_from_knowdb(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).as_path(),
         &conf_path,
@@ -99,7 +98,10 @@ allowed_tables = ["wp_knowledge_pg_cipher"]
     )
     .expect("init postgres provider from knowdb");
 
-    let params = [DataField::from_chars(":name".to_string(), "令狐冲".to_string())];
+    let params = [DataField::from_chars(
+        ":name".to_string(),
+        "令狐冲".to_string(),
+    )];
     let row = kdb::query_fields(
         "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name",
         &params,
@@ -108,10 +110,4 @@ allowed_tables = ["wp_knowledge_pg_cipher"]
     assert_eq!(row.len(), 1);
     assert_eq!(row[0].get_name(), "pinying");
     assert_eq!(row[0].to_string(), "chars(linghuchong)");
-
-    let values = kdb::query_cipher("wp_knowledge_pg_cipher").expect("postgres cipher query");
-    assert_eq!(values, vec!["cipher_0".to_string(), "cipher_1".to_string()]);
-
-    let denied = kdb::query_cipher("wp_knowledge_pg_lookup").expect_err("whitelist deny");
-    assert!(format!("{denied}").contains("not allowed"));
 }

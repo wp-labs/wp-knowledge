@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use postgres::{Client, NoTls};
 use wp_knowledge::facade as kdb;
@@ -20,8 +22,8 @@ fn ensure_postgres_provider_initialized() -> String {
     INIT.get_or_init(|| {
         let url = postgres_url();
 
-        let mut admin = Client::connect(&url, NoTls)
-            .expect("connect to WP_KDB_TEST_POSTGRES_URL failed");
+        let mut admin =
+            Client::connect(&url, NoTls).expect("connect to WP_KDB_TEST_POSTGRES_URL failed");
         admin
             .batch_execute(
                 r#"
@@ -30,17 +32,11 @@ CREATE TABLE IF NOT EXISTS wp_knowledge_pg_lookup (
     name TEXT NOT NULL,
     pinying TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS wp_knowledge_pg_cipher (
-    value TEXT NOT NULL
-);
 TRUNCATE TABLE wp_knowledge_pg_lookup;
-TRUNCATE TABLE wp_knowledge_pg_cipher;
 INSERT INTO wp_knowledge_pg_lookup (id, name, pinying)
 VALUES
     (1, '令狐冲', 'linghuchong'),
     (2, '小龙女', 'xiaolongnu');
-INSERT INTO wp_knowledge_pg_cipher (value)
-VALUES ('cipher_0'), ('cipher_1');
 "#,
             )
             .expect("seed postgres_provider test data failed");
@@ -58,13 +54,15 @@ version = 2
 [provider]
 kind = "postgres"
 connection_uri = "{url}"
-allowed_tables = ["wp_knowledge_pg_cipher"]
 "#
             ),
         )
         .expect("write postgres_provider knowdb config failed");
 
-        let authority_uri = format!("file:{}?mode=rwc&uri=true", tmp.join("unused.sqlite").display());
+        let authority_uri = format!(
+            "file:{}?mode=rwc&uri=true",
+            tmp.join("unused.sqlite").display()
+        );
         kdb::init_thread_cloned_from_knowdb(
             &root,
             &conf_path,
@@ -83,7 +81,10 @@ allowed_tables = ["wp_knowledge_pg_cipher"]
 fn postgres_provider_query_and_cipher() {
     let _url = ensure_postgres_provider_initialized();
 
-    let params = [DataField::from_chars(":name".to_string(), "令狐冲".to_string())];
+    let params = [DataField::from_chars(
+        ":name".to_string(),
+        "令狐冲".to_string(),
+    )];
     let row = kdb::query_fields(
         "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name",
         &params,
@@ -93,9 +94,33 @@ fn postgres_provider_query_and_cipher() {
     assert_eq!(row[0].get_name(), "pinying");
     assert_eq!(row[0].to_string(), "chars(linghuchong)");
 
-    let values = kdb::query_cipher("wp_knowledge_pg_cipher").expect("postgres cipher query");
-    assert_eq!(values, vec!["cipher_0".to_string(), "cipher_1".to_string()]);
+    let started = Instant::now();
+    thread::scope(|scope| {
+        for _ in 0..6 {
+            scope.spawn(|| {
+                let params = [DataField::from_chars(
+                    ":name".to_string(),
+                    "令狐冲".to_string(),
+                )];
+                let row = kdb::query_fields(
+                    r#"
+WITH wait_for_pool AS (SELECT pg_sleep(0.2))
+SELECT pinying
+FROM wp_knowledge_pg_lookup
+CROSS JOIN wait_for_pool
+WHERE name=:name
+"#,
+                    &params,
+                )
+                .expect("concurrent postgres query");
+                assert_eq!(row[0].to_string(), "chars(linghuchong)");
+            });
+        }
+    });
 
-    let denied = kdb::query_cipher("wp_knowledge_pg_lookup").expect_err("whitelist deny");
-    assert!(format!("{denied}").contains("not allowed"));
+    assert!(
+        started.elapsed() < Duration::from_millis(900),
+        "postgres pooled queries look serialized: {:?}",
+        started.elapsed()
+    );
 }

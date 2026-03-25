@@ -41,7 +41,7 @@ pub struct ProviderSpec {
     pub kind: ProviderKind,
     pub connection_uri: String,
     #[serde(default)]
-    pub allowed_tables: Vec<String>,
+    pub pool_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -403,7 +403,6 @@ version = 2
 [provider]
 kind = "postgres"
 connection_uri = "postgres://demo:demo@127.0.0.1/demo"
-allowed_tables = ["cipher_demo"]
 "#,
             &dict,
         )
@@ -412,7 +411,10 @@ allowed_tables = ["cipher_demo"]
         assert!(conf.tables.is_empty());
         let provider = conf.provider.expect("provider");
         assert!(matches!(provider.kind, ProviderKind::Postgres));
-        assert_eq!(provider.allowed_tables, vec!["cipher_demo"]);
+        assert_eq!(
+            provider.connection_uri,
+            "postgres://demo:demo@127.0.0.1/demo"
+        );
     }
 }
 

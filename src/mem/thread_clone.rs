@@ -83,20 +83,4 @@ impl DBQuery for ThreadClonedMDB {
         // not used in current benchmarks
         Ok(vec![])
     }
-
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        self.with_tls_conn(|conn| {
-            let sql = format!("select value from {}", table);
-            let mut stmt = conn.prepare(&sql).owe_rule()?;
-            let mut rows = stmt.query([]).owe_rule()?;
-            let mut result = Vec::new();
-            while let Some(row) = rows.next().owe_rule()? {
-                let x = row.get_ref(0).owe_rule()?;
-                if let rusqlite::types::ValueRef::Text(val) = x {
-                    result.push(String::from_utf8(val.to_vec()).owe_rule()?);
-                }
-            }
-            Ok(result)
-        })
-    }
 }

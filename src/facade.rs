@@ -1,9 +1,8 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use orion_error::{ErrorWith, ToStructError, UvsFrom};
+use orion_error::{ToStructError, UvsFrom};
 use rusqlite::ToSql;
 use rusqlite::{Connection, OpenFlags};
 use wp_error::{KnowledgeReason, KnowledgeResult};
@@ -24,7 +23,6 @@ pub trait QueryFacade: Send + Sync {
     fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>>;
     fn query_row(&self, sql: &str) -> KnowledgeResult<RowData>;
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData>;
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>>;
 }
 
 fn query_named_fields_via_sqlite<Q: DBQuery>(
@@ -56,10 +54,6 @@ impl QueryFacade for ThreadClonedMDB {
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
         query_named_fields_via_sqlite(self, sql, params)
     }
-
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        DBQuery::query_cipher(self, table)
-    }
 }
 
 struct MemProvider(MemDB);
@@ -76,10 +70,6 @@ impl QueryFacade for MemProvider {
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
         query_named_fields_via_sqlite(&self.0, sql, params)
     }
-
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        DBQuery::query_cipher(&self.0, table)
-    }
 }
 
 impl QueryFacade for PostgresProvider {
@@ -94,14 +84,9 @@ impl QueryFacade for PostgresProvider {
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
         PostgresProvider::query_named_fields(self, sql, params)
     }
-
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        PostgresProvider::query_cipher(self, table)
-    }
 }
 
 static PROVIDER: OnceLock<Arc<dyn QueryFacade>> = OnceLock::new();
-static TABLE_WHITELIST: OnceLock<HashSet<String>> = OnceLock::new();
 
 pub fn init_thread_cloned_from_authority(authority_uri: &str) -> KnowledgeResult<()> {
     let tc = ThreadClonedMDB::from_authority(authority_uri);
@@ -118,12 +103,9 @@ pub fn init_mem_provider(memdb: MemDB) -> KnowledgeResult<()> {
     res
 }
 
-pub fn init_postgres_provider(
-    connection_uri: &str,
-    allowed_tables: &[String],
-) -> KnowledgeResult<()> {
-    let provider = PostgresProvider::connect(&PostgresProviderConfig::new(connection_uri))?;
-    set_table_whitelist(allowed_tables.iter().cloned());
+pub fn init_postgres_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
+    let config = PostgresProviderConfig::new(connection_uri).with_pool_size(pool_size);
+    let provider = PostgresProvider::connect(&config)?;
     set_provider(Arc::new(provider))
 }
 
@@ -133,10 +115,6 @@ fn set_provider(p: Arc<dyn QueryFacade>) -> KnowledgeResult<()> {
             .to_err()
             .with_detail("knowledge provider already initialized")
     })
-}
-
-fn set_table_whitelist(tables: impl IntoIterator<Item = String>) {
-    let _ = TABLE_WHITELIST.set(tables.into_iter().collect::<HashSet<_>>());
 }
 
 fn get_provider() -> KnowledgeResult<&'static Arc<dyn QueryFacade>> {
@@ -171,18 +149,6 @@ pub fn query_named<'a>(
 ) -> KnowledgeResult<RowData> {
     let fields = named_params_to_fields(params)?;
     query_fields(sql, &fields)
-}
-
-pub fn query_cipher(table: &str) -> KnowledgeResult<Vec<String>> {
-    if let Some(wl) = TABLE_WHITELIST.get()
-        && !wl.contains(table)
-    {
-        return Err(KnowledgeReason::from_logic()
-            .to_err()
-            .with_detail("table not allowed by knowdb whitelist")
-            .with(("table", table)));
-    }
-    get_provider()?.query_cipher(table)
 }
 
 pub fn cache_query_fields<const N: usize>(
@@ -252,15 +218,14 @@ pub fn init_thread_cloned_from_knowdb(
                 info_ctrl!("init postgres knowdb provider({}) ", conf_abs.display(),);
                 return init_postgres_provider(
                     provider.connection_uri.as_str(),
-                    &provider.allowed_tables,
+                    provider.pool_size,
                 );
             }
             ProviderKind::SqliteAuthority => {}
         }
     }
 
-    let tables =
-        crate::loader::build_authority_from_knowdb(root, knowdb_conf, authority_uri, dict)?;
+    crate::loader::build_authority_from_knowdb(root, knowdb_conf, authority_uri, dict)?;
     let ro_uri = if let Some(rest) = authority_uri.strip_prefix("file:") {
         let path_part = rest.split('?').next().unwrap_or(rest);
         format!("file:{}?mode=ro&uri=true", path_part)
@@ -274,7 +239,6 @@ pub fn init_thread_cloned_from_knowdb(
         tc.with_tls_conn(|_| Ok(()))?;
     }
 
-    set_table_whitelist(tables);
     info_ctrl!("init authority knowdb success({}) ", knowdb_conf.display(),);
     set_provider(Arc::new(tc))
 }
