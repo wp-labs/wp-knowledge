@@ -23,7 +23,25 @@ pub struct KnowDbConf {
     pub default: OptLoadSpec,
     #[serde(default)]
     pub csv: CsvSpec,
+    #[serde(default)]
+    pub provider: Option<ProviderSpec>,
+    #[serde(default)]
     pub tables: Vec<TableSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    SqliteAuthority,
+    Postgres,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderSpec {
+    pub kind: ProviderKind,
+    pub connection_uri: String,
+    #[serde(default)]
+    pub allowed_tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,7 +188,7 @@ pub fn build_authority_from_knowdb(
     Ok(loaded_names)
 }
 
-fn parse_knowdb_conf(
+pub fn parse_knowdb_conf(
     root: &Path,
     conf_path: &Path,
     dict: &EnvDict,
@@ -369,6 +387,33 @@ fn build_csv_reader(
         rdr_b.trim(csv::Trim::All);
     }
     rdr_b.from_path(data_path).owe_res()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_external_provider_spec() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider]
+kind = "postgres"
+connection_uri = "postgres://demo:demo@127.0.0.1/demo"
+allowed_tables = ["cipher_demo"]
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with provider");
+
+        assert!(conf.tables.is_empty());
+        let provider = conf.provider.expect("provider");
+        assert!(matches!(provider.kind, ProviderKind::Postgres));
+        assert_eq!(provider.allowed_tables, vec!["cipher_demo"]);
+    }
 }
 
 fn select_indices_by_header(

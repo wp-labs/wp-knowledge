@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use orion_variate::EnvDict;
 use wp_knowledge::facade as kdb;
+use wp_model_core::model::DataField;
 
 fn uniq_tmp_dir() -> PathBuf {
     use rand::{Rng, rng};
@@ -72,17 +73,17 @@ CREATE INDEX IF NOT EXISTS idx_{table}_end   ON {table}(ip_end_int);
     );
 
     // 3) query with UDF on read connection
-    let rows = kdb::query_named(
+    let rows = kdb::query_fields(
         "SELECT zone FROM zone WHERE ip4_between(:ip, ip_start_int, ip_end_int)=1 LIMIT 1",
-        &[(":ip", &"10.0.10.5" as &dyn rusqlite::ToSql)],
+        &[DataField::from_chars(":ip".to_string(), "10.0.10.5".to_string())],
     )
     .expect("query zone by ip");
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].to_string(), "chars(work_zone)");
 
-    let rows = kdb::query_named(
+    let rows = kdb::query_fields(
         "SELECT cidr4_contains(:ip, '10.0.0.0/8') AS ok",
-        &[(":ip", &"10.1.2.3" as &dyn rusqlite::ToSql)],
+        &[DataField::from_chars(":ip".to_string(), "10.1.2.3".to_string())],
     )
     .expect("query cidr contains");
     assert_eq!(rows[0].to_string(), "digit(1)");
@@ -146,9 +147,9 @@ CREATE INDEX IF NOT EXISTS idx_{table}_end   ON {table}(ip_end_int);
     );
 
     // 3) query with integer compare on read connection
-    let rows = kdb::query_named(
+    let rows = kdb::query_fields(
         "SELECT zone FROM zone WHERE ip_start_int <= ip4_int(:ip) AND ip_end_int >= ip4_int(:ip) LIMIT 1",
-        &[(":ip", &"10.0.10.5" as &dyn rusqlite::ToSql)],
+        &[DataField::from_chars(":ip".to_string(), "10.0.10.5".to_string())],
     )
     .expect("query zone by ip (int compare)");
     assert_eq!(rows.len(), 1);
