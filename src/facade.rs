@@ -16,6 +16,7 @@ use crate::mem::RowData;
 use crate::mem::SqlNamedParam;
 use crate::mem::memdb::MemDB;
 use crate::mem::thread_clone::ThreadClonedMDB;
+use crate::mysql::{MySqlProvider, MySqlProviderConfig};
 use crate::param::named_params_to_fields;
 use crate::postgres::{PostgresProvider, PostgresProviderConfig};
 
@@ -86,6 +87,20 @@ impl QueryFacade for PostgresProvider {
     }
 }
 
+impl QueryFacade for MySqlProvider {
+    fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+        MySqlProvider::query(self, sql)
+    }
+
+    fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
+        MySqlProvider::query_row(self, sql)
+    }
+
+    fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+        MySqlProvider::query_named_fields(self, sql, params)
+    }
+}
+
 static PROVIDER: OnceLock<Arc<dyn QueryFacade>> = OnceLock::new();
 
 pub fn init_thread_cloned_from_authority(authority_uri: &str) -> KnowledgeResult<()> {
@@ -106,6 +121,12 @@ pub fn init_mem_provider(memdb: MemDB) -> KnowledgeResult<()> {
 pub fn init_postgres_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
     let config = PostgresProviderConfig::new(connection_uri).with_pool_size(pool_size);
     let provider = PostgresProvider::connect(&config)?;
+    set_provider(Arc::new(provider))
+}
+
+pub fn init_mysql_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
+    let config = MySqlProviderConfig::new(connection_uri).with_pool_size(pool_size);
+    let provider = MySqlProvider::connect(&config)?;
     set_provider(Arc::new(provider))
 }
 
@@ -220,6 +241,10 @@ pub fn init_thread_cloned_from_knowdb(
                     provider.connection_uri.as_str(),
                     provider.pool_size,
                 );
+            }
+            ProviderKind::Mysql => {
+                info_ctrl!("init mysql knowdb provider({}) ", conf_abs.display(),);
+                return init_mysql_provider(provider.connection_uri.as_str(), provider.pool_size);
             }
             ProviderKind::SqliteAuthority => {}
         }

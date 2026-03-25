@@ -7,9 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **MySQL Provider**: Add external MySQL query provider support with `kind = "mysql"`, connection-pool sizing via `[provider].pool_size`, and an ignored integration test driven by `WP_KDB_TEST_MYSQL_URL`
+- **Tests/MySQL**: Add compose-managed local MySQL validation via `tests/test-mysql-provider.sh` and extend `tests/docker-compose.yml` with a reusable `mysql` service
+
 ### Changed
 - **Postgres Provider**: Replace the single shared `postgres::Client` with an `r2d2` connection pool and allow configuring pool size via `[provider].pool_size`
-- **Provider Config**: Remove `allowed_tables` from external PostgreSQL provider configuration and keep runtime access on the general SQL query path only
+- **Provider Config**: Remove `allowed_tables` from external provider configuration and keep runtime access on the general SQL query path only
 
 ### Removed
 - **Facade/API**: Remove `facade::query_cipher(...)` and the related `DBQuery::query_cipher(...)` implementations from memory, thread-cloned, stub, and PostgreSQL providers

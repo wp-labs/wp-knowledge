@@ -5,6 +5,7 @@ pub use crate::mem::memdb::MDBEnum;
 pub mod cache_util;
 pub mod facade;
 pub mod loader;
+mod mysql;
 mod param;
 mod postgres;
 pub mod sqlite_ext;

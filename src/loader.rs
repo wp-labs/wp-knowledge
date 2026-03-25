@@ -34,6 +34,7 @@ pub struct KnowDbConf {
 pub enum ProviderKind {
     SqliteAuthority,
     Postgres,
+    Mysql,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -415,6 +416,31 @@ connection_uri = "postgres://demo:demo@127.0.0.1/demo"
             provider.connection_uri,
             "postgres://demo:demo@127.0.0.1/demo"
         );
+    }
+
+    #[test]
+    fn parse_mysql_provider_spec() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider]
+kind = "mysql"
+connection_uri = "mysql://demo:demo@127.0.0.1:3306/demo"
+pool_size = 12
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with mysql provider");
+
+        let provider = conf.provider.expect("provider");
+        assert!(matches!(provider.kind, ProviderKind::Mysql));
+        assert_eq!(
+            provider.connection_uri,
+            "mysql://demo:demo@127.0.0.1:3306/demo"
+        );
+        assert_eq!(provider.pool_size, Some(12));
     }
 }
 
