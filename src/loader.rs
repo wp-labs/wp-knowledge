@@ -418,6 +418,43 @@ fn build_csv_reader(
     rdr_b.from_path(data_path).owe_res()
 }
 
+fn select_indices_by_header(
+    headers: &csv::StringRecord,
+    wanted: &[String],
+) -> KnowledgeResult<Vec<usize>> {
+    let mut out = Vec::with_capacity(wanted.len());
+    for name in wanted {
+        let pos = headers.iter().position(|h| h == name).ok_or_else(|| {
+            KnowledgeReason::from_conf()
+                .to_err()
+                .with_detail("header not found")
+        })?;
+        out.push(pos);
+    }
+    Ok(out)
+}
+
+fn extract_row_refs<'a>(
+    record: &'a csv::StringRecord,
+    col_indices: &[usize],
+    bad: &mut usize,
+    load: &OptLoadSpec,
+) -> anyhow::Result<Option<Vec<&'a str>>> {
+    let mut vs: Vec<&str> = Vec::with_capacity(col_indices.len());
+    for &idx in col_indices {
+        if idx >= record.len() {
+            if matches!(load.on_error, OnError::Skip) {
+                *bad += 1;
+                return Ok(None);
+            } else {
+                anyhow::bail!("missing column at index {}", idx);
+            }
+        }
+        vs.push(record.get(idx).unwrap_or(""));
+    }
+    Ok(Some(vs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,42 +544,4 @@ ttl_ms = 1500
         assert_eq!(conf.cache.capacity, 256);
         assert_eq!(conf.cache.ttl_ms, 1500);
     }
-}
-
-fn select_indices_by_header(
-    headers: &csv::StringRecord,
-    wanted: &[String],
-) -> KnowledgeResult<Vec<usize>> {
-    let mut out = Vec::with_capacity(wanted.len());
-    for name in wanted {
-        let pos = headers.iter().position(|h| h == name).ok_or_else(|| {
-            KnowledgeReason::from_conf()
-                .to_err()
-                .with_detail("header not found")
-        })?;
-        out.push(pos);
-    }
-    Ok(out)
-}
-
-fn extract_row_refs<'a>(
-    record: &'a csv::StringRecord,
-    col_indices: &[usize],
-    bad: &mut usize,
-    load: &OptLoadSpec,
-) -> anyhow::Result<Option<Vec<&'a str>>> {
-    let mut vs: Vec<&str> = Vec::with_capacity(col_indices.len());
-    for &idx in col_indices {
-        if idx >= record.len() {
-            if matches!(load.on_error, OnError::Skip) {
-                *bad += 1;
-                return Ok(None);
-            } else {
-                // 将错误在调用方 bail（构建 anyhow）
-                anyhow::bail!("missing column at index {}", idx);
-            }
-        }
-        vs.push(record.get(idx).unwrap_or(""));
-    }
-    Ok(Some(vs))
 }

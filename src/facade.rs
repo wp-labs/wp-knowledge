@@ -838,7 +838,7 @@ connection_uri = "{connection_uri}"
         assert_eq!(row[0].to_string(), "chars(first)");
         let after_first = runtime_snapshot().metadata_cache_len;
         assert!(
-            after_first >= before + 1,
+            after_first > before,
             "metadata cache did not record first generation entry: before={before} after_first={after_first}"
         );
 
@@ -852,7 +852,7 @@ connection_uri = "{connection_uri}"
         assert_eq!(row[0].to_string(), "chars(second)");
         let after_second = runtime_snapshot().metadata_cache_len;
         assert!(
-            after_second >= after_first + 1,
+            after_second > after_first,
             "metadata cache did not keep a distinct generation entry: after_first={after_first} after_second={after_second}"
         );
     }
@@ -918,10 +918,10 @@ connection_uri = "{connection_uri}"
         assert_eq!(row[0].to_string(), "chars(first)");
 
         let after = runtime_snapshot();
-        assert!(after.local_cache_hits >= before.local_cache_hits + 1);
-        assert!(after.local_cache_misses >= before.local_cache_misses + 1);
-        assert!(after.result_cache_misses >= before.result_cache_misses + 1);
-        assert!(after.metadata_cache_misses >= before.metadata_cache_misses + 1);
+        assert!(after.local_cache_hits > before.local_cache_hits);
+        assert!(after.local_cache_misses > before.local_cache_misses);
+        assert!(after.result_cache_misses > before.result_cache_misses);
+        assert!(after.metadata_cache_misses > before.metadata_cache_misses);
     }
 
     #[test]
@@ -1067,7 +1067,7 @@ connection_uri = "{connection_uri}"
         assert_eq!(row[0].to_string(), "chars(alpha)");
         let after = runtime_snapshot();
 
-        assert!(after.result_cache_hits >= before.result_cache_hits + 1);
+        assert!(after.result_cache_hits > before.result_cache_hits);
         assert!(after.result_cache_misses >= before.result_cache_misses + 2);
 
         restore_default_result_cache_config();

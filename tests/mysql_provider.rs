@@ -308,8 +308,8 @@ fn mysql_provider_query_and_pool() {
     .expect("mysql named query second hit");
     assert_eq!(row[0].to_string(), "chars(linghuchong)");
     let after_metadata = kdb::runtime_snapshot();
-    assert!(after_metadata.metadata_cache_misses >= before.metadata_cache_misses + 1);
-    assert!(after_metadata.metadata_cache_hits >= before.metadata_cache_hits + 1);
+    assert!(after_metadata.metadata_cache_misses > before.metadata_cache_misses);
+    assert!(after_metadata.metadata_cache_hits > before.metadata_cache_hits);
 
     let before_empty = kdb::runtime_snapshot();
     let empty = kdb::query_fields(
@@ -325,8 +325,8 @@ fn mysql_provider_query_and_pool() {
     .expect("mysql empty metadata hit");
     assert!(empty.is_empty());
     let after_empty = kdb::runtime_snapshot();
-    assert!(after_empty.metadata_cache_misses >= before_empty.metadata_cache_misses + 1);
-    assert!(after_empty.metadata_cache_hits >= before_empty.metadata_cache_hits + 1);
+    assert!(after_empty.metadata_cache_misses > before_empty.metadata_cache_misses);
+    assert!(after_empty.metadata_cache_hits > before_empty.metadata_cache_hits);
 
     let started = Instant::now();
     thread::scope(|scope| {
