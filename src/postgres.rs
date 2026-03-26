@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, mpsc};
+use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use orion_error::{ToStructError, UvsFrom};
 use postgres::types::{ToSql, Type};
 use postgres::{Client, NoTls, Row, Statement};
-use r2d2::{ManageConnection, Pool, PooledConnection};
 use serde_json::Value as JsonValue;
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
@@ -43,165 +46,300 @@ impl PostgresProviderConfig {
 }
 
 pub struct PostgresProvider {
-    pool: Pool<PostgresConnectionManager>,
+    workers: Vec<PostgresWorkerHandle>,
+    next_worker: AtomicUsize,
+    threads: Mutex<Vec<JoinHandle<()>>>,
 }
 
 #[derive(Debug)]
-struct PostgresConnectionManager {
-    connection_uri: String,
+struct PostgresWorkerHandle {
+    tx: mpsc::Sender<PostgresCommand>,
 }
 
-impl PostgresConnectionManager {
-    fn new(connection_uri: impl Into<String>) -> Self {
-        Self {
-            connection_uri: connection_uri.into(),
-        }
-    }
+enum PostgresCommand {
+    Query {
+        sql: String,
+        reply: mpsc::Sender<KnowledgeResult<Vec<RowData>>>,
+    },
+    QueryRow {
+        sql: String,
+        reply: mpsc::Sender<KnowledgeResult<RowData>>,
+    },
+    QueryFields {
+        sql: String,
+        params: Vec<DataField>,
+        reply: mpsc::Sender<KnowledgeResult<Vec<RowData>>>,
+    },
+    Shutdown,
 }
 
-impl ManageConnection for PostgresConnectionManager {
-    type Connection = Client;
-    type Error = postgres::Error;
-
-    fn connect(&self) -> Result<Self::Connection, Self::Error> {
-        Client::connect(&self.connection_uri, NoTls)
-    }
-
-    fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
-        conn.simple_query("SELECT 1").map(|_| ())
-    }
-
-    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
-        conn.is_closed()
+impl PostgresWorkerHandle {
+    fn send(&self, cmd: PostgresCommand) -> KnowledgeResult<()> {
+        self.tx.send(cmd).map_err(|err| {
+            KnowledgeReason::from_conf()
+                .to_err()
+                .with_detail(format!("postgres worker channel send failed: {err}"))
+        })
     }
 }
 
 impl PostgresProvider {
     pub fn connect(config: &PostgresProviderConfig) -> KnowledgeResult<Self> {
-        let manager = PostgresConnectionManager::new(config.connection_uri());
-        let pool = Pool::builder()
-            .max_size(config.pool_size())
-            .connection_timeout(Duration::from_secs(5))
-            .test_on_check_out(true)
-            .build(manager)
-            .map_err(|err| {
-                KnowledgeReason::from_conf()
-                    .to_err()
-                    .with_detail(format!("create postgres pool failed: {err}"))
-            })?;
+        let worker_count = config.pool_size().max(1) as usize;
+        let mut workers = Vec::with_capacity(worker_count);
+        let mut threads = Vec::with_capacity(worker_count);
 
-        validate_startup(&pool)?;
+        for worker_idx in 0..worker_count {
+            match spawn_worker(config.connection_uri(), worker_idx) {
+                Ok((worker, thread)) => {
+                    workers.push(worker);
+                    threads.push(thread);
+                }
+                Err(err) => {
+                    for worker in &workers {
+                        let _ = worker.send(PostgresCommand::Shutdown);
+                    }
+                    for thread in threads {
+                        let _ = thread.join();
+                    }
+                    return Err(err);
+                }
+            }
+        }
 
-        Ok(Self { pool })
+        Ok(Self {
+            workers,
+            next_worker: AtomicUsize::new(0),
+            threads: Mutex::new(threads),
+        })
     }
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        let mut client = self.pool_conn("query")?;
-        let mut prepared_stmt = None;
-        let col_names = metadata_cache_get_or_try_init(sql, || {
-            let stmt = client.prepare(sql).map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query prepare failed: {err}"))
-            })?;
-            let names = statement_col_names(&stmt);
-            prepared_stmt = Some(stmt);
-            Ok(Some(names))
+        let worker = self.pick_worker()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        worker.send(PostgresCommand::Query {
+            sql: sql.to_string(),
+            reply: reply_tx,
         })?;
-        let rows = if let Some(stmt) = prepared_stmt.as_ref() {
-            client.query(stmt, &[])
-        } else {
-            client.query(sql, &[])
-        }
-        .map_err(|err| {
-            KnowledgeReason::from_rule()
-                .to_err()
-                .with_detail(format!("postgres query failed: {err}"))
-        })?;
-        rows.iter().map(|row| map_row(row, &col_names)).collect()
+        recv_worker_reply(reply_rx, "query")
     }
 
     pub fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
-        let mut client = self.pool_conn("query_row")?;
-        let mut prepared_stmt = None;
-        let col_names = metadata_cache_get_or_try_init(sql, || {
-            let stmt = client.prepare(sql).map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query_row prepare failed: {err}"))
-            })?;
-            let names = statement_col_names(&stmt);
-            prepared_stmt = Some(stmt);
-            Ok(Some(names))
+        let worker = self.pick_worker()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        worker.send(PostgresCommand::QueryRow {
+            sql: sql.to_string(),
+            reply: reply_tx,
         })?;
-        let rows = if let Some(stmt) = prepared_stmt.as_ref() {
-            client.query(stmt, &[])
-        } else {
-            client.query(sql, &[])
-        }
-        .map_err(|err| {
-            KnowledgeReason::from_rule()
-                .to_err()
-                .with_detail(format!("postgres query_row failed: {err}"))
-        })?;
-        if let Some(row) = rows.first() {
-            map_row(row, &col_names)
-        } else {
-            Ok(Vec::new())
-        }
+        recv_worker_reply(reply_rx, "query_row")
     }
 
     pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
-        let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
-        let bind_values: Vec<PostgresBindValue> = ordered_params
-            .iter()
-            .map(|field| PostgresBindValue::from(*field))
-            .collect();
-        let bind_refs: Vec<&(dyn ToSql + Sync)> = bind_values
-            .iter()
-            .map(PostgresBindValue::as_tosql)
-            .collect();
-
-        let mut client = self.pool_conn("query_fields")?;
-        let mut prepared_stmt = None;
-        let col_names = metadata_cache_get_or_try_init(sql, || {
-            let stmt = client.prepare(&rewritten_sql).map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query_fields prepare failed: {err}"))
-            })?;
-            let names = statement_col_names(&stmt);
-            prepared_stmt = Some(stmt);
-            Ok(Some(names))
+        let worker = self.pick_worker()?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        worker.send(PostgresCommand::QueryFields {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            reply: reply_tx,
         })?;
-        let rows = if let Some(stmt) = prepared_stmt.as_ref() {
-            client.query(stmt, &bind_refs)
-        } else {
-            client.query(&rewritten_sql, &bind_refs)
-        }
-        .map_err(|err| {
-            KnowledgeReason::from_rule()
-                .to_err()
-                .with_detail(format!("postgres query_fields failed: {err}"))
-        })?;
-        rows.iter().map(|row| map_row(row, &col_names)).collect()
+        recv_worker_reply(reply_rx, "query_fields")
     }
 
     pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
         self.query_fields(sql, params)
             .map(|rows| rows.into_iter().next().unwrap_or_default())
     }
-
-    fn pool_conn(
-        &self,
-        action: &str,
-    ) -> KnowledgeResult<PooledConnection<PostgresConnectionManager>> {
-        self.pool.get().map_err(|err| {
-            KnowledgeReason::from_conf().to_err().with_detail(format!(
-                "postgres {action} failed to acquire pooled connection: {err}"
-            ))
-        })
+    fn pick_worker(&self) -> KnowledgeResult<&PostgresWorkerHandle> {
+        if self.workers.is_empty() {
+            return Err(KnowledgeReason::from_conf()
+                .to_err()
+                .with_detail("postgres worker pool is empty"));
+        }
+        let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
+        Ok(&self.workers[idx])
     }
+}
+
+impl Drop for PostgresProvider {
+    fn drop(&mut self) {
+        for worker in &self.workers {
+            let _ = worker.send(PostgresCommand::Shutdown);
+        }
+        if let Ok(mut threads) = self.threads.lock() {
+            for thread in threads.drain(..) {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+fn spawn_worker(
+    connection_uri: &str,
+    worker_idx: usize,
+) -> KnowledgeResult<(PostgresWorkerHandle, JoinHandle<()>)> {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let connection_uri = connection_uri.to_string();
+    let builder = thread::Builder::new().name(format!("wp-kdb-pg-{worker_idx}"));
+    let thread = builder
+        .spawn(move || postgres_worker_loop(connection_uri, cmd_rx, ready_tx))
+        .map_err(|err| {
+            KnowledgeReason::from_conf()
+                .to_err()
+                .with_detail(format!("spawn postgres worker failed: {err}"))
+        })?;
+
+    match ready_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(())) => Ok((PostgresWorkerHandle { tx: cmd_tx }, thread)),
+        Ok(Err(err)) => {
+            let _ = thread.join();
+            Err(err)
+        }
+        Err(err) => Err(KnowledgeReason::from_conf()
+            .to_err()
+            .with_detail(format!("postgres worker startup timed out: {err}"))),
+    }
+}
+
+fn postgres_worker_loop(
+    connection_uri: String,
+    cmd_rx: mpsc::Receiver<PostgresCommand>,
+    ready_tx: mpsc::Sender<KnowledgeResult<()>>,
+) {
+    let mut client = match Client::connect(&connection_uri, NoTls) {
+        Ok(client) => client,
+        Err(err) => {
+            let _ = ready_tx.send(Err(KnowledgeReason::from_conf()
+                .to_err()
+                .with_detail(format!("create postgres client failed: {err}"))));
+            return;
+        }
+    };
+
+    if let Err(err) = client.simple_query("SELECT 1") {
+        let _ = ready_tx.send(Err(validation_err("connection", err)));
+        return;
+    }
+    let _ = ready_tx.send(Ok(()));
+
+    while let Ok(cmd) = cmd_rx.recv() {
+        match cmd {
+            PostgresCommand::Query { sql, reply } => {
+                let _ = reply.send(execute_query(&mut client, &sql));
+            }
+            PostgresCommand::QueryRow { sql, reply } => {
+                let _ = reply.send(execute_query_row(&mut client, &sql));
+            }
+            PostgresCommand::QueryFields { sql, params, reply } => {
+                let _ = reply.send(execute_query_fields(&mut client, &sql, &params));
+            }
+            PostgresCommand::Shutdown => break,
+        }
+    }
+}
+
+fn recv_worker_reply<T>(
+    rx: mpsc::Receiver<KnowledgeResult<T>>,
+    action: &str,
+) -> KnowledgeResult<T> {
+    rx.recv().map_err(|err| {
+        KnowledgeReason::from_conf().to_err().with_detail(format!(
+            "postgres worker reply failed during {action}: {err}"
+        ))
+    })?
+}
+
+fn execute_query(client: &mut Client, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+    let mut prepared_stmt = None;
+    let col_names = metadata_cache_get_or_try_init(sql, || {
+        let stmt = client.prepare(sql).map_err(|err| {
+            KnowledgeReason::from_rule()
+                .to_err()
+                .with_detail(format!("postgres query prepare failed: {err}"))
+        })?;
+        let names = statement_col_names(&stmt);
+        prepared_stmt = Some(stmt);
+        Ok(Some(names))
+    })?;
+    let rows = if let Some(stmt) = prepared_stmt.as_ref() {
+        client.query(stmt, &[])
+    } else {
+        client.query(sql, &[])
+    }
+    .map_err(|err| {
+        KnowledgeReason::from_rule()
+            .to_err()
+            .with_detail(format!("postgres query failed: {err}"))
+    })?;
+    rows.iter().map(|row| map_row(row, &col_names)).collect()
+}
+
+fn execute_query_row(client: &mut Client, sql: &str) -> KnowledgeResult<RowData> {
+    let mut prepared_stmt = None;
+    let col_names = metadata_cache_get_or_try_init(sql, || {
+        let stmt = client.prepare(sql).map_err(|err| {
+            KnowledgeReason::from_rule()
+                .to_err()
+                .with_detail(format!("postgres query_row prepare failed: {err}"))
+        })?;
+        let names = statement_col_names(&stmt);
+        prepared_stmt = Some(stmt);
+        Ok(Some(names))
+    })?;
+    let rows = if let Some(stmt) = prepared_stmt.as_ref() {
+        client.query(stmt, &[])
+    } else {
+        client.query(sql, &[])
+    }
+    .map_err(|err| {
+        KnowledgeReason::from_rule()
+            .to_err()
+            .with_detail(format!("postgres query_row failed: {err}"))
+    })?;
+    if let Some(row) = rows.first() {
+        map_row(row, &col_names)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+fn execute_query_fields(
+    client: &mut Client,
+    sql: &str,
+    params: &[DataField],
+) -> KnowledgeResult<Vec<RowData>> {
+    let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
+    let bind_values: Vec<PostgresBindValue> = ordered_params
+        .iter()
+        .map(|field| PostgresBindValue::from(*field))
+        .collect();
+    let bind_refs: Vec<&(dyn ToSql + Sync)> = bind_values
+        .iter()
+        .map(PostgresBindValue::as_tosql)
+        .collect();
+
+    let mut prepared_stmt = None;
+    let col_names = metadata_cache_get_or_try_init(sql, || {
+        let stmt = client.prepare(&rewritten_sql).map_err(|err| {
+            KnowledgeReason::from_rule()
+                .to_err()
+                .with_detail(format!("postgres query_fields prepare failed: {err}"))
+        })?;
+        let names = statement_col_names(&stmt);
+        prepared_stmt = Some(stmt);
+        Ok(Some(names))
+    })?;
+    let rows = if let Some(stmt) = prepared_stmt.as_ref() {
+        client.query(stmt, &bind_refs)
+    } else {
+        client.query(&rewritten_sql, &bind_refs)
+    }
+    .map_err(|err| {
+        KnowledgeReason::from_rule()
+            .to_err()
+            .with_detail(format!("postgres query_fields failed: {err}"))
+    })?;
+    rows.iter().map(|row| map_row(row, &col_names)).collect()
 }
 
 #[derive(Debug)]
@@ -247,20 +385,6 @@ impl From<&DataField> for PostgresBindValue {
             Value::MobilePhone(value) => PostgresBindValue::Text(value.0.to_string()),
         }
     }
-}
-
-fn validate_startup(pool: &Pool<PostgresConnectionManager>) -> KnowledgeResult<()> {
-    let mut client = pool.get().map_err(|err| {
-        KnowledgeReason::from_conf().to_err().with_detail(format!(
-            "postgres startup validation failed to acquire pooled connection: {err}"
-        ))
-    })?;
-
-    client
-        .simple_query("SELECT 1")
-        .map_err(|err| validation_err("connection", err))?;
-
-    Ok(())
 }
 
 fn validation_err(stage: &str, err: postgres::Error) -> wp_error::KnowledgeError {

@@ -19,16 +19,11 @@ fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn ensure_postgres_provider_initialized() -> String {
-    static INIT: OnceLock<String> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let url = postgres_url();
-
-        let mut admin =
-            Client::connect(&url, NoTls).expect("connect to WP_KDB_TEST_POSTGRES_URL failed");
-        admin
-            .batch_execute(
-                r#"
+fn seed_postgres_lookup_table(url: &str) {
+    let mut admin = Client::connect(url, NoTls).expect("connect to postgres lookup table failed");
+    admin
+        .batch_execute(
+            r#"
 CREATE TABLE IF NOT EXISTS wp_knowledge_pg_lookup (
     id BIGINT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -40,8 +35,16 @@ VALUES
     (1, '令狐冲', 'linghuchong'),
     (2, '小龙女', 'xiaolongnu');
 "#,
-            )
-            .expect("seed postgres_provider test data failed");
+        )
+        .expect("seed postgres lookup table failed");
+}
+
+fn ensure_postgres_provider_initialized() -> String {
+    static INIT: OnceLock<String> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let url = postgres_url();
+
+        seed_postgres_lookup_table(&url);
 
         let root = workspace_root();
         let tmp = root.join(".tmp");
@@ -76,6 +79,35 @@ connection_uri = "{url}"
         url
     })
     .clone()
+}
+
+#[test]
+#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
+fn postgres_provider_init_and_query_inside_tokio_runtime() {
+    let url = postgres_url();
+    seed_postgres_lookup_table(&url);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("build tokio runtime for postgres provider");
+
+    rt.block_on(async {
+        kdb::init_postgres_provider(&url, Some(4))
+            .expect("init postgres provider inside tokio runtime");
+
+        let params = [DataField::from_chars(
+            ":name".to_string(),
+            "令狐冲".to_string(),
+        )];
+        let row = kdb::query_fields(
+            "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name",
+            &params,
+        )
+        .expect("postgres query inside tokio runtime");
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].get_name(), "pinying");
+        assert_eq!(row[0].to_string(), "chars(linghuchong)");
+    });
 }
 
 fn perf_env_usize(key: &str, default: usize) -> usize {

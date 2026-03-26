@@ -7,8 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- No unreleased changes yet.  
-  当前没有未发布变更。
+### Fixed
+- Make the PostgreSQL provider safe to use under Tokio-based hosts by isolating sync client I/O onto dedicated worker threads instead of executing it on runtime threads.  
+  将 PostgreSQL Provider 改为通过专用 worker 线程执行同步 client I/O，避免在 Tokio runtime 线程内直接执行阻塞调用。
+- Add regression coverage for initializing and querying the PostgreSQL provider from inside a Tokio runtime.  
+  增加在 Tokio runtime 内初始化并查询 PostgreSQL Provider 的回归测试覆盖。
 
 ## [0.11.0]
 
