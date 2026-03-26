@@ -133,6 +133,26 @@ impl DBQuery for MemDB {
     }
 }
 impl MemDB {
+    pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        let named_params = params
+            .iter()
+            .cloned()
+            .map(SqlNamedParam)
+            .collect::<Vec<_>>();
+        let refs: Vec<(&str, &dyn ToSql)> = named_params
+            .iter()
+            .map(|param| (param.0.get_name(), param as &dyn ToSql))
+            .collect();
+        super::query_util::query_cached(&conn, sql, refs.as_slice())
+    }
+
+    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+        self.query_fields(sql, params)
+            .map(|rows| rows.into_iter().next().unwrap_or_default())
+    }
+
     pub fn instance() -> Self {
         // Provide a single-connection pool for a consistent in-memory DB view
         let manager = SqliteConnectionManager::memory();

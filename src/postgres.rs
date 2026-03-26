@@ -4,13 +4,13 @@ use std::time::Duration;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use orion_error::{ToStructError, UvsFrom};
 use postgres::types::{ToSql, Type};
-use postgres::{Client, NoTls, Row};
+use postgres::{Client, NoTls, Row, Statement};
 use r2d2::{ManageConnection, Pool, PooledConnection};
 use serde_json::Value as JsonValue;
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
 
-use crate::mem::RowData;
+use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init};
 
 #[derive(Debug, Clone)]
 pub struct PostgresProviderConfig {
@@ -97,29 +97,61 @@ impl PostgresProvider {
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
         let mut client = self.pool_conn("query")?;
-        let rows = client.query(sql, &[]).map_err(|err| {
+        let mut prepared_stmt = None;
+        let col_names = metadata_cache_get_or_try_init(sql, || {
+            let stmt = client.prepare(sql).map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("postgres query prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        })?;
+        let rows = if let Some(stmt) = prepared_stmt.as_ref() {
+            client.query(stmt, &[])
+        } else {
+            client.query(sql, &[])
+        }
+        .map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
                 .with_detail(format!("postgres query failed: {err}"))
         })?;
-        rows.iter().map(map_row).collect()
+        rows.iter().map(|row| map_row(row, &col_names)).collect()
     }
 
     pub fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
         let mut client = self.pool_conn("query_row")?;
-        let rows = client.query(sql, &[]).map_err(|err| {
+        let mut prepared_stmt = None;
+        let col_names = metadata_cache_get_or_try_init(sql, || {
+            let stmt = client.prepare(sql).map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("postgres query_row prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        })?;
+        let rows = if let Some(stmt) = prepared_stmt.as_ref() {
+            client.query(stmt, &[])
+        } else {
+            client.query(sql, &[])
+        }
+        .map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
                 .with_detail(format!("postgres query_row failed: {err}"))
         })?;
         if let Some(row) = rows.first() {
-            map_row(row)
+            map_row(row, &col_names)
         } else {
             Ok(Vec::new())
         }
     }
 
-    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+    pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
         let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
         let bind_values: Vec<PostgresBindValue> = ordered_params
             .iter()
@@ -130,17 +162,34 @@ impl PostgresProvider {
             .map(PostgresBindValue::as_tosql)
             .collect();
 
-        let mut client = self.pool_conn("query_named")?;
-        let rows = client.query(&rewritten_sql, &bind_refs).map_err(|err| {
+        let mut client = self.pool_conn("query_fields")?;
+        let mut prepared_stmt = None;
+        let col_names = metadata_cache_get_or_try_init(sql, || {
+            let stmt = client.prepare(&rewritten_sql).map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("postgres query_fields prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        })?;
+        let rows = if let Some(stmt) = prepared_stmt.as_ref() {
+            client.query(stmt, &bind_refs)
+        } else {
+            client.query(&rewritten_sql, &bind_refs)
+        }
+        .map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
-                .with_detail(format!("postgres query_named failed: {err}"))
+                .with_detail(format!("postgres query_fields failed: {err}"))
         })?;
-        if let Some(row) = rows.first() {
-            map_row(row)
-        } else {
-            Ok(Vec::new())
-        }
+        rows.iter().map(|row| map_row(row, &col_names)).collect()
+    }
+
+    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+        self.query_fields(sql, params)
+            .map(|rows| rows.into_iter().next().unwrap_or_default())
     }
 
     fn pool_conn(
@@ -292,12 +341,23 @@ fn rewrite_sql<'a>(
     Ok((out, ordered))
 }
 
-fn map_row(row: &Row) -> KnowledgeResult<RowData> {
+fn map_row(row: &Row, col_names: &[String]) -> KnowledgeResult<RowData> {
     let mut out = Vec::with_capacity(row.len());
     for (idx, col) in row.columns().iter().enumerate() {
-        out.push(map_value(row, idx, col.name(), col.type_())?);
+        let col_name = col_names
+            .get(idx)
+            .map(|name| name.as_str())
+            .unwrap_or(col.name());
+        out.push(map_value(row, idx, col_name, col.type_())?);
     }
     Ok(out)
+}
+
+fn statement_col_names(stmt: &Statement) -> Vec<String> {
+    stmt.columns()
+        .iter()
+        .map(|col| col.name().to_string())
+        .collect()
 }
 
 fn map_value(row: &Row, idx: usize, name: &str, ty: &Type) -> KnowledgeResult<DataField> {

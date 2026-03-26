@@ -24,9 +24,31 @@ pub struct KnowDbConf {
     #[serde(default)]
     pub csv: CsvSpec,
     #[serde(default)]
+    pub cache: CacheSpec,
+    #[serde(default)]
     pub provider: Option<ProviderSpec>,
     #[serde(default)]
     pub tables: Vec<TableSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheSpec {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_result_cache_capacity")]
+    pub capacity: usize,
+    #[serde(default = "default_result_cache_ttl_ms")]
+    pub ttl_ms: u64,
+}
+
+impl Default for CacheSpec {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            capacity: default_result_cache_capacity(),
+            ttl_ms: default_result_cache_ttl_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -139,6 +161,12 @@ fn default_on_error() -> OnError {
 }
 fn default_dot() -> String {
     ".".to_string()
+}
+const fn default_result_cache_capacity() -> usize {
+    1024
+}
+const fn default_result_cache_ttl_ms() -> u64 {
+    30_000
 }
 
 /// 读取文本文件，返回字符串
@@ -441,6 +469,43 @@ pool_size = 12
             "mysql://demo:demo@127.0.0.1:3306/demo"
         );
         assert_eq!(provider.pool_size, Some(12));
+    }
+
+    #[test]
+    fn parse_cache_spec_with_defaults() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with default cache spec");
+
+        assert!(conf.cache.enabled);
+        assert_eq!(conf.cache.capacity, 1024);
+        assert_eq!(conf.cache.ttl_ms, 30_000);
+    }
+
+    #[test]
+    fn parse_cache_spec_from_toml() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[cache]
+enabled = false
+capacity = 256
+ttl_ms = 1500
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with cache spec");
+
+        assert!(!conf.cache.enabled);
+        assert_eq!(conf.cache.capacity, 256);
+        assert_eq!(conf.cache.ttl_ms, 1500);
     }
 }
 

@@ -7,6 +7,9 @@ COMPOSE_FILE="${ROOT_DIR}/tests/docker-compose.yml"
 KEEP_DB="${KEEP_DB:-0}"
 TEST_URL="${TEST_URL:-postgres://postgres:demo@127.0.0.1:5432/postgres}"
 WAIT_SECONDS="${WAIT_SECONDS:-90}"
+export WP_KDB_PERF_ROWS="${WP_KDB_PERF_ROWS:-10000}"
+export WP_KDB_PERF_OPS="${WP_KDB_PERF_OPS:-10000}"
+export WP_KDB_PERF_HOTSET="${WP_KDB_PERF_HOTSET:-128}"
 
 cleanup() {
   if [[ "${KEEP_DB}" == "1" ]]; then
@@ -25,7 +28,7 @@ if [[ -n "${WP_KDB_TEST_POSTGRES_URL:-}" ]]; then
   echo "[wp-knowledge] use TEST_URL=${TEST_URL} for this compose-managed test run"
 fi
 
-docker compose -f "${COMPOSE_FILE}" up -d
+docker compose -f "${COMPOSE_FILE}" up -d postgres
 
 CONTAINER_ID="$(docker compose -f "${COMPOSE_FILE}" ps -q postgres)"
 if [[ -z "${CONTAINER_ID}" ]]; then
@@ -71,5 +74,5 @@ fi
 
 export WP_KDB_TEST_POSTGRES_URL="${TEST_URL}"
 
-echo "[wp-knowledge] running postgres_provider with ${WP_KDB_TEST_POSTGRES_URL}"
+echo "[wp-knowledge] running postgres_provider with ${WP_KDB_TEST_POSTGRES_URL} (perf rows=${WP_KDB_PERF_ROWS} ops=${WP_KDB_PERF_OPS} hotset=${WP_KDB_PERF_HOTSET})"
 cargo test --test postgres_provider -- --ignored --nocapture

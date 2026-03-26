@@ -1,6 +1,6 @@
 # wp-knowledge
 
-`wp-knowledge` 是一个 KnowDB 组件，默认负责把目录化的 CSV + SQL 规则装载为 SQLite 查询库，并提供统一查询门面、线程克隆只读副本和若干内置 UDF；也支持把查询门面切换到外部 PostgreSQL 或 MySQL。
+`wp-knowledge` 是一个 KnowDB 查询与 Provider 组件，支持从 `knowdb.toml` 加载知识库定义，并通过统一查询门面访问 SQLite、PostgreSQL 或 MySQL 数据源。
 
 这个目录已经按独立仓库形态整理，可直接作为 `https://github.com/wp-labs/wp-knowledge` 的仓库根使用；保留在 `wp-motor` workspace 内时也可以继续正常构建。
 
@@ -17,18 +17,18 @@
 - `src/`：库实现与单元测试。
 - `tests/`：集成测试。
 - `knowdb/`：随包分发的示例 KnowDB。
-- `docs/`：设计文档与后续重构方案。
+- `docs/`：架构与使用说明。
 - `.github/workflows/ci.yml`：独立仓库可直接使用的 CI。
 
-## 设计文档
+## 更多说明
 
-- [Provider 与 Cache 重构方案](docs/PROVIDER_CACHE_ARCHITECTURE.md)
+- [Provider 与 Cache 架构说明](docs/PROVIDER_CACHE_ARCHITECTURE.md)
 
 ## 快速开始
 
 ```toml
 [dependencies]
-wp-knowledge = "0.10.3"
+wp-knowledge = "0.11.0"
 ```
 
 ```rust
@@ -55,30 +55,68 @@ let row = facade::query_row("SELECT COUNT(*) AS total FROM example")?;
 - 不再构建本地 `authority.sqlite`
 - 推荐通过 `facade::query_fields/cache_query_fields` 使用 provider-neutral 参数接口
 - `facade::query_named/cache_query` 仍保留，作为兼容旧版 SQLite 参数调用方式的 wrapper
+- 可通过 `facade::runtime_snapshot()` 读取当前 provider、generation，以及 result/local/metadata cache 的运行时计数与占用情况
+- 可通过 `facade::install_runtime_telemetry(...)` 安装外部 telemetry bridge，把 reload/cache/query 事件接到 Prometheus、`wp-stats` 或其他宿主监控系统
+- 可通过 `[cache]` 控制 `result cache` 的开关、容量和 TTL；`local cache` 与 `metadata cache` 不受这个配置影响
+- PostgreSQL / MySQL 现在也接入了 `metadata cache` 与对应 telemetry，重复查询相同 SQL 时会记录 metadata cache hit/miss
 
 示例：
 
 ```toml
 version = 2
 
+[cache]
+enabled = true
+capacity = 1024
+ttl_ms = 30000
+
 [provider]
 kind = "postgres"
-connection_uri = "postgres://user:pass@127.0.0.1:5432/demo"
+connection_uri = "postgres://user:${SEC_PWD}@127.0.0.1:5432/demo"
 pool_size = 8
 ```
 
 ```toml
 version = 2
 
+[cache]
+enabled = true
+capacity = 1024
+ttl_ms = 30000
+
 [provider]
 kind = "mysql"
-connection_uri = "mysql://user:pass@127.0.0.1:3306/demo"
+connection_uri = "mysql://user:${SEC_PWD}@127.0.0.1:3306/demo"
 pool_size = 8
 ```
 
 命名参数在 PostgreSQL 中会自动从 `:name` 重写为 `$1/$2/...`；MySQL provider 原生支持 `:name` 命名参数。调用层都不需要改 SQL 写法。
 
-推荐的新查询方式示例：
+`[cache]` 目前只有 3 个配置项：
+
+- `enabled`
+  控制 `result cache` 总开关；设为 `false` 后，原本会走 `UseGlobal` 的查询也会被强制降级为 `Bypass`
+- `capacity`
+  控制 `result cache` 最大条目数，单位是 entries，不是字节；`1024` 表示最多缓存 1024 条查询结果
+- `ttl_ms`
+  控制 `result cache` 的 TTL，单位是毫秒；外部 PostgreSQL / MySQL 数据发生变化但宿主没有 reload engine 时，依赖这个 TTL 做兜底失效
+
+3 类 cache 的边界如下：
+
+- `result cache`
+  缓存查询结果集，受 `[cache]` 控制
+- `local cache`
+  历史调用期局部缓存，只在单次调用范围内复用，不受 `[cache]` 控制
+- `metadata cache`
+  缓存列名等元数据，不受 `[cache]` 控制
+
+失效机制说明：
+
+- reload knowdb、替换 provider 或 generation 变化时，`result cache` 会整体失效
+- 外部数据源内容变化但宿主没有 reload 时，`result cache` 依赖 `ttl_ms` 到期后重新取数
+- 当前没有对外部 PostgreSQL / MySQL 自动做 CDC、表版本号探测或事件通知接入
+
+查询示例：
 
 ```rust
 use wp_knowledge::facade;
@@ -90,6 +128,35 @@ let row = facade::query_fields(
     &params,
 )?;
 # Ok::<(), wp_error::Error2>(())
+```
+
+Telemetry bridge 示例：
+
+```rust
+use std::sync::Arc;
+
+use wp_knowledge::facade;
+use wp_knowledge::telemetry::{
+    CacheTelemetryEvent, KnowledgeTelemetry, QueryTelemetryEvent, ReloadTelemetryEvent,
+};
+
+struct MyTelemetry;
+
+impl KnowledgeTelemetry for MyTelemetry {
+    fn on_cache(&self, event: &CacheTelemetryEvent) {
+        let _ = event;
+    }
+
+    fn on_reload(&self, event: &ReloadTelemetryEvent) {
+        let _ = event;
+    }
+
+    fn on_query(&self, event: &QueryTelemetryEvent) {
+        let _ = event;
+    }
+}
+
+let _previous = facade::install_runtime_telemetry(Arc::new(MyTelemetry));
 ```
 
 ## 测试外部 Provider

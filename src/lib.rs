@@ -8,4 +8,6 @@ pub mod loader;
 mod mysql;
 mod param;
 mod postgres;
+pub mod runtime;
 pub mod sqlite_ext;
+pub mod telemetry;

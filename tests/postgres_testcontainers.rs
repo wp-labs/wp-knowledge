@@ -43,7 +43,7 @@ fn connect_with_retry(url: &str) -> Client {
 
 #[test]
 #[ignore = "requires docker and may need to pull postgres image"]
-fn postgres_provider_query_and_cipher_via_testcontainers() {
+fn postgres_provider_query_and_pool_via_testcontainers() {
     let container = Postgres::default()
         .start()
         .expect("start postgres testcontainer");

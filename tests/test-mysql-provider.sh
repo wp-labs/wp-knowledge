@@ -7,6 +7,9 @@ COMPOSE_FILE="${ROOT_DIR}/tests/docker-compose.yml"
 KEEP_DB="${KEEP_DB:-0}"
 TEST_URL="${TEST_URL:-mysql://root:demo@127.0.0.1:3306/demo}"
 WAIT_SECONDS="${WAIT_SECONDS:-120}"
+export WP_KDB_PERF_ROWS="${WP_KDB_PERF_ROWS:-10000}"
+export WP_KDB_PERF_OPS="${WP_KDB_PERF_OPS:-10000}"
+export WP_KDB_PERF_HOTSET="${WP_KDB_PERF_HOTSET:-128}"
 
 cleanup() {
   if [[ "${KEEP_DB}" == "1" ]]; then
@@ -71,5 +74,5 @@ fi
 
 export WP_KDB_TEST_MYSQL_URL="${TEST_URL}"
 
-echo "[wp-knowledge] running mysql_provider with ${WP_KDB_TEST_MYSQL_URL}"
+echo "[wp-knowledge] running mysql_provider with ${WP_KDB_TEST_MYSQL_URL} (perf rows=${WP_KDB_PERF_ROWS} ops=${WP_KDB_PERF_OPS} hotset=${WP_KDB_PERF_HOTSET})"
 cargo test --test mysql_provider -- --ignored --nocapture

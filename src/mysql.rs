@@ -8,7 +8,7 @@ use orion_error::{ToStructError, UvsFrom};
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
 
-use crate::mem::RowData;
+use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init};
 
 #[derive(Debug, Clone)]
 pub struct MySqlProviderConfig {
@@ -72,40 +72,93 @@ impl MySqlProvider {
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
         let mut conn = self.pool_conn("query")?;
-        let rows: Vec<Row> = conn.query(sql).map_err(|err| {
+        let mut prepared_stmt = None;
+        let col_names = metadata_cache_get_or_try_init(sql, || {
+            let stmt = conn.prep(sql).map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("mysql query prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        })?;
+        let rows = if let Some(stmt) = prepared_stmt.as_ref() {
+            conn.exec(stmt, ())
+        } else {
+            conn.query(sql)
+        }
+        .map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
                 .with_detail(format!("mysql query failed: {err}"))
         })?;
-        rows.into_iter().map(map_row).collect()
+        rows.into_iter()
+            .map(|row| map_row(row, &col_names))
+            .collect()
     }
 
     pub fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
         let mut conn = self.pool_conn("query_row")?;
-        let row: Option<Row> = conn.query_first(sql).map_err(|err| {
+        let mut prepared_stmt = None;
+        let col_names = metadata_cache_get_or_try_init(sql, || {
+            let stmt = conn.prep(sql).map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("mysql query_row prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        })?;
+        let row: Option<Row> = if let Some(stmt) = prepared_stmt.as_ref() {
+            conn.exec_first(stmt, ())
+        } else {
+            conn.query_first(sql)
+        }
+        .map_err(|err| {
             KnowledgeReason::from_rule()
                 .to_err()
                 .with_detail(format!("mysql query_row failed: {err}"))
         })?;
         match row {
-            Some(row) => map_row(row),
+            Some(row) => map_row(row, &col_names),
             None => Ok(Vec::new()),
         }
     }
 
-    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
-        let mut conn = self.pool_conn("query_named")?;
-        let row: Option<Row> = conn
-            .exec_first(sql, mysql_named_params(params))
-            .map_err(|err| {
+    pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
+        let mut conn = self.pool_conn("query_fields")?;
+        let bind_params = mysql_named_params(params);
+        let mut prepared_stmt = None;
+        let col_names = metadata_cache_get_or_try_init(sql, || {
+            let stmt = conn.prep(sql).map_err(|err| {
                 KnowledgeReason::from_rule()
                     .to_err()
-                    .with_detail(format!("mysql query_named failed: {err}"))
+                    .with_detail(format!("mysql query_fields prepare failed: {err}"))
             })?;
-        match row {
-            Some(row) => map_row(row),
-            None => Ok(Vec::new()),
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        })?;
+        let rows: Vec<Row> = if let Some(stmt) = prepared_stmt.as_ref() {
+            conn.exec(stmt, bind_params.clone())
+        } else {
+            conn.exec(sql, bind_params)
         }
+        .map_err(|err| {
+            KnowledgeReason::from_rule()
+                .to_err()
+                .with_detail(format!("mysql query_fields failed: {err}"))
+        })?;
+        rows.into_iter()
+            .map(|row| map_row(row, &col_names))
+            .collect()
+    }
+
+    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+        self.query_fields(sql, params)
+            .map(|rows| rows.into_iter().next().unwrap_or_default())
     }
 
     fn pool_conn(&self, action: &str) -> KnowledgeResult<PooledConn> {
@@ -169,10 +222,13 @@ fn mysql_value(field: &DataField) -> MySqlValue {
     }
 }
 
-fn map_row(row: Row) -> KnowledgeResult<RowData> {
+fn map_row(row: Row, col_names: &[String]) -> KnowledgeResult<RowData> {
     let mut result = Vec::with_capacity(row.len());
     for (idx, column) in row.columns_ref().iter().enumerate() {
-        let name = column.name_str().into_owned();
+        let name = col_names
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| column.name_str().into_owned());
         let field = match row.as_ref(idx) {
             Some(value) => map_value(&name, value),
             None => DataField::new(DataType::default(), &name, Value::Null),
@@ -180,6 +236,13 @@ fn map_row(row: Row) -> KnowledgeResult<RowData> {
         result.push(field);
     }
     Ok(result)
+}
+
+fn statement_col_names(stmt: &::mysql::Statement) -> Vec<String> {
+    stmt.columns()
+        .iter()
+        .map(|col| col.name_str().into_owned())
+        .collect()
 }
 
 fn map_value(name: &str, value: &MySqlValue) -> DataField {
