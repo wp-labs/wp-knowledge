@@ -23,6 +23,7 @@
 ## 更多说明
 
 - [Provider 与 Cache 架构说明](docs/PROVIDER_CACHE_ARCHITECTURE.md)
+- [Async Provider 性能测试与结论](docs/ASYNC_PROVIDER_PERF.md)
 
 ## 快速开始
 

@@ -26,6 +26,8 @@ use wp_model_core::model::DataField;
 
 use super::AnyResult;
 use super::SqlNamedParam;
+use crate::loader::ProviderKind;
+use crate::runtime::MetadataCacheScope;
 
 lazy_static! {
     // Important: Use a single SQLite in-memory connection so schema/data persist across calls.
@@ -133,6 +135,74 @@ impl DBQuery for MemDB {
     }
 }
 impl MemDB {
+    pub fn query_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+    ) -> KnowledgeResult<Vec<RowData>> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        super::query_util::query_cached_with_scope(
+            &conn,
+            scope,
+            Some(ProviderKind::SqliteAuthority),
+            sql,
+            [],
+        )
+    }
+
+    pub fn query_row_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+    ) -> KnowledgeResult<RowData> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        super::query_util::query_first_row_cached_with_scope(
+            &conn,
+            scope,
+            Some(ProviderKind::SqliteAuthority),
+            sql,
+            [],
+        )
+    }
+
+    pub fn query_fields_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        let named_params = params
+            .iter()
+            .cloned()
+            .map(SqlNamedParam)
+            .collect::<Vec<_>>();
+        let refs: Vec<(&str, &dyn ToSql)> = named_params
+            .iter()
+            .map(|param| (param.0.get_name(), param as &dyn ToSql))
+            .collect();
+        super::query_util::query_cached_with_scope(
+            &conn,
+            scope,
+            Some(ProviderKind::SqliteAuthority),
+            sql,
+            refs.as_slice(),
+        )
+    }
+
+    pub fn query_named_fields_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        self.query_fields_with_scope(scope, sql, params)
+            .map(|rows| rows.into_iter().next().unwrap_or_default())
+    }
+
     pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
         let conn = self.conn.get().owe_res().want("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);

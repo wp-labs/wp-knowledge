@@ -1,11 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
-use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use postgres::{Client, NoTls};
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
+use tokio_postgres::{Client, NoTls};
 use wp_knowledge::facade as kdb;
 use wp_model_core::model::DataField;
 
@@ -24,21 +23,33 @@ fn temp_test_dir() -> PathBuf {
     dir
 }
 
-fn connect_with_retry(url: &str) -> Client {
-    let mut last_err = None;
-    for _ in 0..30 {
-        match Client::connect(url, NoTls) {
-            Ok(client) => return client,
-            Err(err) => {
-                last_err = Some(err);
-                thread::sleep(Duration::from_secs(1));
+fn connect_with_retry(url: &str) -> (tokio::runtime::Runtime, Client) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime for postgres testcontainer connect");
+    let client = rt.block_on(async {
+        let mut last_err = None;
+        for _ in 0..30 {
+            match tokio_postgres::connect(url, NoTls).await {
+                Ok((client, connection)) => {
+                    tokio::spawn(async move {
+                        let _ = connection.await;
+                    });
+                    return client;
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
-    }
-    panic!(
-        "connect postgres container failed: {}",
-        last_err.expect("postgres connect error")
-    );
+        panic!(
+            "connect postgres container failed: {}",
+            last_err.expect("postgres connect error")
+        );
+    });
+    (rt, client)
 }
 
 #[test]
@@ -52,10 +63,11 @@ fn postgres_provider_query_and_pool_via_testcontainers() {
         .expect("resolve postgres mapped port");
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
 
-    let mut admin = connect_with_retry(&url);
-    admin
-        .batch_execute(
-            r#"
+    let (rt, admin) = connect_with_retry(&url);
+    rt.block_on(async {
+        admin
+            .batch_execute(
+                r#"
 CREATE TABLE IF NOT EXISTS wp_knowledge_pg_lookup (
     id BIGINT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -67,8 +79,10 @@ VALUES
     (1, '令狐冲', 'linghuchong'),
     (2, '小龙女', 'xiaolongnu');
 "#,
-        )
-        .expect("seed postgres test data");
+            )
+            .await
+            .expect("seed postgres test data");
+    });
 
     let tmp = temp_test_dir();
     let conf_path = tmp.join("postgres-knowdb.toml");

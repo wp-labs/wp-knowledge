@@ -7,11 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1]
+
+### Added
+- Add async provider query APIs and async/runtime regression coverage for SQLite, PostgreSQL, and MySQL providers.  
+  增加 async Provider 查询接口，以及面向 SQLite、PostgreSQL、MySQL Provider 的 async/runtime 回归测试覆盖。
+- Add async provider performance documentation and benchmark notes.  
+  增加 async Provider 性能测试与结论文档。
+
+### Changed
+- Switch PostgreSQL and MySQL providers to Tokio-based async execution with pooled runtime-managed query paths.  
+  将 PostgreSQL 与 MySQL Provider 切换为基于 Tokio 的异步执行路径，并统一到带连接池的 runtime 管理查询模型。
+- Extend provider runtime with async execution entry points while keeping generation-aware reload and cache semantics aligned across sync and async paths.  
+  为 provider runtime 增加 async 执行入口，同时保持 sync/async 两条路径上的 generation 感知 reload 与 cache 语义一致。
+
 ### Fixed
-- Make the PostgreSQL provider safe to use under Tokio-based hosts by isolating sync client I/O onto dedicated worker threads instead of executing it on runtime threads.  
-  将 PostgreSQL Provider 改为通过专用 worker 线程执行同步 client I/O，避免在 Tokio runtime 线程内直接执行阻塞调用。
-- Add regression coverage for initializing and querying the PostgreSQL provider from inside a Tokio runtime.  
-  增加在 Tokio runtime 内初始化并查询 PostgreSQL Provider 的回归测试覆盖。
+- Fix metadata cache scoping so SQLite, PostgreSQL, and MySQL queries keep datasource/generation isolation across reloads.  
+  修复 metadata cache 作用域问题，确保 SQLite、PostgreSQL、MySQL 在 reload 前后保持 datasource/generation 隔离。
+- Fix SQLite async bridge so queued async queries keep the captured provider handle instead of jumping to a newer provider after reload.  
+  修复 SQLite async bridge，避免排队中的异步查询在 reload 后跳转到更新后的 provider。
+- Fix PostgreSQL named-parameter rewriting so casts, comments, and dollar-quoted bodies are not misparsed as placeholders.  
+  修复 PostgreSQL 命名参数重写逻辑，避免将 cast、注释和 dollar-quote 体误判为占位符。
+- Fix first-row query paths to avoid materializing full result sets when only one row is required.  
+  修复 first-row 查询路径，避免在只需要一行时先物化整个结果集。
 
 ## [0.11.0]
 

@@ -1,12 +1,14 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use lru::LruCache;
 use orion_error::{ToStructError, UvsFrom};
+use tokio::task;
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_log::{debug_kdb, warn_kdb};
 use wp_model_core::model::{DataField, DataType, Value};
@@ -15,7 +17,7 @@ use crate::loader::ProviderKind;
 use crate::mem::RowData;
 use crate::telemetry::{
     CacheLayer, CacheOutcome, CacheTelemetryEvent, QueryTelemetryEvent, ReloadOutcome,
-    ReloadTelemetryEvent, telemetry,
+    ReloadTelemetryEvent, telemetry, telemetry_enabled,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -123,11 +125,36 @@ impl QueryResponse {
     }
 }
 
+#[async_trait]
 pub trait ProviderExecutor: Send + Sync {
     fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>>;
     fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>>;
     fn query_row(&self, sql: &str) -> KnowledgeResult<RowData>;
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData>;
+
+    async fn query_async(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+        self.query(sql)
+    }
+
+    async fn query_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
+        self.query_fields(sql, params)
+    }
+
+    async fn query_row_async(&self, sql: &str) -> KnowledgeResult<RowData> {
+        self.query_row(sql)
+    }
+
+    async fn query_named_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        self.query_named_fields(sql, params)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -205,7 +232,11 @@ struct CachedQueryResponse {
 pub struct KnowledgeRuntime {
     provider: RwLock<Option<Arc<ProviderHandle>>>,
     next_generation: AtomicU64,
+    provider_epoch: AtomicU64,
+    current_generation_value: AtomicU64,
     result_cache_config: RwLock<ResultCacheConfig>,
+    result_cache_enabled: AtomicBool,
+    result_cache_ttl_ms: AtomicU64,
     result_cache: RwLock<LruCache<ResultCacheKey, CachedQueryResponse>>,
     result_cache_hits: AtomicU64,
     result_cache_misses: AtomicU64,
@@ -227,7 +258,11 @@ impl KnowledgeRuntime {
         Self {
             provider: RwLock::new(None),
             next_generation: AtomicU64::new(0),
+            provider_epoch: AtomicU64::new(0),
+            current_generation_value: AtomicU64::new(0),
             result_cache_config: RwLock::new(config),
+            result_cache_enabled: AtomicBool::new(config.enabled),
+            result_cache_ttl_ms: AtomicU64::new(config.ttl.as_millis() as u64),
             result_cache: RwLock::new(LruCache::new(capacity)),
             result_cache_hits: AtomicU64::new(0),
             result_cache_misses: AtomicU64::new(0),
@@ -274,10 +309,12 @@ impl KnowledgeRuntime {
                     generation.0,
                     err
                 );
-                telemetry().on_reload(&ReloadTelemetryEvent {
-                    outcome: ReloadOutcome::Failure,
-                    provider_kind: kind.clone(),
-                });
+                if telemetry_enabled() {
+                    telemetry().on_reload(&ReloadTelemetryEvent {
+                        outcome: ReloadOutcome::Failure,
+                        provider_kind: kind.clone(),
+                    });
+                }
                 return Err(err);
             }
         };
@@ -294,6 +331,7 @@ impl KnowledgeRuntime {
             generation,
             kind: kind_for_handle,
         });
+        self.provider_epoch.fetch_add(1, Ordering::AcqRel);
         {
             let mut guard = self
                 .provider
@@ -301,11 +339,16 @@ impl KnowledgeRuntime {
                 .expect("runtime provider lock poisoned");
             *guard = Some(handle);
         }
+        self.current_generation_value
+            .store(generation.0, Ordering::Release);
+        self.provider_epoch.fetch_add(1, Ordering::Release);
         self.reload_successes.fetch_add(1, Ordering::Relaxed);
-        telemetry().on_reload(&ReloadTelemetryEvent {
-            outcome: ReloadOutcome::Success,
-            provider_kind: kind.clone(),
-        });
+        if telemetry_enabled() {
+            telemetry().on_reload(&ReloadTelemetryEvent {
+                outcome: ReloadOutcome::Success,
+                provider_kind: kind.clone(),
+            });
+        }
         debug_kdb!(
             "[kdb] reload provider success kind={kind:?} datasource_id={} generation={}",
             datasource_id.0,
@@ -331,6 +374,12 @@ impl KnowledgeRuntime {
             }
             *guard = new_config;
         }
+        self.result_cache_enabled
+            .store(new_config.enabled, Ordering::Relaxed);
+        self.result_cache_ttl_ms.store(
+            new_config.ttl.as_millis().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
 
         if should_reset_cache {
             let mut cache = self
@@ -344,10 +393,19 @@ impl KnowledgeRuntime {
     }
 
     pub fn current_generation(&self) -> Option<Generation> {
-        self.provider
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().map(|handle| handle.generation))
+        let epoch_before = self.provider_epoch.load(Ordering::Acquire);
+        if epoch_before % 2 == 1 {
+            return self.current_generation_from_provider();
+        }
+        let generation = self.current_generation_value.load(Ordering::Acquire);
+        let epoch_after = self.provider_epoch.load(Ordering::Acquire);
+        if epoch_before != epoch_after {
+            return self.current_generation_from_provider();
+        }
+        match generation {
+            0 => None,
+            generation => Some(Generation(generation)),
+        }
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -437,20 +495,25 @@ impl KnowledgeRuntime {
 
     pub fn execute(&self, req: &QueryRequest) -> KnowledgeResult<QueryResponse> {
         let handle = self.current_handle()?;
-        let result_cache_config = self
-            .result_cache_config
-            .read()
-            .map(|guard| *guard)
-            .unwrap_or_default();
+        self.execute_with_handle(&handle, req)
+    }
+
+    fn execute_with_handle(
+        &self,
+        handle: &Arc<ProviderHandle>,
+        req: &QueryRequest,
+    ) -> KnowledgeResult<QueryResponse> {
         let use_global_cache =
-            matches!(req.cache_policy, CachePolicy::UseGlobal) && result_cache_config.enabled;
-        if use_global_cache && let Some(hit) = self.fetch_result_cache(&handle, req) {
+            matches!(req.cache_policy, CachePolicy::UseGlobal) && self.result_cache_enabled();
+        if use_global_cache && let Some(hit) = self.fetch_result_cache(handle, req) {
             self.record_result_cache_hit();
-            telemetry().on_cache(&CacheTelemetryEvent {
-                layer: CacheLayer::Result,
-                outcome: CacheOutcome::Hit,
-                provider_kind: Some(handle.kind.clone()),
-            });
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Hit,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
             debug_kdb!(
                 "[kdb] global result cache hit kind={:?} generation={}",
                 handle.kind,
@@ -460,11 +523,13 @@ impl KnowledgeRuntime {
         }
         if use_global_cache {
             self.record_result_cache_miss();
-            telemetry().on_cache(&CacheTelemetryEvent {
-                layer: CacheLayer::Result,
-                outcome: CacheOutcome::Miss,
-                provider_kind: Some(handle.kind.clone()),
-            });
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Miss,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
             debug_kdb!(
                 "[kdb] global result cache miss kind={:?} generation={}",
                 handle.kind,
@@ -505,27 +570,31 @@ impl KnowledgeRuntime {
             }
         } {
             Ok(response) => {
-                telemetry().on_query(&QueryTelemetryEvent {
-                    provider_kind: handle.kind.clone(),
-                    mode: mode_tag,
-                    success: true,
-                    elapsed: started.elapsed(),
-                });
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: mode_tag,
+                        success: true,
+                        elapsed: started.elapsed(),
+                    });
+                }
                 response
             }
             Err(err) => {
-                telemetry().on_query(&QueryTelemetryEvent {
-                    provider_kind: handle.kind.clone(),
-                    mode: mode_tag,
-                    success: false,
-                    elapsed: started.elapsed(),
-                });
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: mode_tag,
+                        success: false,
+                        elapsed: started.elapsed(),
+                    });
+                }
                 return Err(err);
             }
         };
 
         if use_global_cache {
-            self.save_result_cache(&handle, req, response.clone());
+            self.save_result_cache(handle, req, response.clone());
             debug_kdb!(
                 "[kdb] global result cache store kind={:?} generation={}",
                 handle.kind,
@@ -534,6 +603,292 @@ impl KnowledgeRuntime {
         }
 
         Ok(response)
+    }
+
+    pub fn execute_first_row_fields(
+        &self,
+        sql: &str,
+        params: &[DataField],
+        cache_policy: CachePolicy,
+    ) -> KnowledgeResult<RowData> {
+        let handle = self.current_handle()?;
+        self.execute_first_row_fields_with_handle(&handle, sql, params, cache_policy)
+    }
+
+    fn execute_first_row_fields_with_handle(
+        &self,
+        handle: &Arc<ProviderHandle>,
+        sql: &str,
+        params: &[DataField],
+        cache_policy: CachePolicy,
+    ) -> KnowledgeResult<RowData> {
+        let use_global_cache =
+            matches!(cache_policy, CachePolicy::UseGlobal) && self.result_cache_enabled();
+        if use_global_cache
+            && let Some(hit) = self.fetch_result_cache_by_key(result_cache_key_fields(
+                handle,
+                sql,
+                params,
+                QueryModeTag::FirstRow,
+            ))
+        {
+            self.record_result_cache_hit();
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Hit,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
+            return Ok(hit.into_row());
+        }
+        if use_global_cache {
+            self.record_result_cache_miss();
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Miss,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
+        }
+
+        let started = Instant::now();
+        let row = if params.is_empty() {
+            handle.provider.query_row(sql)
+        } else {
+            handle.provider.query_named_fields(sql, params)
+        };
+        let row = match row {
+            Ok(row) => {
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: QueryModeTag::FirstRow,
+                        success: true,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                row
+            }
+            Err(err) => {
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: QueryModeTag::FirstRow,
+                        success: false,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                return Err(err);
+            }
+        };
+
+        if use_global_cache {
+            self.save_result_cache_by_key(
+                result_cache_key_fields(handle, sql, params, QueryModeTag::FirstRow),
+                QueryResponse::Row(row.clone()),
+            );
+        }
+
+        Ok(row)
+    }
+
+    pub async fn execute_async(&self, req: &QueryRequest) -> KnowledgeResult<QueryResponse> {
+        let handle = self.current_handle()?;
+        if matches!(handle.kind, ProviderKind::SqliteAuthority) {
+            let handle = handle.clone();
+            let req = req.clone();
+            return task::spawn_blocking(move || runtime().execute_with_handle(&handle, &req))
+                .await
+                .map_err(|err| {
+                    KnowledgeReason::from_logic()
+                        .to_err()
+                        .with_detail(format!("knowledge async sqlite query join failed: {err}"))
+                })?;
+        }
+        let use_global_cache =
+            matches!(req.cache_policy, CachePolicy::UseGlobal) && self.result_cache_enabled();
+        if use_global_cache && let Some(hit) = self.fetch_result_cache(&handle, req) {
+            self.record_result_cache_hit();
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Hit,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
+            return Ok(hit);
+        }
+        if use_global_cache {
+            self.record_result_cache_miss();
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Miss,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
+        }
+
+        let params = params_to_fields(&req.params);
+        let mode_tag = query_mode_tag(&req.mode);
+        let started = Instant::now();
+        let response = match req.mode {
+            QueryMode::Many => {
+                if params.is_empty() {
+                    handle
+                        .provider
+                        .query_async(&req.sql)
+                        .await
+                        .map(QueryResponse::Rows)
+                } else {
+                    handle
+                        .provider
+                        .query_fields_async(&req.sql, &params)
+                        .await
+                        .map(QueryResponse::Rows)
+                }
+            }
+            QueryMode::FirstRow => {
+                if params.is_empty() {
+                    handle
+                        .provider
+                        .query_row_async(&req.sql)
+                        .await
+                        .map(QueryResponse::Row)
+                } else {
+                    handle
+                        .provider
+                        .query_named_fields_async(&req.sql, &params)
+                        .await
+                        .map(QueryResponse::Row)
+                }
+            }
+        };
+        let response = match response {
+            Ok(response) => {
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: mode_tag,
+                        success: true,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                response
+            }
+            Err(err) => {
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: mode_tag,
+                        success: false,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                return Err(err);
+            }
+        };
+
+        if use_global_cache {
+            self.save_result_cache(&handle, req, response.clone());
+        }
+
+        Ok(response)
+    }
+
+    pub async fn execute_first_row_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+        cache_policy: CachePolicy,
+    ) -> KnowledgeResult<RowData> {
+        let handle = self.current_handle()?;
+        if matches!(handle.kind, ProviderKind::SqliteAuthority) {
+            let handle = handle.clone();
+            let sql = sql.to_string();
+            let params = params.to_vec();
+            return task::spawn_blocking(move || {
+                runtime().execute_first_row_fields_with_handle(&handle, &sql, &params, cache_policy)
+            })
+            .await
+            .map_err(|err| {
+                KnowledgeReason::from_logic().to_err().with_detail(format!(
+                    "knowledge async sqlite first-row query join failed: {err}"
+                ))
+            })?;
+        }
+        let use_global_cache =
+            matches!(cache_policy, CachePolicy::UseGlobal) && self.result_cache_enabled();
+        if use_global_cache
+            && let Some(hit) = self.fetch_result_cache_by_key(result_cache_key_fields(
+                &handle,
+                sql,
+                params,
+                QueryModeTag::FirstRow,
+            ))
+        {
+            self.record_result_cache_hit();
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Hit,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
+            return Ok(hit.into_row());
+        }
+        if use_global_cache {
+            self.record_result_cache_miss();
+            if telemetry_enabled() {
+                telemetry().on_cache(&CacheTelemetryEvent {
+                    layer: CacheLayer::Result,
+                    outcome: CacheOutcome::Miss,
+                    provider_kind: Some(handle.kind.clone()),
+                });
+            }
+        }
+
+        let started = Instant::now();
+        let row = if params.is_empty() {
+            handle.provider.query_row_async(sql).await
+        } else {
+            handle.provider.query_named_fields_async(sql, params).await
+        };
+        let row = match row {
+            Ok(row) => {
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: QueryModeTag::FirstRow,
+                        success: true,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                row
+            }
+            Err(err) => {
+                if telemetry_enabled() {
+                    telemetry().on_query(&QueryTelemetryEvent {
+                        provider_kind: handle.kind.clone(),
+                        mode: QueryModeTag::FirstRow,
+                        success: false,
+                        elapsed: started.elapsed(),
+                    });
+                }
+                return Err(err);
+            }
+        };
+
+        if use_global_cache {
+            self.save_result_cache_by_key(
+                result_cache_key_fields(&handle, sql, params, QueryModeTag::FirstRow),
+                QueryResponse::Row(row.clone()),
+            );
+        }
+
+        Ok(row)
     }
 
     fn current_handle(&self) -> KnowledgeResult<Arc<ProviderHandle>> {
@@ -548,26 +903,31 @@ impl KnowledgeRuntime {
             })
     }
 
+    fn current_generation_from_provider(&self) -> Option<Generation> {
+        self.provider
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|handle| handle.generation))
+    }
+
     fn fetch_result_cache(
         &self,
         handle: &ProviderHandle,
         req: &QueryRequest,
     ) -> Option<QueryResponse> {
-        let config = self
-            .result_cache_config
-            .read()
-            .map(|guard| *guard)
-            .unwrap_or_default();
-        if !config.enabled {
+        self.fetch_result_cache_by_key(result_cache_key(handle, req))
+    }
+
+    fn fetch_result_cache_by_key(&self, key: ResultCacheKey) -> Option<QueryResponse> {
+        if !self.result_cache_enabled() {
             return None;
         }
-        let key = result_cache_key(handle, req);
         let cached = self
             .result_cache
             .read()
             .ok()
             .and_then(|cache| cache.peek(&key).cloned())?;
-        if cached.cached_at.elapsed() > config.ttl {
+        if cached.cached_at.elapsed() > self.result_cache_ttl() {
             if let Ok(mut cache) = self.result_cache.write() {
                 let _ = cache.pop(&key);
             }
@@ -582,15 +942,29 @@ impl KnowledgeRuntime {
         req: &QueryRequest,
         response: QueryResponse,
     ) {
+        self.save_result_cache_by_key(result_cache_key(handle, req), response);
+    }
+
+    fn save_result_cache_by_key(&self, key: ResultCacheKey, response: QueryResponse) {
         if let Ok(mut cache) = self.result_cache.write() {
             cache.put(
-                result_cache_key(handle, req),
+                key,
                 CachedQueryResponse {
                     response: Arc::new(response),
                     cached_at: Instant::now(),
                 },
             );
         }
+    }
+
+    #[inline]
+    fn result_cache_enabled(&self) -> bool {
+        self.result_cache_enabled.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn result_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.result_cache_ttl_ms.load(Ordering::Relaxed))
     }
 }
 
@@ -600,9 +974,23 @@ pub fn runtime() -> &'static KnowledgeRuntime {
 }
 
 #[cfg(test)]
-pub(crate) fn runtime_test_guard() -> &'static std::sync::Mutex<()> {
-    static GUARD: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
-    GUARD.get_or_init(|| std::sync::Mutex::new(()))
+pub(crate) struct RuntimeTestGuard(tokio::sync::Mutex<()>);
+
+#[cfg(test)]
+impl RuntimeTestGuard {
+    pub(crate) fn lock(&self) -> Result<tokio::sync::MutexGuard<'_, ()>, std::convert::Infallible> {
+        Ok(self.0.blocking_lock())
+    }
+
+    pub(crate) async fn lock_async(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.lock().await
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn runtime_test_guard() -> &'static RuntimeTestGuard {
+    static GUARD: OnceLock<RuntimeTestGuard> = OnceLock::new();
+    GUARD.get_or_init(|| RuntimeTestGuard(tokio::sync::Mutex::new(())))
 }
 
 fn result_cache_key(handle: &ProviderHandle, req: &QueryRequest) -> ResultCacheKey {
@@ -615,6 +1003,21 @@ fn result_cache_key(handle: &ProviderHandle, req: &QueryRequest) -> ResultCacheK
             QueryMode::Many => QueryModeTag::Many,
             QueryMode::FirstRow => QueryModeTag::FirstRow,
         },
+    }
+}
+
+fn result_cache_key_fields(
+    handle: &ProviderHandle,
+    sql: &str,
+    params: &[DataField],
+    mode: QueryModeTag,
+) -> ResultCacheKey {
+    ResultCacheKey {
+        datasource_id: handle.datasource_id.clone(),
+        generation: handle.generation,
+        query_hash: stable_hash(sql),
+        params_hash: stable_field_params_hash(params),
+        mode,
     }
 }
 
@@ -652,6 +1055,81 @@ fn stable_params_hash(params: &[QueryParam]) -> u64 {
             QueryValue::Text(value) => {
                 4u8.hash(&mut hasher);
                 value.hash(&mut hasher);
+            }
+        }
+    }
+    hasher.finish()
+}
+
+fn stable_field_params_hash(params: &[DataField]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for field in params {
+        field.get_name().hash(&mut hasher);
+        match field.get_value() {
+            Value::Null | Value::Ignore(_) => 0u8.hash(&mut hasher),
+            Value::Bool(value) => {
+                1u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Digit(value) => {
+                2u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Float(value) => {
+                3u8.hash(&mut hasher);
+                value.to_bits().hash(&mut hasher);
+            }
+            Value::Chars(value) => {
+                4u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Symbol(value) => {
+                5u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Time(value) => {
+                6u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Hex(value) => {
+                7u8.hash(&mut hasher);
+                value.to_string().hash(&mut hasher);
+            }
+            Value::IpNet(value) => {
+                8u8.hash(&mut hasher);
+                value.to_string().hash(&mut hasher);
+            }
+            Value::IpAddr(value) => {
+                9u8.hash(&mut hasher);
+                value.hash(&mut hasher);
+            }
+            Value::Obj(value) => {
+                10u8.hash(&mut hasher);
+                format!("{:?}", value).hash(&mut hasher);
+            }
+            Value::Array(value) => {
+                11u8.hash(&mut hasher);
+                format!("{:?}", value).hash(&mut hasher);
+            }
+            Value::Domain(value) => {
+                12u8.hash(&mut hasher);
+                value.0.hash(&mut hasher);
+            }
+            Value::Url(value) => {
+                13u8.hash(&mut hasher);
+                value.0.hash(&mut hasher);
+            }
+            Value::Email(value) => {
+                14u8.hash(&mut hasher);
+                value.0.hash(&mut hasher);
+            }
+            Value::IdCard(value) => {
+                15u8.hash(&mut hasher);
+                value.0.hash(&mut hasher);
+            }
+            Value::MobilePhone(value) => {
+                16u8.hash(&mut hasher);
+                value.0.hash(&mut hasher);
             }
         }
     }
@@ -709,7 +1187,36 @@ pub fn params_to_fields(params: &[QueryParam]) -> Vec<DataField> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use std::sync::Arc;
     use wp_model_core::model::Value;
+
+    struct TestProvider {
+        value: &'static str,
+    }
+
+    #[async_trait]
+    impl ProviderExecutor for TestProvider {
+        fn query(&self, _sql: &str) -> KnowledgeResult<Vec<RowData>> {
+            Ok(vec![vec![DataField::from_chars("value", self.value)]])
+        }
+
+        fn query_fields(&self, _sql: &str, _params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
+            self.query("")
+        }
+
+        fn query_row(&self, _sql: &str) -> KnowledgeResult<RowData> {
+            Ok(vec![DataField::from_chars("value", self.value)])
+        }
+
+        fn query_named_fields(
+            &self,
+            _sql: &str,
+            _params: &[DataField],
+        ) -> KnowledgeResult<RowData> {
+            self.query_row("")
+        }
+    }
 
     #[test]
     fn query_param_hash_is_stable() {
@@ -740,5 +1247,34 @@ mod tests {
         }
         let roundtrip = params_to_fields(&params);
         assert!(matches!(roundtrip[0].get_value(), Value::Chars(_)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sqlite_async_bridge_keeps_captured_handle_after_reload() {
+        let _guard = runtime_test_guard().lock_async().await;
+        runtime()
+            .install_provider(
+                ProviderKind::SqliteAuthority,
+                DatasourceId("sqlite:old".to_string()),
+                |_generation| Ok(Arc::new(TestProvider { value: "old" })),
+            )
+            .expect("install old provider");
+        let old_handle = runtime().current_handle().expect("current old handle");
+
+        runtime()
+            .install_provider(
+                ProviderKind::SqliteAuthority,
+                DatasourceId("sqlite:new".to_string()),
+                |_generation| Ok(Arc::new(TestProvider { value: "new" })),
+            )
+            .expect("install new provider");
+
+        let req = QueryRequest::first_row("SELECT value", Vec::new(), CachePolicy::Bypass);
+        let row = task::spawn_blocking(move || runtime().execute_with_handle(&old_handle, &req))
+            .await
+            .expect("join sqlite bridge")
+            .expect("execute old handle")
+            .into_row();
+        assert_eq!(row[0].to_string(), "chars(old)");
     }
 }

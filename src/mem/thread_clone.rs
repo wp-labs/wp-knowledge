@@ -12,6 +12,8 @@ use wp_log::debug_kdb;
 use wp_model_core::model::DataField;
 
 use super::SqlNamedParam;
+use crate::loader::ProviderKind;
+use crate::runtime::{DatasourceId, Generation, MetadataCacheScope};
 
 thread_local! {
     // clippy: use const init for thread_local value
@@ -29,21 +31,39 @@ struct ThreadLocalState {
 #[derive(Clone)]
 pub struct ThreadClonedMDB {
     authority_path: String,
-    generation: u64,
+    metadata_scope: MetadataCacheScope,
 }
 
 impl ThreadClonedMDB {
     pub fn from_authority(path: &str) -> Self {
         Self {
             authority_path: path.to_string(),
-            generation: 0,
+            metadata_scope: MetadataCacheScope {
+                datasource_id: DatasourceId("sqlite:standalone".to_string()),
+                generation: Generation(0),
+            },
         }
     }
 
     pub fn from_authority_with_generation(path: &str, generation: u64) -> Self {
+        Self::from_authority_with_scope(
+            path,
+            DatasourceId("sqlite:standalone".to_string()),
+            generation,
+        )
+    }
+
+    pub fn from_authority_with_scope(
+        path: &str,
+        datasource_id: DatasourceId,
+        generation: u64,
+    ) -> Self {
         Self {
             authority_path: path.to_string(),
-            generation,
+            metadata_scope: MetadataCacheScope {
+                datasource_id,
+                generation: Generation(generation),
+            },
         }
     }
 
@@ -52,7 +72,7 @@ impl ThreadClonedMDB {
         f: F,
     ) -> KnowledgeResult<T> {
         let path = self.authority_path.clone();
-        let generation = self.generation;
+        let generation = self.metadata_scope.generation.0;
         TLS_DB.with(|cell| {
             // make sure a thread-local in-memory db exists
             let should_rebuild = cell
@@ -97,6 +117,14 @@ impl ThreadClonedMDB {
     }
 
     pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
+        self.query_fields_with_scope(sql, params)
+    }
+
+    pub fn query_fields_with_scope(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
         self.with_tls_conn(|conn| {
             let named_params = params
                 .iter()
@@ -107,13 +135,51 @@ impl ThreadClonedMDB {
                 .iter()
                 .map(|param| (param.0.get_name(), param as &dyn ToSql))
                 .collect();
-            super::query_util::query_cached(conn, sql, refs.as_slice())
+            super::query_util::query_cached_with_scope(
+                conn,
+                &self.metadata_scope,
+                Some(ProviderKind::SqliteAuthority),
+                sql,
+                refs.as_slice(),
+            )
         })
     }
 
     pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
-        self.query_fields(sql, params)
+        self.query_named_fields_with_scope(sql, params)
+    }
+
+    pub fn query_named_fields_with_scope(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        self.query_fields_with_scope(sql, params)
             .map(|rows| rows.into_iter().next().unwrap_or_default())
+    }
+
+    pub fn query_with_scope(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+        self.with_tls_conn(|conn| {
+            super::query_util::query_cached_with_scope(
+                conn,
+                &self.metadata_scope,
+                Some(ProviderKind::SqliteAuthority),
+                sql,
+                [],
+            )
+        })
+    }
+
+    pub fn query_row_with_scope(&self, sql: &str) -> KnowledgeResult<RowData> {
+        self.with_tls_conn(|conn| {
+            super::query_util::query_first_row_cached_with_scope(
+                conn,
+                &self.metadata_scope,
+                Some(ProviderKind::SqliteAuthority),
+                sql,
+                [],
+            )
+        })
     }
 }
 

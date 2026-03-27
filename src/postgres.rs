@@ -1,19 +1,21 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, mpsc};
+use std::sync::mpsc;
 use std::thread;
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use orion_error::{ToStructError, UvsFrom};
-use postgres::types::{ToSql, Type};
-use postgres::{Client, NoTls, Row, Statement};
-use serde_json::Value as JsonValue;
+use tokio::runtime::{Builder, Runtime};
+use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::{Client, NoTls, Row, Statement};
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
 
-use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init};
+use crate::loader::ProviderKind;
+use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init_async_for_scope};
+use crate::runtime::MetadataCacheScope;
 
 #[derive(Debug, Clone)]
 pub struct PostgresProviderConfig {
@@ -46,225 +48,260 @@ impl PostgresProviderConfig {
 }
 
 pub struct PostgresProvider {
-    workers: Vec<PostgresWorkerHandle>,
-    next_worker: AtomicUsize,
-    threads: Mutex<Vec<JoinHandle<()>>>,
-}
-
-#[derive(Debug)]
-struct PostgresWorkerHandle {
-    tx: mpsc::Sender<PostgresCommand>,
-}
-
-enum PostgresCommand {
-    Query {
-        sql: String,
-        reply: mpsc::Sender<KnowledgeResult<Vec<RowData>>>,
-    },
-    QueryRow {
-        sql: String,
-        reply: mpsc::Sender<KnowledgeResult<RowData>>,
-    },
-    QueryFields {
-        sql: String,
-        params: Vec<DataField>,
-        reply: mpsc::Sender<KnowledgeResult<Vec<RowData>>>,
-    },
-    Shutdown,
-}
-
-impl PostgresWorkerHandle {
-    fn send(&self, cmd: PostgresCommand) -> KnowledgeResult<()> {
-        self.tx.send(cmd).map_err(|err| {
-            KnowledgeReason::from_conf()
-                .to_err()
-                .with_detail(format!("postgres worker channel send failed: {err}"))
-        })
-    }
+    runtime: Option<Runtime>,
+    clients: Vec<Arc<Client>>,
+    next_client: AtomicUsize,
+    metadata_scope: MetadataCacheScope,
 }
 
 impl PostgresProvider {
-    pub fn connect(config: &PostgresProviderConfig) -> KnowledgeResult<Self> {
-        let worker_count = config.pool_size().max(1) as usize;
-        let mut workers = Vec::with_capacity(worker_count);
-        let mut threads = Vec::with_capacity(worker_count);
+    pub fn connect(
+        config: &PostgresProviderConfig,
+        metadata_scope: MetadataCacheScope,
+    ) -> KnowledgeResult<Self> {
+        let pool_size = config.pool_size().max(1) as usize;
+        let connection_uri = config.connection_uri().to_string();
+        let metadata_scope_for_thread = metadata_scope.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("wp-kdb-pg-init".to_string())
+            .spawn(move || {
+                let runtime = Builder::new_multi_thread()
+                    .worker_threads(pool_size)
+                    .enable_all()
+                    .thread_name("wp-kdb-pg")
+                    .build()
+                    .map_err(|err| {
+                        KnowledgeReason::from_conf()
+                            .to_err()
+                            .with_detail(format!("create postgres tokio runtime failed: {err}"))
+                    });
+                let result = runtime.and_then(|runtime| {
+                    let clients = runtime.block_on(async move {
+                        let mut clients = Vec::with_capacity(pool_size);
+                        for _ in 0..pool_size {
+                            let (client, connection) =
+                                tokio_postgres::connect(&connection_uri, NoTls)
+                                    .await
+                                    .map_err(|err| {
+                                        KnowledgeReason::from_conf().to_err().with_detail(format!(
+                                            "create postgres client failed: {err}"
+                                        ))
+                                    })?;
+                            tokio::spawn(async move {
+                                let _ = connection.await;
+                            });
+                            client
+                                .simple_query("SELECT 1")
+                                .await
+                                .map_err(|err| validation_err("connection", err))?;
+                            clients.push(Arc::new(client));
+                        }
+                        Ok::<Vec<Arc<Client>>, wp_error::KnowledgeError>(clients)
+                    })?;
+                    Ok::<PostgresProvider, wp_error::KnowledgeError>(Self {
+                        runtime: Some(runtime),
+                        clients,
+                        next_client: AtomicUsize::new(0),
+                        metadata_scope: metadata_scope_for_thread,
+                    })
+                });
+                let _ = tx.send(result);
+            })
+            .map_err(|err| {
+                KnowledgeReason::from_conf()
+                    .to_err()
+                    .with_detail(format!("spawn postgres init thread failed: {err}"))
+            })?;
 
-        for worker_idx in 0..worker_count {
-            match spawn_worker(config.connection_uri(), worker_idx) {
-                Ok((worker, thread)) => {
-                    workers.push(worker);
-                    threads.push(thread);
-                }
-                Err(err) => {
-                    for worker in &workers {
-                        let _ = worker.send(PostgresCommand::Shutdown);
-                    }
-                    for thread in threads {
-                        let _ = thread.join();
-                    }
-                    return Err(err);
-                }
-            }
-        }
-
-        Ok(Self {
-            workers,
-            next_worker: AtomicUsize::new(0),
-            threads: Mutex::new(threads),
-        })
+        rx.recv()
+            .map_err(|err| {
+                KnowledgeReason::from_conf()
+                    .to_err()
+                    .with_detail(format!("receive postgres init result failed: {err}"))
+            })
+            .and_then(|result| result)
     }
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        let worker = self.pick_worker()?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        worker.send(PostgresCommand::Query {
-            sql: sql.to_string(),
-            reply: reply_tx,
-        })?;
-        recv_worker_reply(reply_rx, "query")
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let metadata_scope = self.metadata_scope.clone();
+        self.block_on_task(
+            async move { execute_query(&client, &metadata_scope, &sql).await },
+            "query",
+        )
     }
 
     pub fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
-        let worker = self.pick_worker()?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        worker.send(PostgresCommand::QueryRow {
-            sql: sql.to_string(),
-            reply: reply_tx,
-        })?;
-        recv_worker_reply(reply_rx, "query_row")
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let metadata_scope = self.metadata_scope.clone();
+        self.block_on_task(
+            async move { execute_query_row(&client, &metadata_scope, &sql).await },
+            "query_row",
+        )
     }
 
     pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
-        let worker = self.pick_worker()?;
-        let (reply_tx, reply_rx) = mpsc::channel();
-        worker.send(PostgresCommand::QueryFields {
-            sql: sql.to_string(),
-            params: params.to_vec(),
-            reply: reply_tx,
-        })?;
-        recv_worker_reply(reply_rx, "query_fields")
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let metadata_scope = self.metadata_scope.clone();
+        self.block_on_task(
+            async move { execute_query_fields(&client, &metadata_scope, &sql, &params).await },
+            "query_fields",
+        )
     }
 
     pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
-        self.query_fields(sql, params)
-            .map(|rows| rows.into_iter().next().unwrap_or_default())
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let metadata_scope = self.metadata_scope.clone();
+        self.block_on_task(
+            async move {
+                execute_query_named_fields(&client, &metadata_scope, &sql, &params).await
+            },
+            "query_named_fields",
+        )
     }
-    fn pick_worker(&self) -> KnowledgeResult<&PostgresWorkerHandle> {
-        if self.workers.is_empty() {
+
+    pub async fn query_async(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let metadata_scope = self.metadata_scope.clone();
+        self.run_task(
+            async move { execute_query(&client, &metadata_scope, &sql).await },
+            "query",
+        )
+        .await
+    }
+
+    pub async fn query_row_async(&self, sql: &str) -> KnowledgeResult<RowData> {
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let metadata_scope = self.metadata_scope.clone();
+        self.run_task(
+            async move { execute_query_row(&client, &metadata_scope, &sql).await },
+            "query_row",
+        )
+        .await
+    }
+
+    pub async fn query_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let metadata_scope = self.metadata_scope.clone();
+        self.run_task(
+            async move { execute_query_fields(&client, &metadata_scope, &sql, &params).await },
+            "query_fields",
+        )
+        .await
+    }
+
+    pub async fn query_named_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        let client = self.pick_client()?;
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let metadata_scope = self.metadata_scope.clone();
+        self.run_task(
+            async move {
+                execute_query_named_fields(&client, &metadata_scope, &sql, &params).await
+            },
+            "query_named_fields",
+        )
+        .await
+    }
+
+    fn pick_client(&self) -> KnowledgeResult<Arc<Client>> {
+        if self.clients.is_empty() {
             return Err(KnowledgeReason::from_conf()
                 .to_err()
-                .with_detail("postgres worker pool is empty"));
+                .with_detail("postgres client pool is empty"));
         }
-        let idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        Ok(&self.workers[idx])
+        let idx = self.next_client.fetch_add(1, Ordering::Relaxed) % self.clients.len();
+        Ok(self.clients[idx].clone())
+    }
+
+    async fn run_task<T, F>(&self, fut: F, action: &str) -> KnowledgeResult<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = KnowledgeResult<T>> + Send + 'static,
+    {
+        self.runtime
+            .as_ref()
+            .expect("postgres runtime available")
+            .handle()
+            .spawn(fut)
+            .await
+            .map_err(|err| join_err("postgres", action, err))?
+    }
+
+    fn block_on_task<T, F>(&self, fut: F, action: &str) -> KnowledgeResult<T>
+    where
+        T: Send + 'static,
+        F: Future<Output = KnowledgeResult<T>> + Send + 'static,
+    {
+        let (tx, rx) = mpsc::channel();
+        self.runtime
+            .as_ref()
+            .expect("postgres runtime available")
+            .handle()
+            .spawn(async move {
+                let _ = tx.send(fut.await);
+            });
+        rx.recv().map_err(|err| {
+            KnowledgeReason::from_logic().to_err().with_detail(format!(
+                "postgres async task channel failed during {action}: {err}"
+            ))
+        })?
     }
 }
 
 impl Drop for PostgresProvider {
     fn drop(&mut self) {
-        for worker in &self.workers {
-            let _ = worker.send(PostgresCommand::Shutdown);
-        }
-        if let Ok(mut threads) = self.threads.lock() {
-            for thread in threads.drain(..) {
-                let _ = thread.join();
-            }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
 }
 
-fn spawn_worker(
-    connection_uri: &str,
-    worker_idx: usize,
-) -> KnowledgeResult<(PostgresWorkerHandle, JoinHandle<()>)> {
-    let (cmd_tx, cmd_rx) = mpsc::channel();
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let connection_uri = connection_uri.to_string();
-    let builder = thread::Builder::new().name(format!("wp-kdb-pg-{worker_idx}"));
-    let thread = builder
-        .spawn(move || postgres_worker_loop(connection_uri, cmd_rx, ready_tx))
-        .map_err(|err| {
-            KnowledgeReason::from_conf()
-                .to_err()
-                .with_detail(format!("spawn postgres worker failed: {err}"))
-        })?;
-
-    match ready_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(())) => Ok((PostgresWorkerHandle { tx: cmd_tx }, thread)),
-        Ok(Err(err)) => {
-            let _ = thread.join();
-            Err(err)
-        }
-        Err(err) => Err(KnowledgeReason::from_conf()
-            .to_err()
-            .with_detail(format!("postgres worker startup timed out: {err}"))),
-    }
-}
-
-fn postgres_worker_loop(
-    connection_uri: String,
-    cmd_rx: mpsc::Receiver<PostgresCommand>,
-    ready_tx: mpsc::Sender<KnowledgeResult<()>>,
-) {
-    let mut client = match Client::connect(&connection_uri, NoTls) {
-        Ok(client) => client,
-        Err(err) => {
-            let _ = ready_tx.send(Err(KnowledgeReason::from_conf()
-                .to_err()
-                .with_detail(format!("create postgres client failed: {err}"))));
-            return;
-        }
-    };
-
-    if let Err(err) = client.simple_query("SELECT 1") {
-        let _ = ready_tx.send(Err(validation_err("connection", err)));
-        return;
-    }
-    let _ = ready_tx.send(Ok(()));
-
-    while let Ok(cmd) = cmd_rx.recv() {
-        match cmd {
-            PostgresCommand::Query { sql, reply } => {
-                let _ = reply.send(execute_query(&mut client, &sql));
-            }
-            PostgresCommand::QueryRow { sql, reply } => {
-                let _ = reply.send(execute_query_row(&mut client, &sql));
-            }
-            PostgresCommand::QueryFields { sql, params, reply } => {
-                let _ = reply.send(execute_query_fields(&mut client, &sql, &params));
-            }
-            PostgresCommand::Shutdown => break,
-        }
-    }
-}
-
-fn recv_worker_reply<T>(
-    rx: mpsc::Receiver<KnowledgeResult<T>>,
-    action: &str,
-) -> KnowledgeResult<T> {
-    rx.recv().map_err(|err| {
-        KnowledgeReason::from_conf().to_err().with_detail(format!(
-            "postgres worker reply failed during {action}: {err}"
-        ))
-    })?
-}
-
-fn execute_query(client: &mut Client, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+async fn execute_query(
+    client: &Client,
+    metadata_scope: &MetadataCacheScope,
+    sql: &str,
+) -> KnowledgeResult<Vec<RowData>> {
     let mut prepared_stmt = None;
-    let col_names = metadata_cache_get_or_try_init(sql, || {
-        let stmt = client.prepare(sql).map_err(|err| {
-            KnowledgeReason::from_rule()
-                .to_err()
-                .with_detail(format!("postgres query prepare failed: {err}"))
-        })?;
-        let names = statement_col_names(&stmt);
-        prepared_stmt = Some(stmt);
-        Ok(Some(names))
-    })?;
+    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+        metadata_scope,
+        Some(ProviderKind::Postgres),
+        sql,
+        || async {
+            let stmt = client.prepare(sql).await.map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("postgres query prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        },
+    )
+    .await?;
     let rows = if let Some(stmt) = prepared_stmt.as_ref() {
-        client.query(stmt, &[])
+        client.query(stmt, &[]).await
     } else {
-        client.query(sql, &[])
+        client.query(sql, &[]).await
     }
     .map_err(|err| {
         KnowledgeReason::from_rule()
@@ -274,37 +311,48 @@ fn execute_query(client: &mut Client, sql: &str) -> KnowledgeResult<Vec<RowData>
     rows.iter().map(|row| map_row(row, &col_names)).collect()
 }
 
-fn execute_query_row(client: &mut Client, sql: &str) -> KnowledgeResult<RowData> {
+async fn execute_query_row(
+    client: &Client,
+    metadata_scope: &MetadataCacheScope,
+    sql: &str,
+) -> KnowledgeResult<RowData> {
     let mut prepared_stmt = None;
-    let col_names = metadata_cache_get_or_try_init(sql, || {
-        let stmt = client.prepare(sql).map_err(|err| {
-            KnowledgeReason::from_rule()
-                .to_err()
-                .with_detail(format!("postgres query_row prepare failed: {err}"))
-        })?;
-        let names = statement_col_names(&stmt);
-        prepared_stmt = Some(stmt);
-        Ok(Some(names))
-    })?;
-    let rows = if let Some(stmt) = prepared_stmt.as_ref() {
-        client.query(stmt, &[])
+    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+        metadata_scope,
+        Some(ProviderKind::Postgres),
+        sql,
+        || async {
+            let stmt = client.prepare(sql).await.map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("postgres query_row prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        },
+    )
+    .await?;
+    let row = if let Some(stmt) = prepared_stmt.as_ref() {
+        client.query_opt(stmt, &[]).await
     } else {
-        client.query(sql, &[])
+        client.query_opt(sql, &[]).await
     }
     .map_err(|err| {
         KnowledgeReason::from_rule()
             .to_err()
             .with_detail(format!("postgres query_row failed: {err}"))
     })?;
-    if let Some(row) = rows.first() {
+    if let Some(row) = row.as_ref() {
         map_row(row, &col_names)
     } else {
         Ok(Vec::new())
     }
 }
 
-fn execute_query_fields(
-    client: &mut Client,
+async fn execute_query_fields(
+    client: &Client,
+    metadata_scope: &MetadataCacheScope,
     sql: &str,
     params: &[DataField],
 ) -> KnowledgeResult<Vec<RowData>> {
@@ -319,20 +367,26 @@ fn execute_query_fields(
         .collect();
 
     let mut prepared_stmt = None;
-    let col_names = metadata_cache_get_or_try_init(sql, || {
-        let stmt = client.prepare(&rewritten_sql).map_err(|err| {
-            KnowledgeReason::from_rule()
-                .to_err()
-                .with_detail(format!("postgres query_fields prepare failed: {err}"))
-        })?;
-        let names = statement_col_names(&stmt);
-        prepared_stmt = Some(stmt);
-        Ok(Some(names))
-    })?;
+    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+        metadata_scope,
+        Some(ProviderKind::Postgres),
+        sql,
+        || async {
+            let stmt = client.prepare(&rewritten_sql).await.map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("postgres query_fields prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        },
+    )
+    .await?;
     let rows = if let Some(stmt) = prepared_stmt.as_ref() {
-        client.query(stmt, &bind_refs)
+        client.query(stmt, &bind_refs).await
     } else {
-        client.query(&rewritten_sql, &bind_refs)
+        client.query(&rewritten_sql, &bind_refs).await
     }
     .map_err(|err| {
         KnowledgeReason::from_rule()
@@ -340,6 +394,56 @@ fn execute_query_fields(
             .with_detail(format!("postgres query_fields failed: {err}"))
     })?;
     rows.iter().map(|row| map_row(row, &col_names)).collect()
+}
+
+async fn execute_query_named_fields(
+    client: &Client,
+    metadata_scope: &MetadataCacheScope,
+    sql: &str,
+    params: &[DataField],
+) -> KnowledgeResult<RowData> {
+    let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
+    let bind_values: Vec<PostgresBindValue> = ordered_params
+        .iter()
+        .map(|field| PostgresBindValue::from(*field))
+        .collect();
+    let bind_refs: Vec<&(dyn ToSql + Sync)> = bind_values
+        .iter()
+        .map(PostgresBindValue::as_tosql)
+        .collect();
+
+    let mut prepared_stmt = None;
+    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+        metadata_scope,
+        Some(ProviderKind::Postgres),
+        sql,
+        || async {
+            let stmt = client.prepare(&rewritten_sql).await.map_err(|err| {
+                KnowledgeReason::from_rule()
+                    .to_err()
+                    .with_detail(format!("postgres query_named_fields prepare failed: {err}"))
+            })?;
+            let names = statement_col_names(&stmt);
+            prepared_stmt = Some(stmt);
+            Ok(Some(names))
+        },
+    )
+    .await?;
+    let row = if let Some(stmt) = prepared_stmt.as_ref() {
+        client.query_opt(stmt, &bind_refs).await
+    } else {
+        client.query_opt(&rewritten_sql, &bind_refs).await
+    }
+    .map_err(|err| {
+        KnowledgeReason::from_rule()
+            .to_err()
+            .with_detail(format!("postgres query_named_fields failed: {err}"))
+    })?;
+    if let Some(row) = row.as_ref() {
+        map_row(row, &col_names)
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Debug)]
@@ -387,9 +491,15 @@ impl From<&DataField> for PostgresBindValue {
     }
 }
 
-fn validation_err(stage: &str, err: postgres::Error) -> wp_error::KnowledgeError {
+fn validation_err(stage: &str, err: tokio_postgres::Error) -> wp_error::KnowledgeError {
     KnowledgeReason::from_conf().to_err().with_detail(format!(
         "postgres startup validation failed during {stage}: connection issue: {err}"
+    ))
+}
+
+fn join_err(provider: &str, action: &str, err: tokio::task::JoinError) -> wp_error::KnowledgeError {
+    KnowledgeReason::from_logic().to_err().with_detail(format!(
+        "{provider} async task join failed during {action}: {err}"
     ))
 }
 
@@ -412,57 +522,177 @@ fn rewrite_sql<'a>(
 
     let mut assigned_numbers: HashMap<String, usize> = HashMap::new();
     let mut ordered: Vec<&DataField> = Vec::new();
+    let bytes = sql.as_bytes();
     let mut out = String::with_capacity(sql.len());
-    let chars: Vec<char> = sql.chars().collect();
     let mut i = 0usize;
-    let mut in_single = false;
-    let mut in_double = false;
+    let mut dollar_tag: Option<Vec<u8>> = None;
 
-    while i < chars.len() {
-        let ch = chars[i];
-        if ch == '\'' && !in_double {
-            in_single = !in_single;
-            out.push(ch);
-            i += 1;
-            continue;
-        }
-        if ch == '"' && !in_single {
-            in_double = !in_double;
-            out.push(ch);
+    while i < bytes.len() {
+        if let Some(tag) = dollar_tag.as_ref() {
+            if bytes[i..].starts_with(tag) {
+                out.push_str(std::str::from_utf8(tag).expect("valid dollar quote tag"));
+                i += tag.len();
+                dollar_tag = None;
+                continue;
+            }
+            out.push(bytes[i] as char);
             i += 1;
             continue;
         }
 
-        if ch == ':' && !in_single && !in_double {
-            let start = i;
-            i += 1;
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+        match bytes[i] {
+            b'\'' => {
+                out.push('\'');
+                i += 1;
+                while i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'\'' {
+                            out.push('\'');
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                out.push('"');
+                i += 1;
+                while i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        if i < bytes.len() && bytes[i] == b'"' {
+                            out.push('"');
+                            i += 1;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                out.push('-');
+                out.push('-');
+                i += 2;
+                while i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    let is_newline = bytes[i] == b'\n';
+                    i += 1;
+                    if is_newline {
+                        break;
+                    }
+                }
+            }
+            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                out.push('/');
+                out.push('*');
+                i += 2;
+                while i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        out.push('/');
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'$' => {
+                if let Some(tag_len) = parse_dollar_quote_tag(&bytes[i..]) {
+                    let tag = bytes[i..i + tag_len].to_vec();
+                    out.push_str(std::str::from_utf8(&tag).expect("valid dollar quote tag"));
+                    i += tag_len;
+                    dollar_tag = Some(tag);
+                } else {
+                    out.push('$');
+                    i += 1;
+                }
+            }
+            b':' => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b':' {
+                    out.push(':');
+                    out.push(':');
+                    i += 2;
+                    continue;
+                }
+                if i + 1 >= bytes.len() || !is_param_start(bytes[i + 1]) {
+                    out.push(':');
+                    i += 1;
+                    continue;
+                }
+
+                let start = i;
+                i += 2;
+                while i < bytes.len() && is_param_continue(bytes[i]) {
+                    i += 1;
+                }
+                let raw_name = &sql[start..i];
+                let field = by_name.get(raw_name).ok_or_else(|| {
+                    KnowledgeReason::from_rule()
+                        .to_err()
+                        .with_detail(format!("postgres query missing param: {raw_name}"))
+                })?;
+                let placeholder_no = if let Some(idx) = assigned_numbers.get(raw_name) {
+                    *idx
+                } else {
+                    let idx = ordered.len() + 1;
+                    assigned_numbers.insert(raw_name.to_string(), idx);
+                    ordered.push(*field);
+                    idx
+                };
+                out.push('$');
+                out.push_str(&placeholder_no.to_string());
+            }
+            _ => {
+                out.push(bytes[i] as char);
                 i += 1;
             }
-            let raw_name: String = chars[start..i].iter().collect();
-            let field = by_name.get(&raw_name).ok_or_else(|| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query missing param: {raw_name}"))
-            })?;
-            let placeholder_no = if let Some(idx) = assigned_numbers.get(&raw_name) {
-                *idx
-            } else {
-                let idx = ordered.len() + 1;
-                assigned_numbers.insert(raw_name.clone(), idx);
-                ordered.push(*field);
-                idx
-            };
-            out.push('$');
-            out.push_str(&placeholder_no.to_string());
-            continue;
         }
-
-        out.push(ch);
-        i += 1;
     }
 
     Ok((out, ordered))
+}
+
+fn parse_dollar_quote_tag(input: &[u8]) -> Option<usize> {
+    if input.first().copied()? != b'$' {
+        return None;
+    }
+    let mut idx = 1usize;
+    while idx < input.len() && input[idx] != b'$' {
+        if idx == 1 {
+            if !is_dollar_tag_start(input[idx]) {
+                return None;
+            }
+        } else if !is_dollar_tag_continue(input[idx]) {
+            return None;
+        }
+        idx += 1;
+    }
+    if idx >= input.len() || input[idx] != b'$' {
+        return None;
+    }
+    Some(idx + 1)
+}
+
+fn is_param_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_param_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+fn is_dollar_tag_start(byte: u8) -> bool {
+    byte.is_ascii_alphabetic() || byte == b'_'
+}
+
+fn is_dollar_tag_continue(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn map_row(row: &Row, col_names: &[String]) -> KnowledgeResult<RowData> {
@@ -486,123 +716,117 @@ fn statement_col_names(stmt: &Statement) -> Vec<String> {
 
 fn map_value(row: &Row, idx: usize, name: &str, ty: &Type) -> KnowledgeResult<DataField> {
     match *ty {
-        Type::BOOL => row
+        Type::BOOL => Ok(row
             .try_get::<usize, Option<bool>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_bool(name.to_string(), value))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::INT2 => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::INT2 => Ok(row
             .try_get::<usize, Option<i16>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_digit(name.to_string(), i64::from(value)))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::INT4 => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::INT4 => Ok(row
             .try_get::<usize, Option<i32>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_digit(name.to_string(), i64::from(value)))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::INT8 | Type::OID => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::INT8 | Type::OID => Ok(row
             .try_get::<usize, Option<i64>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_digit(name.to_string(), value))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::FLOAT4 => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::FLOAT4 => Ok(row
             .try_get::<usize, Option<f32>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_float(name.to_string(), f64::from(value)))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::FLOAT8 => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::FLOAT8 => Ok(row
             .try_get::<usize, Option<f64>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_float(name.to_string(), value))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::UNKNOWN => Ok(row
             .try_get::<usize, Option<String>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_chars(name.to_string(), value))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::JSON | Type::JSONB => row
-            .try_get::<usize, Option<JsonValue>>(idx)
-            .map_err(pg_decode_err)?
-            .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::TIMESTAMP => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::TIMESTAMP => Ok(row
             .try_get::<usize, Option<NaiveDateTime>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::TIMESTAMPTZ => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::TIMESTAMPTZ => Ok(row
             .try_get::<usize, Option<DateTime<Utc>>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_chars(name.to_string(), value.to_rfc3339()))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::DATE => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::DATE => Ok(row
             .try_get::<usize, Option<NaiveDate>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        Type::TIME => row
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::TIME => Ok(row
             .try_get::<usize, Option<NaiveTime>>(idx)
             .map_err(pg_decode_err)?
             .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))
-            .pipe(Ok),
-        _ => Err(KnowledgeReason::from_rule().to_err().with_detail(format!(
-            "postgres column type not supported yet: {} ({})",
-            name,
-            ty.name()
-        ))),
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        Type::JSON | Type::JSONB => Ok(row
+            .try_get::<usize, Option<serde_json::Value>>(idx)
+            .map_err(pg_decode_err)?
+            .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
+        _ => Ok(row
+            .try_get::<usize, Option<String>>(idx)
+            .map_err(pg_decode_err)?
+            .map(|value| DataField::from_chars(name.to_string(), value))
+            .unwrap_or_else(|| DataField::new(DataType::default(), name, Value::Null))),
     }
 }
 
-fn pg_decode_err(err: postgres::Error) -> wp_error::KnowledgeError {
+fn pg_decode_err(err: tokio_postgres::Error) -> wp_error::KnowledgeError {
     KnowledgeReason::from_rule()
         .to_err()
-        .with_detail(format!("postgres decode failed: {err}"))
+        .with_detail(format!("postgres row decode failed: {err}"))
 }
-
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
-    }
-}
-
-impl<T> Pipe for T {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wp_model_core::model::DataField;
 
     #[test]
-    fn rewrite_sql_reuses_same_named_param() {
-        let params = vec![DataField::from_digit(":id".to_string(), 7)];
-        let (sql, ordered) =
-            rewrite_sql("select * from demo where id=:id or parent_id=:id", &params).unwrap();
-        assert_eq!(sql, "select * from demo where id=$1 or parent_id=$1");
+    fn rewrite_sql_skips_pg_cast_comments_and_dollar_quotes() {
+        let sql = r#"
+SELECT
+  payload::jsonb,
+  note
+FROM demo
+WHERE id = :id
+  AND note <> ':ignored'
+  AND tag = $$:ignored$$
+  -- :ignored
+  /* :ignored */
+"#;
+        let params = [DataField::from_digit(":id", 7)];
+        let (rewritten, ordered) = rewrite_sql(sql, &params).expect("rewrite sql");
+        assert!(rewritten.contains("payload::jsonb"));
+        assert!(rewritten.contains("id = $1"));
+        assert!(rewritten.contains("':ignored'"));
+        assert!(rewritten.contains("$$:ignored$$"));
         assert_eq!(ordered.len(), 1);
         assert_eq!(ordered[0].get_name(), ":id");
     }
 
     #[test]
-    fn rewrite_sql_ignores_colons_inside_strings() {
-        let params = vec![DataField::from_digit(":id".to_string(), 7)];
-        let (sql, ordered) = rewrite_sql(
-            "select ':id' as literal, id from demo where id=:id",
-            &params,
-        )
-        .unwrap();
-        assert_eq!(sql, "select ':id' as literal, id from demo where id=$1");
+    fn rewrite_sql_reuses_same_placeholder_for_duplicate_param() {
+        let sql = "SELECT * FROM demo WHERE left_id=:id OR right_id=:id";
+        let params = [DataField::from_digit(":id", 7)];
+        let (rewritten, ordered) = rewrite_sql(sql, &params).expect("rewrite sql");
+        assert_eq!(
+            rewritten,
+            "SELECT * FROM demo WHERE left_id=$1 OR right_id=$1"
+        );
         assert_eq!(ordered.len(), 1);
     }
 }

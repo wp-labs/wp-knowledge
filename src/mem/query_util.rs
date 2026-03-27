@@ -1,6 +1,7 @@
 use orion_error::ErrorOwe;
 use rusqlite::Params;
 use std::collections::hash_map::DefaultHasher;
+use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::{Arc, RwLock};
@@ -11,9 +12,12 @@ use wp_model_core::model::{self, DataField};
 use lazy_static::lazy_static;
 use lru::LruCache;
 
+use crate::loader::ProviderKind;
 use crate::mem::RowData;
-use crate::runtime::{DatasourceId, Generation, runtime};
-use crate::telemetry::{CacheLayer, CacheOutcome, CacheTelemetryEvent, telemetry};
+use crate::runtime::{DatasourceId, Generation, MetadataCacheScope, runtime};
+use crate::telemetry::{
+    CacheLayer, CacheOutcome, CacheTelemetryEvent, telemetry, telemetry_enabled,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MetadataCacheKey {
@@ -43,10 +47,18 @@ fn stable_hash(value: &str) -> u64 {
     hasher.finish()
 }
 
+#[cfg(test)]
 pub(crate) fn metadata_cache_key_for_current_scope(sql: &str) -> MetadataCacheKey {
     let scope = runtime().current_metadata_scope();
+    metadata_cache_key_for_scope(&scope, sql)
+}
+
+pub(crate) fn metadata_cache_key_for_scope(
+    scope: &MetadataCacheScope,
+    sql: &str,
+) -> MetadataCacheKey {
     MetadataCacheKey {
-        datasource_id: scope.datasource_id,
+        datasource_id: scope.datasource_id.clone(),
         generation: scope.generation,
         query_hash: stable_hash(sql),
     }
@@ -56,18 +68,34 @@ pub(crate) fn metadata_cache_get_or_try_init<F>(sql: &str, load: F) -> Knowledge
 where
     F: FnOnce() -> KnowledgeResult<Option<Vec<String>>>,
 {
-    let cache_key = metadata_cache_key_for_current_scope(sql);
+    let scope = runtime().current_metadata_scope();
+    let provider_kind = runtime().current_provider_kind();
+    metadata_cache_get_or_try_init_for_scope(&scope, provider_kind, sql, load)
+}
+
+pub(crate) fn metadata_cache_get_or_try_init_for_scope<F>(
+    scope: &MetadataCacheScope,
+    provider_kind: Option<ProviderKind>,
+    sql: &str,
+    load: F,
+) -> KnowledgeResult<Vec<String>>
+where
+    F: FnOnce() -> KnowledgeResult<Option<Vec<String>>>,
+{
+    let cache_key = metadata_cache_key_for_scope(scope, sql);
     if let Some(names) = COLNAME_CACHE
         .read()
         .ok()
         .and_then(|m| m.peek(&cache_key).cloned())
     {
         runtime().record_metadata_cache_hit();
-        telemetry().on_cache(&CacheTelemetryEvent {
-            layer: CacheLayer::Metadata,
-            outcome: CacheOutcome::Hit,
-            provider_kind: runtime().current_provider_kind(),
-        });
+        if telemetry_enabled() {
+            telemetry().on_cache(&CacheTelemetryEvent {
+                layer: CacheLayer::Metadata,
+                outcome: CacheOutcome::Hit,
+                provider_kind: provider_kind.clone(),
+            });
+        }
         debug_kdb!(
             "[kdb] metadata cache hit datasource_id={} generation={}",
             cache_key.datasource_id.0,
@@ -77,11 +105,13 @@ where
     }
 
     runtime().record_metadata_cache_miss();
-    telemetry().on_cache(&CacheTelemetryEvent {
-        layer: CacheLayer::Metadata,
-        outcome: CacheOutcome::Miss,
-        provider_kind: runtime().current_provider_kind(),
-    });
+    if telemetry_enabled() {
+        telemetry().on_cache(&CacheTelemetryEvent {
+            layer: CacheLayer::Metadata,
+            outcome: CacheOutcome::Miss,
+            provider_kind,
+        });
+    }
     debug_kdb!(
         "[kdb] metadata cache miss datasource_id={} generation={}",
         cache_key.datasource_id.0,
@@ -89,6 +119,51 @@ where
     );
 
     let Some(names) = load()? else {
+        return Ok(Vec::new());
+    };
+    if let Ok(mut m) = COLNAME_CACHE.write() {
+        m.put(cache_key, Arc::new(names.clone()));
+    }
+    Ok(names)
+}
+
+pub(crate) async fn metadata_cache_get_or_try_init_async_for_scope<F, Fut>(
+    scope: &MetadataCacheScope,
+    provider_kind: Option<ProviderKind>,
+    sql: &str,
+    load: F,
+) -> KnowledgeResult<Vec<String>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = KnowledgeResult<Option<Vec<String>>>>,
+{
+    let cache_key = metadata_cache_key_for_scope(scope, sql);
+    if let Some(names) = COLNAME_CACHE
+        .read()
+        .ok()
+        .and_then(|m| m.peek(&cache_key).cloned())
+    {
+        runtime().record_metadata_cache_hit();
+        if telemetry_enabled() {
+            telemetry().on_cache(&CacheTelemetryEvent {
+                layer: CacheLayer::Metadata,
+                outcome: CacheOutcome::Hit,
+                provider_kind: provider_kind.clone(),
+            });
+        }
+        return Ok((*names).clone());
+    }
+
+    runtime().record_metadata_cache_miss();
+    if telemetry_enabled() {
+        telemetry().on_cache(&CacheTelemetryEvent {
+            layer: CacheLayer::Metadata,
+            outcome: CacheOutcome::Miss,
+            provider_kind,
+        });
+    }
+
+    let Some(names) = load().await? else {
         return Ok(Vec::new());
     };
     if let Ok(mut m) = COLNAME_CACHE.write() {
@@ -148,6 +223,22 @@ fn extract_col_names_cached(
     })
 }
 
+fn extract_col_names_cached_with_scope(
+    stmt: &rusqlite::Statement<'_>,
+    scope: &MetadataCacheScope,
+    provider_kind: Option<ProviderKind>,
+    sql: &str,
+) -> KnowledgeResult<Vec<String>> {
+    metadata_cache_get_or_try_init_for_scope(scope, provider_kind, sql, || {
+        let col_cnt = stmt.column_count();
+        let mut names = Vec::with_capacity(col_cnt);
+        for i in 0..col_cnt {
+            names.push(stmt.column_name(i).owe_rule()?.to_string());
+        }
+        Ok(Some(names))
+    })
+}
+
 pub fn query<P: Params>(
     conn: &rusqlite::Connection,
     sql: &str,
@@ -196,6 +287,23 @@ pub fn query_cached<P: Params>(
     Ok(all_result)
 }
 
+pub fn query_cached_with_scope<P: Params>(
+    conn: &rusqlite::Connection,
+    scope: &MetadataCacheScope,
+    provider_kind: Option<ProviderKind>,
+    sql: &str,
+    params: P,
+) -> KnowledgeResult<Vec<RowData>> {
+    let mut stmt = conn.prepare_cached(sql).owe_rule()?;
+    let col_names = extract_col_names_cached_with_scope(&stmt, scope, provider_kind, sql)?;
+    let mut rows = stmt.query(params).owe_rule()?;
+    let mut all_result = Vec::new();
+    while let Some(row) = rows.next().owe_rule()? {
+        all_result.push(map_row(row, &col_names)?);
+    }
+    Ok(all_result)
+}
+
 /// Same as `query_first_row` but with a shared column-names cache to reduce metadata lookups.
 pub fn query_first_row_cached<P: Params>(
     conn: &rusqlite::Connection,
@@ -204,6 +312,23 @@ pub fn query_first_row_cached<P: Params>(
 ) -> KnowledgeResult<RowData> {
     let mut stmt = conn.prepare_cached(sql).owe_rule()?;
     let col_names = extract_col_names_cached(&stmt, sql)?;
+    let mut rows = stmt.query(params).owe_rule()?;
+    if let Some(row) = rows.next().owe_rule()? {
+        map_row(row, &col_names)
+    } else {
+        Ok(Vec::new())
+    }
+}
+
+pub fn query_first_row_cached_with_scope<P: Params>(
+    conn: &rusqlite::Connection,
+    scope: &MetadataCacheScope,
+    provider_kind: Option<ProviderKind>,
+    sql: &str,
+    params: P,
+) -> KnowledgeResult<RowData> {
+    let mut stmt = conn.prepare_cached(sql).owe_rule()?;
+    let col_names = extract_col_names_cached_with_scope(&stmt, scope, provider_kind, sql)?;
     let mut rows = stmt.query(params).owe_rule()?;
     if let Some(row) = rows.next().owe_rule()? {
         map_row(row, &col_names)
@@ -321,5 +446,21 @@ mod tests {
         let rows = query(&conn, "SELECT name FROM test WHERE id = ?1", [2]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0].to_string(), "chars(bob)");
+    }
+
+    #[test]
+    fn test_metadata_cache_key_for_scope_is_explicit() {
+        let sql = "SELECT id FROM test";
+        let scope_a = MetadataCacheScope {
+            datasource_id: DatasourceId("postgres:aaaa".to_string()),
+            generation: Generation(1),
+        };
+        let scope_b = MetadataCacheScope {
+            datasource_id: DatasourceId("postgres:bbbb".to_string()),
+            generation: Generation(2),
+        };
+        let key_a = metadata_cache_key_for_scope(&scope_a, sql);
+        let key_b = metadata_cache_key_for_scope(&scope_b, sql);
+        assert_ne!(key_a, key_b);
     }
 }

@@ -6,6 +6,7 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use async_trait::async_trait;
 use rusqlite::ToSql;
 use rusqlite::{Connection, OpenFlags};
 use wp_error::KnowledgeResult;
@@ -21,51 +22,60 @@ use crate::mysql::{MySqlProvider, MySqlProviderConfig};
 use crate::param::named_params_to_fields;
 use crate::postgres::{PostgresProvider, PostgresProviderConfig};
 use crate::runtime::{
-    CachePolicy, DatasourceId, Generation, ProviderExecutor, QueryRequest, QueryResponse,
-    RuntimeSnapshot, fields_to_params, runtime,
+    CachePolicy, DatasourceId, Generation, MetadataCacheScope, ProviderExecutor, QueryRequest,
+    QueryResponse, RuntimeSnapshot, runtime,
 };
 use crate::telemetry::{
-    CacheLayer, CacheOutcome, CacheTelemetryEvent, KnowledgeTelemetry, install_telemetry, telemetry,
+    CacheLayer, CacheOutcome, CacheTelemetryEvent, KnowledgeTelemetry, install_telemetry,
+    telemetry, telemetry_enabled,
 };
 
-struct MemProvider(MemDB);
+struct MemProvider {
+    db: MemDB,
+    metadata_scope: MetadataCacheScope,
+}
 
+#[async_trait]
 impl ProviderExecutor for ThreadClonedMDB {
     fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        crate::DBQuery::query(self, sql)
+        ThreadClonedMDB::query_with_scope(self, sql)
     }
 
     fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
-        ThreadClonedMDB::query_fields(self, sql, params)
+        ThreadClonedMDB::query_fields_with_scope(self, sql, params)
     }
 
     fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
-        crate::DBQuery::query_row(self, sql)
+        ThreadClonedMDB::query_row_with_scope(self, sql)
     }
 
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
-        ThreadClonedMDB::query_named_fields(self, sql, params)
+        ThreadClonedMDB::query_named_fields_with_scope(self, sql, params)
     }
 }
 
+#[async_trait]
 impl ProviderExecutor for MemProvider {
     fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        crate::DBQuery::query(&self.0, sql)
+        self.db.query_with_scope(&self.metadata_scope, sql)
     }
 
     fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
-        self.0.query_fields(sql, params)
+        self.db
+            .query_fields_with_scope(&self.metadata_scope, sql, params)
     }
 
     fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
-        crate::DBQuery::query_row(&self.0, sql)
+        self.db.query_row_with_scope(&self.metadata_scope, sql)
     }
 
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
-        self.0.query_named_fields(sql, params)
+        self.db
+            .query_named_fields_with_scope(&self.metadata_scope, sql, params)
     }
 }
 
+#[async_trait]
 impl ProviderExecutor for PostgresProvider {
     fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
         PostgresProvider::query(self, sql)
@@ -82,8 +92,33 @@ impl ProviderExecutor for PostgresProvider {
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
         PostgresProvider::query_named_fields(self, sql, params)
     }
+
+    async fn query_async(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+        PostgresProvider::query_async(self, sql).await
+    }
+
+    async fn query_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
+        PostgresProvider::query_fields_async(self, sql, params).await
+    }
+
+    async fn query_row_async(&self, sql: &str) -> KnowledgeResult<RowData> {
+        PostgresProvider::query_row_async(self, sql).await
+    }
+
+    async fn query_named_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        PostgresProvider::query_named_fields_async(self, sql, params).await
+    }
 }
 
+#[async_trait]
 impl ProviderExecutor for MySqlProvider {
     fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
         MySqlProvider::query(self, sql)
@@ -99,6 +134,30 @@ impl ProviderExecutor for MySqlProvider {
 
     fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
         MySqlProvider::query_named_fields(self, sql, params)
+    }
+
+    async fn query_async(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+        MySqlProvider::query_async(self, sql).await
+    }
+
+    async fn query_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
+        MySqlProvider::query_fields_async(self, sql, params).await
+    }
+
+    async fn query_row_async(&self, sql: &str) -> KnowledgeResult<RowData> {
+        MySqlProvider::query_row_async(self, sql).await
+    }
+
+    async fn query_named_fields_async(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        MySqlProvider::query_named_fields_async(self, sql, params).await
     }
 }
 
@@ -121,8 +180,9 @@ fn datasource_id_for(kind: ProviderKind, seed: &str) -> DatasourceId {
 pub fn init_thread_cloned_from_authority(authority_uri: &str) -> KnowledgeResult<()> {
     let datasource_id = datasource_id_for(ProviderKind::SqliteAuthority, authority_uri);
     install_provider(ProviderKind::SqliteAuthority, datasource_id, |generation| {
-        Ok(Arc::new(ThreadClonedMDB::from_authority_with_generation(
+        Ok(Arc::new(ThreadClonedMDB::from_authority_with_scope(
             authority_uri,
+            datasource_id_for(ProviderKind::SqliteAuthority, authority_uri),
             generation.0,
         )))
     })
@@ -132,24 +192,48 @@ pub fn init_mem_provider(memdb: MemDB) -> KnowledgeResult<()> {
     install_provider(
         ProviderKind::SqliteAuthority,
         datasource_id_for(ProviderKind::SqliteAuthority, "memdb"),
-        |_generation| Ok(Arc::new(MemProvider(memdb))),
+        |generation| {
+            Ok(Arc::new(MemProvider {
+                db: memdb,
+                metadata_scope: MetadataCacheScope {
+                    datasource_id: datasource_id_for(ProviderKind::SqliteAuthority, "memdb"),
+                    generation,
+                },
+            }))
+        },
     )
 }
 
 pub fn init_postgres_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
     let datasource_id = datasource_id_for(ProviderKind::Postgres, connection_uri);
-    install_provider(ProviderKind::Postgres, datasource_id, |_generation| {
-        let config = PostgresProviderConfig::new(connection_uri).with_pool_size(pool_size);
-        let provider = PostgresProvider::connect(&config)?;
-        Ok(Arc::new(provider))
-    })
+    install_provider(
+        ProviderKind::Postgres,
+        datasource_id.clone(),
+        |generation| {
+            let config = PostgresProviderConfig::new(connection_uri).with_pool_size(pool_size);
+            let provider = PostgresProvider::connect(
+                &config,
+                MetadataCacheScope {
+                    datasource_id: datasource_id.clone(),
+                    generation,
+                },
+            )?;
+            Ok(Arc::new(provider))
+        },
+    )
 }
 
 pub fn init_mysql_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
     let datasource_id = datasource_id_for(ProviderKind::Mysql, connection_uri);
-    install_provider(ProviderKind::Mysql, datasource_id, |_generation| {
+    install_provider(ProviderKind::Mysql, datasource_id.clone(), |generation| {
         let config = MySqlProviderConfig::new(connection_uri).with_pool_size(pool_size);
-        let provider = MySqlProvider::connect(&config)?;
+        let provider = MySqlProvider::connect(
+            &config,
+            MetadataCacheScope {
+                datasource_id: datasource_id.clone(),
+                generation,
+            },
+        )?;
         Ok(Arc::new(provider))
     })
 }
@@ -176,6 +260,13 @@ pub fn query(sql: &str) -> KnowledgeResult<Vec<RowData>> {
         .map(QueryResponse::into_rows)
 }
 
+pub async fn query_async(sql: &str) -> KnowledgeResult<Vec<RowData>> {
+    runtime()
+        .execute_async(&QueryRequest::many(sql, Vec::new(), CachePolicy::Bypass))
+        .await
+        .map(QueryResponse::into_rows)
+}
+
 pub fn query_row(sql: &str) -> KnowledgeResult<RowData> {
     runtime()
         .execute(&QueryRequest::first_row(
@@ -186,18 +277,33 @@ pub fn query_row(sql: &str) -> KnowledgeResult<RowData> {
         .map(QueryResponse::into_row)
 }
 
-pub fn query_fields(sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+pub async fn query_row_async(sql: &str) -> KnowledgeResult<RowData> {
     runtime()
-        .execute(&QueryRequest::first_row(
+        .execute_async(&QueryRequest::first_row(
             sql,
-            fields_to_params(params),
+            Vec::new(),
             CachePolicy::Bypass,
         ))
+        .await
         .map(QueryResponse::into_row)
+}
+
+pub fn query_fields(sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+    runtime().execute_first_row_fields(sql, params, CachePolicy::Bypass)
+}
+
+pub async fn query_fields_async(sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+    runtime()
+        .execute_first_row_fields_async(sql, params, CachePolicy::Bypass)
+        .await
 }
 
 pub fn query_named_fields(sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
     query_fields(sql, params)
+}
+
+pub async fn query_named_fields_async(sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+    query_fields_async(sql, params).await
 }
 
 pub fn query_named<'a>(
@@ -214,30 +320,119 @@ pub fn cache_query_fields<const N: usize>(
     query_params: &[DataField],
     cache: &mut impl CacheAble<DataField, RowData, N>,
 ) -> RowData {
-    let local_cache_scope = stable_hash(sql);
+    cache_query_fields_with_scope(sql, stable_hash(sql), c_params, query_params, cache)
+}
+
+pub fn cache_query_fields_with_scope<const N: usize>(
+    sql: &str,
+    local_cache_scope: u64,
+    c_params: &[DataField; N],
+    query_params: &[DataField],
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+) -> RowData {
     if let Some(generation) = current_generation() {
         cache.prepare_generation(generation);
     }
     if let Some(hit) = cache.fetch_scoped(local_cache_scope, c_params) {
         runtime().record_local_cache_hit();
-        telemetry().on_cache(&CacheTelemetryEvent {
-            layer: CacheLayer::Local,
-            outcome: CacheOutcome::Hit,
-            provider_kind: runtime().current_provider_kind(),
-        });
+        if telemetry_enabled() {
+            telemetry().on_cache(&CacheTelemetryEvent {
+                layer: CacheLayer::Local,
+                outcome: CacheOutcome::Hit,
+                provider_kind: runtime().current_provider_kind(),
+            });
+        }
         return hit.clone();
     }
     runtime().record_local_cache_miss();
-    telemetry().on_cache(&CacheTelemetryEvent {
-        layer: CacheLayer::Local,
-        outcome: CacheOutcome::Miss,
-        provider_kind: runtime().current_provider_kind(),
-    });
+    if telemetry_enabled() {
+        telemetry().on_cache(&CacheTelemetryEvent {
+            layer: CacheLayer::Local,
+            outcome: CacheOutcome::Miss,
+            provider_kind: runtime().current_provider_kind(),
+        });
+    }
 
-    let req = QueryRequest::first_row(sql, fields_to_params(query_params), CachePolicy::UseGlobal);
-    match runtime().execute(&req) {
-        Ok(out) => {
-            let row = out.into_row();
+    match runtime().execute_first_row_fields(sql, query_params, CachePolicy::UseGlobal) {
+        Ok(row) => {
+            cache.save_scoped(local_cache_scope, c_params, row.clone());
+            row
+        }
+        Err(err) => {
+            warn_kdb!("[kdb] query error: {}", err);
+            Vec::new()
+        }
+    }
+}
+
+pub async fn cache_query_fields_async<const N: usize>(
+    sql: &str,
+    c_params: &[DataField; N],
+    query_params: &[DataField],
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+) -> RowData {
+    cache_query_fields_async_with_scope(
+        sql,
+        stable_hash(sql),
+        c_params,
+        || query_params.to_vec(),
+        cache,
+    )
+    .await
+}
+
+pub async fn cache_query_fields_async_with<const N: usize, F>(
+    sql: &str,
+    c_params: &[DataField; N],
+    build_query_params: F,
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+) -> RowData
+where
+    F: FnOnce() -> Vec<DataField>,
+{
+    cache_query_fields_async_with_scope(sql, stable_hash(sql), c_params, build_query_params, cache)
+        .await
+}
+
+pub async fn cache_query_fields_async_with_scope<const N: usize, F>(
+    sql: &str,
+    local_cache_scope: u64,
+    c_params: &[DataField; N],
+    build_query_params: F,
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+) -> RowData
+where
+    F: FnOnce() -> Vec<DataField>,
+{
+    if let Some(generation) = current_generation() {
+        cache.prepare_generation(generation);
+    }
+    if let Some(hit) = cache.fetch_scoped(local_cache_scope, c_params) {
+        runtime().record_local_cache_hit();
+        if telemetry_enabled() {
+            telemetry().on_cache(&CacheTelemetryEvent {
+                layer: CacheLayer::Local,
+                outcome: CacheOutcome::Hit,
+                provider_kind: runtime().current_provider_kind(),
+            });
+        }
+        return hit.clone();
+    }
+    runtime().record_local_cache_miss();
+    if telemetry_enabled() {
+        telemetry().on_cache(&CacheTelemetryEvent {
+            layer: CacheLayer::Local,
+            outcome: CacheOutcome::Miss,
+            provider_kind: runtime().current_provider_kind(),
+        });
+    }
+
+    let query_params = build_query_params();
+    match runtime()
+        .execute_first_row_fields_async(sql, &query_params, CachePolicy::UseGlobal)
+        .await
+    {
+        Ok(row) => {
             cache.save_scoped(local_cache_scope, c_params, row.clone());
             row
         }
@@ -263,6 +458,23 @@ pub fn cache_query<const N: usize>(
     };
 
     cache_query_fields(sql, c_params, &query_fields, cache)
+}
+
+pub async fn cache_query_async<const N: usize>(
+    sql: &str,
+    c_params: &[DataField; N],
+    named_params: &[(&str, &dyn ToSql)],
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+) -> RowData {
+    let query_fields = match named_params_to_fields(named_params) {
+        Ok(fields) => fields,
+        Err(err) => {
+            warn_kdb!("[kdb] query param conversion error: {}", err);
+            return Vec::new();
+        }
+    };
+
+    cache_query_fields_async(sql, c_params, &query_fields, cache).await
 }
 
 fn ensure_wal(authority_uri: &str) -> KnowledgeResult<()> {
@@ -348,6 +560,8 @@ mod tests {
     use super::*;
     use crate::cache::FieldQueryCache;
     use crate::mem::memdb::MemDB;
+    use crate::mem::query_util::{COLNAME_CACHE, metadata_cache_key_for_scope};
+    use crate::runtime::fields_to_params;
     use crate::telemetry::{
         CacheLayer, CacheTelemetryEvent, KnowledgeTelemetry, QueryTelemetryEvent,
         ReloadTelemetryEvent, reset_telemetry,
@@ -424,6 +638,26 @@ mod tests {
         }
         db.execute("COMMIT").expect("commit perf_kv load");
         init_mem_provider(db).expect("init perf provider");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_async_works_with_mem_provider() {
+        let _guard = crate::runtime::runtime_test_guard().lock_async().await;
+        let db = MemDB::instance();
+        db.execute("CREATE TABLE async_kv (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create async_kv");
+        db.execute("INSERT INTO async_kv (id, value) VALUES (1, 'hello')")
+            .expect("insert async_kv row");
+        init_mem_provider(db).expect("init mem provider");
+
+        let row = query_fields_async(
+            "SELECT value FROM async_kv WHERE id=:id",
+            &[DataField::from_digit(":id", 1)],
+        )
+        .await
+        .expect("query async row");
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].to_string(), "chars(hello)");
     }
 
     #[derive(Clone)]
@@ -707,6 +941,109 @@ connection_uri = "{connection_uri}"
         init_mem_provider(db2).expect("replace provider with db2");
         let row = query_row("SELECT value FROM t WHERE id = 1").expect("query db2");
         assert_eq!(row[0].to_string(), "chars(second)");
+    }
+
+    #[test]
+    fn sqlite_metadata_cache_uses_provider_scope_after_reload() {
+        let _guard = crate::runtime::runtime_test_guard()
+            .lock()
+            .expect("provider test guard");
+        COLNAME_CACHE.write().expect("metadata cache lock").clear();
+
+        let db = MemDB::instance();
+        db.execute("CREATE TABLE cache_scope_t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO cache_scope_t (id, value) VALUES (1, 'scope-old')")
+            .expect("seed table");
+
+        let old_scope = MetadataCacheScope {
+            datasource_id: DatasourceId("sqlite:old".to_string()),
+            generation: Generation(1),
+        };
+        let new_scope = MetadataCacheScope {
+            datasource_id: DatasourceId("sqlite:new".to_string()),
+            generation: Generation(2),
+        };
+        let old_provider = MemProvider {
+            db: db.clone(),
+            metadata_scope: old_scope.clone(),
+        };
+
+        install_provider(
+            ProviderKind::SqliteAuthority,
+            new_scope.datasource_id.clone(),
+            |_generation| {
+                Ok(Arc::new(MemProvider {
+                    db: db.clone(),
+                    metadata_scope: new_scope.clone(),
+                }))
+            },
+        )
+        .expect("install new provider");
+
+        let row = old_provider
+            .query_row("SELECT value FROM cache_scope_t WHERE id = 1")
+            .expect("old provider query");
+        assert_eq!(row[0].to_string(), "chars(scope-old)");
+
+        let cache = COLNAME_CACHE.read().expect("metadata cache lock");
+        assert!(cache.contains(&metadata_cache_key_for_scope(
+            &old_scope,
+            "SELECT value FROM cache_scope_t WHERE id = 1",
+        )));
+        assert!(!cache.contains(&metadata_cache_key_for_scope(
+            &new_scope,
+            "SELECT value FROM cache_scope_t WHERE id = 1",
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_query_uses_runtime_bridge() {
+        let _guard = crate::runtime::runtime_test_guard().lock_async().await;
+        let db = MemDB::instance();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t (id, value) VALUES (1, 'async-first')")
+            .expect("seed table");
+        init_mem_provider(db).expect("init provider");
+
+        let row = query_row_async("SELECT value FROM t WHERE id = 1")
+            .await
+            .expect("async query row");
+        assert_eq!(row[0].to_string(), "chars(async-first)");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_cache_query_fields_hits_local_cache() {
+        let _guard = crate::runtime::runtime_test_guard().lock_async().await;
+        let db = MemDB::instance();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t (id, value) VALUES (1, 'async-cache')")
+            .expect("seed table");
+        init_mem_provider(db).expect("init provider");
+
+        let key = [DataField::from_digit("id", 1)];
+        let params = [DataField::from_digit(":id", 1)];
+        let mut cache = FieldQueryCache::default();
+
+        let first = cache_query_fields_async(
+            "SELECT value FROM t WHERE id=:id",
+            &key,
+            &params,
+            &mut cache,
+        )
+        .await;
+        let second = cache_query_fields_async(
+            "SELECT value FROM t WHERE id=:id",
+            &key,
+            &params,
+            &mut cache,
+        )
+        .await;
+
+        assert_eq!(first[0].to_string(), "chars(async-cache)");
+        assert_eq!(second[0].to_string(), "chars(async-cache)");
     }
 
     #[test]
