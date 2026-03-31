@@ -24,9 +24,31 @@ pub struct KnowDbConf {
     #[serde(default)]
     pub csv: CsvSpec,
     #[serde(default)]
+    pub cache: CacheSpec,
+    #[serde(default)]
     pub provider: Option<ProviderSpec>,
     #[serde(default)]
     pub tables: Vec<TableSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheSpec {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_result_cache_capacity")]
+    pub capacity: usize,
+    #[serde(default = "default_result_cache_ttl_ms")]
+    pub ttl_ms: u64,
+}
+
+impl Default for CacheSpec {
+    fn default() -> Self {
+        Self {
+            enabled: default_true(),
+            capacity: default_result_cache_capacity(),
+            ttl_ms: default_result_cache_ttl_ms(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,6 +56,7 @@ pub struct KnowDbConf {
 pub enum ProviderKind {
     SqliteAuthority,
     Postgres,
+    Mysql,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,7 +64,7 @@ pub struct ProviderSpec {
     pub kind: ProviderKind,
     pub connection_uri: String,
     #[serde(default)]
-    pub allowed_tables: Vec<String>,
+    pub pool_size: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -138,6 +161,12 @@ fn default_on_error() -> OnError {
 }
 fn default_dot() -> String {
     ".".to_string()
+}
+const fn default_result_cache_capacity() -> usize {
+    1024
+}
+const fn default_result_cache_ttl_ms() -> u64 {
+    30_000
 }
 
 /// 读取文本文件，返回字符串
@@ -389,33 +418,6 @@ fn build_csv_reader(
     rdr_b.from_path(data_path).owe_res()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_external_provider_spec() {
-        let dict = EnvDict::default();
-        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
-            r#"
-version = 2
-
-[provider]
-kind = "postgres"
-connection_uri = "postgres://demo:demo@127.0.0.1/demo"
-allowed_tables = ["cipher_demo"]
-"#,
-            &dict,
-        )
-        .expect("parse knowdb with provider");
-
-        assert!(conf.tables.is_empty());
-        let provider = conf.provider.expect("provider");
-        assert!(matches!(provider.kind, ProviderKind::Postgres));
-        assert_eq!(provider.allowed_tables, vec!["cipher_demo"]);
-    }
-}
-
 fn select_indices_by_header(
     headers: &csv::StringRecord,
     wanted: &[String],
@@ -445,11 +447,101 @@ fn extract_row_refs<'a>(
                 *bad += 1;
                 return Ok(None);
             } else {
-                // 将错误在调用方 bail（构建 anyhow）
                 anyhow::bail!("missing column at index {}", idx);
             }
         }
         vs.push(record.get(idx).unwrap_or(""));
     }
     Ok(Some(vs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_external_provider_spec() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider]
+kind = "postgres"
+connection_uri = "postgres://demo:demo@127.0.0.1/demo"
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with provider");
+
+        assert!(conf.tables.is_empty());
+        let provider = conf.provider.expect("provider");
+        assert!(matches!(provider.kind, ProviderKind::Postgres));
+        assert_eq!(
+            provider.connection_uri,
+            "postgres://demo:demo@127.0.0.1/demo"
+        );
+    }
+
+    #[test]
+    fn parse_mysql_provider_spec() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider]
+kind = "mysql"
+connection_uri = "mysql://demo:demo@127.0.0.1:3306/demo"
+pool_size = 12
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with mysql provider");
+
+        let provider = conf.provider.expect("provider");
+        assert!(matches!(provider.kind, ProviderKind::Mysql));
+        assert_eq!(
+            provider.connection_uri,
+            "mysql://demo:demo@127.0.0.1:3306/demo"
+        );
+        assert_eq!(provider.pool_size, Some(12));
+    }
+
+    #[test]
+    fn parse_cache_spec_with_defaults() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with default cache spec");
+
+        assert!(conf.cache.enabled);
+        assert_eq!(conf.cache.capacity, 1024);
+        assert_eq!(conf.cache.ttl_ms, 30_000);
+    }
+
+    #[test]
+    fn parse_cache_spec_from_toml() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[cache]
+enabled = false
+capacity = 256
+ttl_ms = 1500
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with cache spec");
+
+        assert!(!conf.cache.enabled);
+        assert_eq!(conf.cache.capacity, 256);
+        assert_eq!(conf.cache.ttl_ms, 1500);
+    }
 }

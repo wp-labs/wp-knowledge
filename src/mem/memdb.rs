@@ -26,6 +26,8 @@ use wp_model_core::model::DataField;
 
 use super::AnyResult;
 use super::SqlNamedParam;
+use crate::loader::ProviderKind;
+use crate::runtime::MetadataCacheScope;
 
 lazy_static! {
     // Important: Use a single SQLite in-memory connection so schema/data persist across calls.
@@ -121,22 +123,6 @@ impl DBQuery for MemDB {
         super::query_util::query_first_row_cached(&conn, sql, params)
     }
 
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        let sql = format!("select value from {}", table);
-        let conn = self.conn.get().owe_res()?;
-        let mut stmt = conn.prepare(&sql).owe_rule()?;
-        let mut rows = stmt.query([]).owe_rule()?;
-        let mut result = Vec::new();
-        while let Some(row) = rows.next().owe_rule()? {
-            let x = row.get_ref(0).owe_rule()?;
-            if let rusqlite::types::ValueRef::Text(val) = x {
-                result.push(String::from_utf8(val.to_vec()).owe_conf()?);
-            }
-        }
-
-        Ok(result)
-    }
-
     fn query_row_tdos<P: Params>(
         &self,
         _sql: &str,
@@ -149,6 +135,94 @@ impl DBQuery for MemDB {
     }
 }
 impl MemDB {
+    pub fn query_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+    ) -> KnowledgeResult<Vec<RowData>> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        super::query_util::query_cached_with_scope(
+            &conn,
+            scope,
+            Some(ProviderKind::SqliteAuthority),
+            sql,
+            [],
+        )
+    }
+
+    pub fn query_row_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+    ) -> KnowledgeResult<RowData> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        super::query_util::query_first_row_cached_with_scope(
+            &conn,
+            scope,
+            Some(ProviderKind::SqliteAuthority),
+            sql,
+            [],
+        )
+    }
+
+    pub fn query_fields_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        let named_params = params
+            .iter()
+            .cloned()
+            .map(SqlNamedParam)
+            .collect::<Vec<_>>();
+        let refs: Vec<(&str, &dyn ToSql)> = named_params
+            .iter()
+            .map(|param| (param.0.get_name(), param as &dyn ToSql))
+            .collect();
+        super::query_util::query_cached_with_scope(
+            &conn,
+            scope,
+            Some(ProviderKind::SqliteAuthority),
+            sql,
+            refs.as_slice(),
+        )
+    }
+
+    pub fn query_named_fields_with_scope(
+        &self,
+        scope: &MetadataCacheScope,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        self.query_fields_with_scope(scope, sql, params)
+            .map(|rows| rows.into_iter().next().unwrap_or_default())
+    }
+
+    pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
+        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let _ = crate::sqlite_ext::register_builtin(&conn);
+        let named_params = params
+            .iter()
+            .cloned()
+            .map(SqlNamedParam)
+            .collect::<Vec<_>>();
+        let refs: Vec<(&str, &dyn ToSql)> = named_params
+            .iter()
+            .map(|param| (param.0.get_name(), param as &dyn ToSql))
+            .collect();
+        super::query_util::query_cached(&conn, sql, refs.as_slice())
+    }
+
+    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+        self.query_fields(sql, params)
+            .map(|rows| rows.into_iter().next().unwrap_or_default())
+    }
+
     pub fn instance() -> Self {
         // Provide a single-connection pool for a consistent in-memory DB view
         let manager = SqliteConnectionManager::memory();
@@ -602,18 +676,6 @@ mod tests {
         assert_eq!(row.len(), 2);
         assert_eq!(row[0].get_name(), "the number");
         assert_eq!(row[1].get_name(), "the text");
-        Ok(())
-    }
-
-    #[test]
-    fn test_query_cipher_basic() -> AnyResult<()> {
-        let db = MemDB::instance();
-        db.execute("CREATE TABLE cipher (value TEXT)")?;
-        db.execute("INSERT INTO cipher (value) VALUES ('A')")?;
-        db.execute("INSERT INTO cipher (value) VALUES ('B')")?;
-        let vals = db.query_cipher("cipher")?;
-        assert!(vals.contains(&"A".to_string()));
-        assert!(vals.contains(&"B".to_string()));
         Ok(())
     }
 

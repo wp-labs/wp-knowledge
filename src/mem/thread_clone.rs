@@ -4,14 +4,26 @@ use std::time::Duration;
 use crate::DBQuery;
 use crate::mem::RowData;
 use orion_error::{ErrorOwe, ErrorWith};
+use rusqlite::ToSql;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, Params};
 use wp_error::KnowledgeResult;
+use wp_log::debug_kdb;
 use wp_model_core::model::DataField;
+
+use super::SqlNamedParam;
+use crate::loader::ProviderKind;
+use crate::runtime::{DatasourceId, Generation, MetadataCacheScope};
 
 thread_local! {
     // clippy: use const init for thread_local value
-    static TLS_DB: RefCell<Option<Connection>> = const { RefCell::new(None) };
+    static TLS_DB: RefCell<Option<ThreadLocalState>> = const { RefCell::new(None) };
+}
+
+struct ThreadLocalState {
+    authority_path: String,
+    generation: u64,
+    conn: Connection,
 }
 
 /// Thread-cloned read-only in-memory DB built from an authority file DB via SQLite backup API.
@@ -19,12 +31,39 @@ thread_local! {
 #[derive(Clone)]
 pub struct ThreadClonedMDB {
     authority_path: String,
+    metadata_scope: MetadataCacheScope,
 }
 
 impl ThreadClonedMDB {
     pub fn from_authority(path: &str) -> Self {
         Self {
             authority_path: path.to_string(),
+            metadata_scope: MetadataCacheScope {
+                datasource_id: DatasourceId("sqlite:standalone".to_string()),
+                generation: Generation(0),
+            },
+        }
+    }
+
+    pub fn from_authority_with_generation(path: &str, generation: u64) -> Self {
+        Self::from_authority_with_scope(
+            path,
+            DatasourceId("sqlite:standalone".to_string()),
+            generation,
+        )
+    }
+
+    pub fn from_authority_with_scope(
+        path: &str,
+        datasource_id: DatasourceId,
+        generation: u64,
+    ) -> Self {
+        Self {
+            authority_path: path.to_string(),
+            metadata_scope: MetadataCacheScope {
+                datasource_id,
+                generation: Generation(generation),
+            },
         }
     }
 
@@ -33,9 +72,20 @@ impl ThreadClonedMDB {
         f: F,
     ) -> KnowledgeResult<T> {
         let path = self.authority_path.clone();
+        let generation = self.metadata_scope.generation.0;
         TLS_DB.with(|cell| {
             // make sure a thread-local in-memory db exists
-            if cell.borrow().is_none() {
+            let should_rebuild = cell
+                .borrow()
+                .as_ref()
+                .map(|state| state.authority_path != path || state.generation != generation)
+                .unwrap_or(true);
+            if should_rebuild {
+                debug_kdb!(
+                    "[kdb] rebuild thread-local sqlite snapshot generation={} path={}",
+                    generation,
+                    path
+                );
                 // source: authority file; dest: in-memory
                 let src = Connection::open_with_flags(
                     &path,
@@ -54,11 +104,81 @@ impl ThreadClonedMDB {
                 }
                 // 为查询连接注册内置 UDF（只读场景也可用在 SQL/OML 查询中）
                 let _ = crate::sqlite_ext::register_builtin(&dst);
-                *cell.borrow_mut() = Some(dst);
+                *cell.borrow_mut() = Some(ThreadLocalState {
+                    authority_path: path.clone(),
+                    generation,
+                    conn: dst,
+                });
             }
             // safe to unwrap since ensured above
             let conn = cell.borrow();
-            f(conn.as_ref().unwrap())
+            f(&conn.as_ref().unwrap().conn)
+        })
+    }
+
+    pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
+        self.query_fields_with_scope(sql, params)
+    }
+
+    pub fn query_fields_with_scope(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<Vec<RowData>> {
+        self.with_tls_conn(|conn| {
+            let named_params = params
+                .iter()
+                .cloned()
+                .map(SqlNamedParam)
+                .collect::<Vec<_>>();
+            let refs: Vec<(&str, &dyn ToSql)> = named_params
+                .iter()
+                .map(|param| (param.0.get_name(), param as &dyn ToSql))
+                .collect();
+            super::query_util::query_cached_with_scope(
+                conn,
+                &self.metadata_scope,
+                Some(ProviderKind::SqliteAuthority),
+                sql,
+                refs.as_slice(),
+            )
+        })
+    }
+
+    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+        self.query_named_fields_with_scope(sql, params)
+    }
+
+    pub fn query_named_fields_with_scope(
+        &self,
+        sql: &str,
+        params: &[DataField],
+    ) -> KnowledgeResult<RowData> {
+        self.query_fields_with_scope(sql, params)
+            .map(|rows| rows.into_iter().next().unwrap_or_default())
+    }
+
+    pub fn query_with_scope(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+        self.with_tls_conn(|conn| {
+            super::query_util::query_cached_with_scope(
+                conn,
+                &self.metadata_scope,
+                Some(ProviderKind::SqliteAuthority),
+                sql,
+                [],
+            )
+        })
+    }
+
+    pub fn query_row_with_scope(&self, sql: &str) -> KnowledgeResult<RowData> {
+        self.with_tls_conn(|conn| {
+            super::query_util::query_first_row_cached_with_scope(
+                conn,
+                &self.metadata_scope,
+                Some(ProviderKind::SqliteAuthority),
+                sql,
+                [],
+            )
         })
     }
 }
@@ -82,21 +202,5 @@ impl DBQuery for ThreadClonedMDB {
     ) -> KnowledgeResult<RowData> {
         // not used in current benchmarks
         Ok(vec![])
-    }
-
-    fn query_cipher(&self, table: &str) -> KnowledgeResult<Vec<String>> {
-        self.with_tls_conn(|conn| {
-            let sql = format!("select value from {}", table);
-            let mut stmt = conn.prepare(&sql).owe_rule()?;
-            let mut rows = stmt.query([]).owe_rule()?;
-            let mut result = Vec::new();
-            while let Some(row) = rows.next().owe_rule()? {
-                let x = row.get_ref(0).owe_rule()?;
-                if let rusqlite::types::ValueRef::Text(val) = x {
-                    result.push(String::from_utf8(val.to_vec()).owe_rule()?);
-                }
-            }
-            Ok(result)
-        })
     }
 }

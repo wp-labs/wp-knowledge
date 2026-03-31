@@ -1,0 +1,71 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [0.11.1]
+
+### Added
+- Add async provider query APIs and async/runtime regression coverage for SQLite, PostgreSQL, and MySQL providers.  
+  增加 async Provider 查询接口，以及面向 SQLite、PostgreSQL、MySQL Provider 的 async/runtime 回归测试覆盖。
+- Add async provider performance documentation and benchmark notes.  
+  增加 async Provider 性能测试与结论文档。
+
+### Changed
+- Switch PostgreSQL and MySQL providers to Tokio-based async execution with pooled runtime-managed query paths.  
+  将 PostgreSQL 与 MySQL Provider 切换为基于 Tokio 的异步执行路径，并统一到带连接池的 runtime 管理查询模型。
+- Extend provider runtime with async execution entry points while keeping generation-aware reload and cache semantics aligned across sync and async paths.  
+  为 provider runtime 增加 async 执行入口，同时保持 sync/async 两条路径上的 generation 感知 reload 与 cache 语义一致。
+
+### Fixed
+- Fix metadata cache scoping so SQLite, PostgreSQL, and MySQL queries keep datasource/generation isolation across reloads.  
+  修复 metadata cache 作用域问题，确保 SQLite、PostgreSQL、MySQL 在 reload 前后保持 datasource/generation 隔离。
+- Fix SQLite async bridge so queued async queries keep the captured provider handle instead of jumping to a newer provider after reload.  
+  修复 SQLite async bridge，避免排队中的异步查询在 reload 后跳转到更新后的 provider。
+- Fix PostgreSQL named-parameter rewriting so casts, comments, and dollar-quoted bodies are not misparsed as placeholders.  
+  修复 PostgreSQL 命名参数重写逻辑，避免将 cast、注释和 dollar-quote 体误判为占位符。
+- Fix first-row query paths to avoid materializing full result sets when only one row is required.  
+  修复 first-row 查询路径，避免在只需要一行时先物化整个结果集。
+
+## [0.11.0]
+
+Added since `v0.10.4`.  
+自 `v0.10.4` 以来新增内容。
+
+### Added
+- Add external MySQL provider support, including local Compose validation scripts.  
+  增加外部 MySQL Provider 支持，并补充本地 Compose 验证脚本。
+- Add `[cache] enabled/capacity/ttl_ms` in `knowdb.toml` to control runtime result cache.  
+  在 `knowdb.toml` 中增加 `[cache] enabled/capacity/ttl_ms`，用于控制 runtime result cache。
+- Add runtime snapshot and installable telemetry hooks for provider, cache, query, and reload diagnostics.  
+  增加 runtime snapshot 与可安装的 telemetry hook，用于观测 provider、cache、query 与 reload 状态。
+- Add cache performance scripts and provider-level cache perf coverage for SQLite, PostgreSQL, and MySQL.  
+  增加 SQLite、PostgreSQL、MySQL 的 cache 性能脚本与 provider 级性能验证。
+- Add generation-aware provider runtime behavior for reload, result cache, local cache, and metadata cache.  
+  增加带 generation 感知的 provider runtime 语义，覆盖 reload、result cache、local cache 与 metadata cache。
+- Add metadata cache and cache telemetry support for PostgreSQL and MySQL query paths, including empty-result queries.  
+  为 PostgreSQL / MySQL 查询路径增加 metadata cache 与对应 cache telemetry，并覆盖空结果查询场景。
+- Add documentation for cache architecture, configuration, and invalidation behavior.  
+  增加 cache 架构、配置项与失效语义相关文档。
+
+### Changed
+- Switch PostgreSQL provider to pooled connections and support `[provider].pool_size`.  
+  PostgreSQL Provider 改为连接池实现，并支持 `[provider].pool_size` 配置。
+
+### Removed
+- Remove `query_cipher` and related stale code and documentation references.  
+  删除 `query_cipher` 及相关过期代码与文档引用。
+- Remove `allowed_tables` from external provider configuration.  
+  从外部 provider 配置中删除 `allowed_tables`。
+
+### Fixed
+- Fix local cache scoping so different SQL statements do not accidentally share the same cache entry.  
+  修复 local cache 作用域问题，避免不同 SQL 意外共享同一条缓存记录。
+- Fix result-cache config application timing so failed provider reloads do not leak new cache settings onto the previous provider.  
+  修复 result cache 配置应用时机，避免 provider reload 失败后污染旧 provider 的 cache 配置。
+- Fix PostgreSQL / MySQL provider tests and naming after the API cleanup.  
+  修复 PostgreSQL / MySQL provider 相关测试与命名问题。

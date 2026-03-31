@@ -7,7 +7,7 @@
 - `knowdb.toml` 支持 `[provider] kind = "postgres"`
 - `facade::query_fields(...)` / `cache_query_fields(...)` 已成为推荐的 provider-neutral 查询入口
 - `facade::query_named(...)` / `cache_query(...)` 仍保留，作为兼容旧版 SQLite 参数接口的 wrapper
-- PostgreSQL 的基础查询、命名参数重写、`query_cipher`、手工测试脚本已经可用
+- PostgreSQL 的基础查询、命名参数重写、手工测试脚本已经可用
 
 当前状态适合验证功能通路，但还不足以视为“长期稳定可运营”的 PostgreSQL 支持。
 
@@ -40,8 +40,6 @@ Current:
 Tasks:
 
 - 初始化时增加基础自检
-- 校验白名单表是否存在
-- 校验 `query_cipher` 依赖表是否可读
 - 输出清晰的错误信息，区分连接问题、权限问题、schema 问题
 
 Acceptance:

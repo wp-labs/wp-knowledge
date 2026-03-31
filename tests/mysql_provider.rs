@@ -5,88 +5,65 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use mysql::prelude::Queryable;
+use mysql::{Opts, Pool};
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
-use tokio_postgres::{Client, NoTls};
 use wp_knowledge::cache::FieldQueryCache;
 use wp_knowledge::facade as kdb;
 use wp_knowledge::runtime::{CachePolicy, QueryRequest, fields_to_params, runtime};
 use wp_model_core::model::DataField;
 
-fn postgres_url() -> String {
-    std::env::var("WP_KDB_TEST_POSTGRES_URL")
-        .expect("WP_KDB_TEST_POSTGRES_URL must be set to run postgres_provider")
+fn mysql_url() -> String {
+    std::env::var("WP_KDB_TEST_MYSQL_URL")
+        .expect("WP_KDB_TEST_MYSQL_URL must be set to run mysql_provider")
 }
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn postgres_test_guard() -> &'static Mutex<()> {
+fn mysql_test_guard() -> &'static Mutex<()> {
     static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
     GUARD.get_or_init(|| Mutex::new(()))
 }
 
-async fn connect_postgres_with_retry(url: &str) -> Client {
-    let mut last_err = None;
-    for _ in 0..30 {
-        match tokio_postgres::connect(url, NoTls).await {
-            Ok((client, connection)) => {
-                tokio::spawn(async move {
-                    let _ = connection.await;
-                });
-                return client;
-            }
-            Err(err) => {
-                last_err = Some(err);
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
-    panic!(
-        "connect postgres failed: {}",
-        last_err.expect("postgres connect error")
-    );
-}
-
-fn seed_postgres_lookup_table(url: &str) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime for postgres seed");
-    rt.block_on(async {
-        let admin = connect_postgres_with_retry(url).await;
+fn ensure_mysql_provider_initialized() -> String {
+    static INIT: OnceLock<String> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let url = mysql_url();
+        let opts = Opts::from_url(&url).expect("parse WP_KDB_TEST_MYSQL_URL failed");
+        let pool = Pool::new(opts).expect("connect to WP_KDB_TEST_MYSQL_URL failed");
+        let mut admin = pool.get_conn().expect("open mysql admin connection failed");
         admin
-            .batch_execute(
+            .query_drop(
                 r#"
-CREATE TABLE IF NOT EXISTS wp_knowledge_pg_lookup (
+CREATE TABLE IF NOT EXISTS wp_knowledge_mysql_lookup (
     id BIGINT PRIMARY KEY,
     name TEXT NOT NULL,
     pinying TEXT NOT NULL
-);
-TRUNCATE TABLE wp_knowledge_pg_lookup;
-INSERT INTO wp_knowledge_pg_lookup (id, name, pinying)
-VALUES
-    (1, '令狐冲', 'linghuchong'),
-    (2, '小龙女', 'xiaolongnu');
+)
 "#,
             )
-            .await
-            .expect("seed postgres lookup table failed");
-    });
-}
-
-fn ensure_postgres_provider_initialized() -> String {
-    static INIT: OnceLock<String> = OnceLock::new();
-    INIT.get_or_init(|| {
-        let url = postgres_url();
-
-        seed_postgres_lookup_table(&url);
+            .expect("create mysql_provider test table failed");
+        admin
+            .query_drop("TRUNCATE TABLE wp_knowledge_mysql_lookup")
+            .expect("truncate mysql_provider test table failed");
+        admin
+            .query_drop(
+                r#"
+INSERT INTO wp_knowledge_mysql_lookup (id, name, pinying)
+VALUES
+    (1, '令狐冲', 'linghuchong'),
+    (2, '小龙女', 'xiaolongnu')
+"#,
+            )
+            .expect("seed mysql_provider test data failed");
 
         let root = workspace_root();
         let tmp = root.join(".tmp");
-        fs::create_dir_all(&tmp).expect("create .tmp for postgres_provider failed");
-        let conf_path = tmp.join("postgres-knowdb.toml");
+        fs::create_dir_all(&tmp).expect("create .tmp for mysql_provider failed");
+        let conf_path = tmp.join("mysql-knowdb.toml");
         fs::write(
             &conf_path,
             format!(
@@ -94,12 +71,13 @@ fn ensure_postgres_provider_initialized() -> String {
 version = 2
 
 [provider]
-kind = "postgres"
+kind = "mysql"
 connection_uri = "{url}"
+pool_size = 8
 "#
             ),
         )
-        .expect("write postgres_provider knowdb config failed");
+        .expect("write mysql_provider knowdb config failed");
 
         let authority_uri = format!(
             "file:{}?mode=rwc&uri=true",
@@ -111,42 +89,11 @@ connection_uri = "{url}"
             &authority_uri,
             &orion_variate::EnvDict::default(),
         )
-        .expect("init postgres provider from knowdb failed");
+        .expect("init mysql provider from knowdb failed");
 
         url
     })
     .clone()
-}
-
-#[test]
-#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
-fn postgres_provider_init_and_query_inside_tokio_runtime() {
-    let _guard = postgres_test_guard().lock().expect("postgres test guard");
-    let url = postgres_url();
-    seed_postgres_lookup_table(&url);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime for postgres provider");
-
-    rt.block_on(async {
-        kdb::init_postgres_provider(&url, Some(4))
-            .expect("init postgres provider inside tokio runtime");
-
-        let params = [DataField::from_chars(
-            ":name".to_string(),
-            "令狐冲".to_string(),
-        )];
-        let row = kdb::query_fields(
-            "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name",
-            &params,
-        )
-        .expect("postgres query inside tokio runtime");
-        assert_eq!(row.len(), 1);
-        assert_eq!(row[0].get_name(), "pinying");
-        assert_eq!(row[0].to_string(), "chars(linghuchong)");
-    });
 }
 
 fn perf_env_usize(key: &str, default: usize) -> usize {
@@ -169,38 +116,33 @@ fn perf_concurrency_levels() -> Vec<usize> {
         .unwrap_or_else(|| vec![1, 4, 16, 64])
 }
 
-fn seed_postgres_perf_table(url: &str, rows: usize) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime for postgres perf seed");
-    rt.block_on(async {
-        let admin = connect_postgres_with_retry(url).await;
-        admin
-            .batch_execute(
-                r#"
-CREATE TABLE IF NOT EXISTS wp_knowledge_pg_perf_lookup (
+fn seed_mysql_perf_table(url: &str, rows: usize) {
+    let opts = Opts::from_url(url).expect("parse mysql perf url failed");
+    let pool = Pool::new(opts).expect("connect mysql perf admin failed");
+    let mut admin = pool
+        .get_conn()
+        .expect("open mysql perf admin connection failed");
+    admin
+        .query_drop(
+            r#"
+CREATE TABLE IF NOT EXISTS wp_knowledge_mysql_perf_lookup (
     id BIGINT PRIMARY KEY,
     value TEXT NOT NULL
-);
-TRUNCATE TABLE wp_knowledge_pg_perf_lookup;
+)
 "#,
+        )
+        .expect("create mysql perf table failed");
+    admin
+        .query_drop("TRUNCATE TABLE wp_knowledge_mysql_perf_lookup")
+        .expect("truncate mysql perf table failed");
+    for id in 1..=rows as i64 {
+        admin
+            .exec_drop(
+                "INSERT INTO wp_knowledge_mysql_perf_lookup (id, value) VALUES (?, ?)",
+                (id, format!("value_{id}")),
             )
-            .await
-            .expect("prepare postgres perf table failed");
-
-        let stmt = admin
-            .prepare("INSERT INTO wp_knowledge_pg_perf_lookup (id, value) VALUES ($1, $2)")
-            .await
-            .expect("prepare postgres perf insert failed");
-        for id in 1..=rows as i64 {
-            let value = format!("value_{id}");
-            admin
-                .execute(&stmt, &[&id, &value])
-                .await
-                .expect("insert postgres perf row failed");
-        }
-    });
+            .expect("insert mysql perf row failed");
+    }
 }
 
 #[derive(Clone)]
@@ -219,7 +161,7 @@ fn build_perf_workload(ops: usize, hotset: usize) -> Vec<PerfQuery> {
             let query_params = [DataField::from_digit(":id", id)];
             let bypass_params = [DataField::from_digit(":id".to_string(), id)];
             let global_req = QueryRequest::first_row(
-                "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+                "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
                 fields_to_params(&query_params),
                 CachePolicy::UseGlobal,
             );
@@ -364,16 +306,16 @@ fn perf_counter_delta(before: &wp_knowledge::runtime::RuntimeSnapshot) -> PerfCo
     }
 }
 
-fn run_postgres_bypass(url: &str, workload: &[PerfQuery]) -> PerfResult {
-    kdb::init_postgres_provider(url, Some(8)).expect("init postgres provider for bypass");
+fn run_mysql_bypass(url: &str, workload: &[PerfQuery]) -> PerfResult {
+    kdb::init_mysql_provider(url, Some(8)).expect("init mysql provider for bypass");
     let before = kdb::runtime_snapshot();
     let started = Instant::now();
     for item in workload {
         let row = kdb::query_fields(
-            "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+            "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
             &item.bypass_params,
         )
-        .expect("postgres bypass query");
+        .expect("mysql bypass query");
         black_box(row);
     }
     PerfResult {
@@ -384,14 +326,14 @@ fn run_postgres_bypass(url: &str, workload: &[PerfQuery]) -> PerfResult {
     }
 }
 
-fn run_postgres_global_cache(url: &str, workload: &[PerfQuery]) -> PerfResult {
-    kdb::init_postgres_provider(url, Some(8)).expect("init postgres provider for global cache");
+fn run_mysql_global_cache(url: &str, workload: &[PerfQuery]) -> PerfResult {
+    kdb::init_mysql_provider(url, Some(8)).expect("init mysql provider for global cache");
     let before = kdb::runtime_snapshot();
     let started = Instant::now();
     for item in workload {
         let row = runtime()
             .execute(&item.global_req)
-            .expect("postgres global-cache query")
+            .expect("mysql global-cache query")
             .into_row();
         black_box(row);
     }
@@ -403,14 +345,14 @@ fn run_postgres_global_cache(url: &str, workload: &[PerfQuery]) -> PerfResult {
     }
 }
 
-fn run_postgres_local_cache(url: &str, workload: &[PerfQuery]) -> PerfResult {
-    kdb::init_postgres_provider(url, Some(8)).expect("init postgres provider for local cache");
+fn run_mysql_local_cache(url: &str, workload: &[PerfQuery]) -> PerfResult {
+    kdb::init_mysql_provider(url, Some(8)).expect("init mysql provider for local cache");
     let mut cache = wp_knowledge::cache::FieldQueryCache::with_capacity(workload.len().max(1));
     let before = kdb::runtime_snapshot();
     let started = Instant::now();
     for item in workload {
         let row = kdb::cache_query_fields(
-            "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+            "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
             &item.cache_key,
             &item.query_params,
             &mut cache,
@@ -427,7 +369,7 @@ fn run_postgres_local_cache(url: &str, workload: &[PerfQuery]) -> PerfResult {
 
 fn print_perf_result(result: &PerfResult) {
     eprintln!(
-        "[wp-knowledge][postgres-cache-perf] scenario={} elapsed_ms={} qps={:.0} result_hit={} result_miss={} local_hit={} local_miss={} metadata_hit={} metadata_miss={}",
+        "[wp-knowledge][mysql-cache-perf] scenario={} elapsed_ms={} qps={:.0} result_hit={} result_miss={} local_hit={} local_miss={} metadata_hit={} metadata_miss={}",
         result.name,
         result.elapsed.as_millis(),
         result.qps(),
@@ -469,24 +411,24 @@ fn print_concurrent_latency_result(provider: &str, result: &ConcurrentLatencyRes
     );
 }
 
-fn run_postgres_sync_latency(url: &str, workload: &[PerfQuery]) -> LatencyResult {
-    kdb::init_postgres_provider(url, Some(8)).expect("init postgres provider for sync latency");
+fn run_mysql_sync_latency(url: &str, workload: &[PerfQuery]) -> LatencyResult {
+    kdb::init_mysql_provider(url, Some(8)).expect("init mysql provider for sync latency");
     let warm = [DataField::from_digit(":id", 1)];
     let _ = kdb::query_fields(
-        "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+        "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
         &warm,
     )
-    .expect("warm postgres sync query");
+    .expect("warm mysql sync query");
 
     let mut samples_us = Vec::with_capacity(workload.len());
     let started = Instant::now();
     for item in workload {
         let op_started = Instant::now();
         let row = kdb::query_fields(
-            "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+            "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
             &item.bypass_params,
         )
-        .expect("postgres sync query");
+        .expect("mysql sync query");
         black_box(row);
         samples_us.push(op_started.elapsed().as_secs_f64() * 1_000_000.0);
     }
@@ -500,32 +442,31 @@ fn run_postgres_sync_latency(url: &str, workload: &[PerfQuery]) -> LatencyResult
     }
 }
 
-fn run_postgres_async_latency(url: &str, workload: &[PerfQuery]) -> LatencyResult {
+fn run_mysql_async_latency(url: &str, workload: &[PerfQuery]) -> LatencyResult {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("build tokio runtime for postgres async latency");
+        .expect("build tokio runtime for mysql async latency");
     rt.block_on(async {
-        kdb::init_postgres_provider(url, Some(8))
-            .expect("init postgres provider for async latency");
+        kdb::init_mysql_provider(url, Some(8)).expect("init mysql provider for async latency");
         let warm = [DataField::from_digit(":id", 1)];
         let _ = kdb::query_fields_async(
-            "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+            "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
             &warm,
         )
         .await
-        .expect("warm postgres async query");
+        .expect("warm mysql async query");
 
         let mut samples_us = Vec::with_capacity(workload.len());
         let started = Instant::now();
         for item in workload {
             let op_started = Instant::now();
             let row = kdb::query_fields_async(
-                "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+                "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
                 &item.bypass_params,
             )
             .await
-            .expect("postgres async query");
+            .expect("mysql async query");
             black_box(row);
             samples_us.push(op_started.elapsed().as_secs_f64() * 1_000_000.0);
         }
@@ -540,14 +481,14 @@ fn run_postgres_async_latency(url: &str, workload: &[PerfQuery]) -> LatencyResul
     })
 }
 
-fn run_postgres_async_cache_concurrency(
+fn run_mysql_async_cache_concurrency(
     url: &str,
     workload: &[PerfQuery],
     concurrency: usize,
     mode: AsyncPerfMode,
 ) -> ConcurrentLatencyResult {
-    kdb::init_postgres_provider(url, Some(8))
-        .expect("init postgres provider for async cache concurrency");
+    kdb::init_mysql_provider(url, Some(8))
+        .expect("init mysql provider for async cache concurrency");
     let worker_count = concurrency.max(1).min(workload.len().max(1));
     let worker_threads = worker_count.clamp(2, 16);
     let shards = shard_workload(workload, worker_count);
@@ -555,36 +496,36 @@ fn run_postgres_async_cache_concurrency(
         .worker_threads(worker_threads)
         .enable_all()
         .build()
-        .expect("build tokio runtime for postgres async cache concurrency");
+        .expect("build tokio runtime for mysql async cache concurrency");
 
     rt.block_on(async move {
         match mode {
             AsyncPerfMode::Bypass => {
                 let warm = [DataField::from_digit(":id", 1)];
                 let _ = kdb::query_fields_async(
-                    "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+                    "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
                     &warm,
                 )
                 .await
-                .expect("warm postgres async bypass query");
+                .expect("warm mysql async bypass query");
             }
             AsyncPerfMode::GlobalCache => {
                 let req = QueryRequest::first_row(
-                    "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+                    "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
                     fields_to_params(&[DataField::from_digit(":id", 1)]),
                     CachePolicy::UseGlobal,
                 );
                 let _ = runtime()
                     .execute_async(&req)
                     .await
-                    .expect("warm postgres async global-cache query");
+                    .expect("warm mysql async global-cache query");
             }
             AsyncPerfMode::LocalCache => {
                 let mut cache = FieldQueryCache::with_capacity(16);
                 let cache_key = [DataField::from_digit("id", 1)];
                 let query_params = [DataField::from_digit(":id", 1)];
                 let _ = kdb::cache_query_fields_async(
-                    "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+                    "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
                     &cache_key,
                     &query_params,
                     &mut cache,
@@ -606,19 +547,19 @@ fn run_postgres_async_cache_concurrency(
                     let op_started = Instant::now();
                     let row = match mode {
                         AsyncPerfMode::Bypass => kdb::query_fields_async(
-                            "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+                            "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
                             &item.bypass_params,
                         )
                         .await
-                        .expect("postgres async bypass query"),
+                        .expect("mysql async bypass query"),
                         AsyncPerfMode::GlobalCache => runtime()
                             .execute_async(&item.global_req)
                             .await
-                            .expect("postgres async global-cache query")
+                            .expect("mysql async global-cache query")
                             .into_row(),
                         AsyncPerfMode::LocalCache => {
                             kdb::cache_query_fields_async(
-                                "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+                                "SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
                                 &item.cache_key,
                                 &item.query_params,
                                 &mut cache,
@@ -637,7 +578,7 @@ fn run_postgres_async_cache_concurrency(
         barrier.wait().await;
         let mut samples_us = Vec::with_capacity(workload.len());
         while let Some(joined) = set.join_next().await {
-            samples_us.extend(joined.expect("join postgres async cache worker"));
+            samples_us.extend(joined.expect("join mysql async cache worker"));
         }
         let elapsed = started.elapsed();
         let counters = perf_counter_delta(&before);
@@ -654,10 +595,10 @@ fn run_postgres_async_cache_concurrency(
 }
 
 #[test]
-#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
-fn postgres_provider_query_and_pool() {
-    let _guard = postgres_test_guard().lock().expect("postgres test guard");
-    let _url = ensure_postgres_provider_initialized();
+#[ignore = "requires WP_KDB_TEST_MYSQL_URL and a reachable MySQL instance"]
+fn mysql_provider_query_and_pool() {
+    let _guard = mysql_test_guard().lock().expect("mysql test guard");
+    let _url = ensure_mysql_provider_initialized();
 
     let before = kdb::runtime_snapshot();
     let params = [DataField::from_chars(
@@ -665,18 +606,18 @@ fn postgres_provider_query_and_pool() {
         "令狐冲".to_string(),
     )];
     let row = kdb::query_fields(
-        "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name",
+        "SELECT pinying FROM wp_knowledge_mysql_lookup WHERE name=:name",
         &params,
     )
-    .expect("postgres named query");
+    .expect("mysql named query");
     assert_eq!(row.len(), 1);
     assert_eq!(row[0].get_name(), "pinying");
     assert_eq!(row[0].to_string(), "chars(linghuchong)");
     let row = kdb::query_fields(
-        "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name",
+        "SELECT pinying FROM wp_knowledge_mysql_lookup WHERE name=:name",
         &params,
     )
-    .expect("postgres named query second hit");
+    .expect("mysql named query second hit");
     assert_eq!(row[0].to_string(), "chars(linghuchong)");
     let after_metadata = kdb::runtime_snapshot();
     assert!(after_metadata.metadata_cache_misses > before.metadata_cache_misses);
@@ -684,16 +625,16 @@ fn postgres_provider_query_and_pool() {
 
     let before_empty = kdb::runtime_snapshot();
     let empty = kdb::query_fields(
-        "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name AND id=-1",
+        "SELECT pinying FROM wp_knowledge_mysql_lookup WHERE name=:name AND id=-1",
         &params,
     )
-    .expect("postgres empty metadata miss");
+    .expect("mysql empty metadata miss");
     assert!(empty.is_empty());
     let empty = kdb::query_fields(
-        "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name AND id=-1",
+        "SELECT pinying FROM wp_knowledge_mysql_lookup WHERE name=:name AND id=-1",
         &params,
     )
-    .expect("postgres empty metadata hit");
+    .expect("mysql empty metadata hit");
     assert!(empty.is_empty());
     let after_empty = kdb::runtime_snapshot();
     assert!(after_empty.metadata_cache_misses > before_empty.metadata_cache_misses);
@@ -709,15 +650,14 @@ fn postgres_provider_query_and_pool() {
                 )];
                 let row = kdb::query_fields(
                     r#"
-WITH wait_for_pool AS (SELECT pg_sleep(0.2))
 SELECT pinying
-FROM wp_knowledge_pg_lookup
-CROSS JOIN wait_for_pool
+FROM wp_knowledge_mysql_lookup
+CROSS JOIN (SELECT SLEEP(0.2)) AS wait_for_pool
 WHERE name=:name
 "#,
                     &params,
                 )
-                .expect("concurrent postgres query");
+                .expect("concurrent mysql query");
                 assert_eq!(row[0].to_string(), "chars(linghuchong)");
             });
         }
@@ -725,37 +665,37 @@ WHERE name=:name
 
     assert!(
         started.elapsed() < Duration::from_millis(900),
-        "postgres pooled queries look serialized: {:?}",
+        "mysql pooled queries look serialized: {:?}",
         started.elapsed()
     );
 }
 
 #[test]
-#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
-fn postgres_provider_cache_perf() {
-    let _guard = postgres_test_guard().lock().expect("postgres test guard");
-    let url = postgres_url();
+#[ignore = "requires WP_KDB_TEST_MYSQL_URL and a reachable MySQL instance"]
+fn mysql_provider_cache_perf() {
+    let _guard = mysql_test_guard().lock().expect("mysql test guard");
+    let url = mysql_url();
     let rows = perf_env_usize("WP_KDB_PERF_ROWS", 10_000).max(1);
     let ops = perf_env_usize("WP_KDB_PERF_OPS", 10_000).max(1);
     let hotset = perf_env_usize("WP_KDB_PERF_HOTSET", 128).clamp(1, rows);
-    seed_postgres_perf_table(&url, rows);
+    seed_mysql_perf_table(&url, rows);
     let workload = build_perf_workload(ops, hotset);
 
     eprintln!(
-        "[wp-knowledge][postgres-cache-perf] rows={} ops={} hotset={} sql=SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+        "[wp-knowledge][mysql-cache-perf] rows={} ops={} hotset={} sql=SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
         rows, ops, hotset
     );
 
-    let bypass = run_postgres_bypass(&url, &workload);
-    let global = run_postgres_global_cache(&url, &workload);
-    let local = run_postgres_local_cache(&url, &workload);
+    let bypass = run_mysql_bypass(&url, &workload);
+    let global = run_mysql_global_cache(&url, &workload);
+    let local = run_mysql_local_cache(&url, &workload);
 
     print_perf_result(&bypass);
     print_perf_result(&global);
     print_perf_result(&local);
 
     eprintln!(
-        "[wp-knowledge][postgres-cache-perf] speedup global_vs_bypass={:.2}x local_vs_bypass={:.2}x",
+        "[wp-knowledge][mysql-cache-perf] speedup global_vs_bypass={:.2}x local_vs_bypass={:.2}x",
         bypass.elapsed.as_secs_f64() / global.elapsed.as_secs_f64(),
         bypass.elapsed.as_secs_f64() / local.elapsed.as_secs_f64(),
     );
@@ -780,40 +720,40 @@ fn postgres_provider_cache_perf() {
 }
 
 #[test]
-#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
-fn postgres_provider_sync_vs_async_perf() {
-    let _guard = postgres_test_guard().lock().expect("postgres test guard");
-    let url = postgres_url();
+#[ignore = "requires WP_KDB_TEST_MYSQL_URL and a reachable MySQL instance"]
+fn mysql_provider_sync_vs_async_perf() {
+    let _guard = mysql_test_guard().lock().expect("mysql test guard");
+    let url = mysql_url();
     let rows = perf_env_usize("WP_KDB_PERF_ROWS", 10_000).max(1);
     let ops = perf_env_usize("WP_KDB_PERF_OPS", 10_000).max(1);
     let hotset = perf_env_usize("WP_KDB_PERF_HOTSET", 128).clamp(1, rows);
-    seed_postgres_perf_table(&url, rows);
+    seed_mysql_perf_table(&url, rows);
     let workload = build_perf_workload(ops, hotset);
 
-    let sync = run_postgres_sync_latency(&url, &workload);
-    let async_result = run_postgres_async_latency(&url, &workload);
+    let sync = run_mysql_sync_latency(&url, &workload);
+    let async_result = run_mysql_async_latency(&url, &workload);
 
     eprintln!(
-        "[wp-knowledge][postgres-sync-async] rows={} ops={} hotset={} sql=SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
+        "[wp-knowledge][mysql-sync-async] rows={} ops={} hotset={} sql=SELECT value FROM wp_knowledge_mysql_perf_lookup WHERE id=:id",
         rows, ops, hotset
     );
-    print_latency_result("postgres", &sync);
-    print_latency_result("postgres", &async_result);
+    print_latency_result("mysql", &sync);
+    print_latency_result("mysql", &async_result);
 }
 
 #[test]
-#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
-fn postgres_provider_async_cache_concurrency_perf() {
-    let _guard = postgres_test_guard().lock().expect("postgres test guard");
-    let url = postgres_url();
+#[ignore = "requires WP_KDB_TEST_MYSQL_URL and a reachable MySQL instance"]
+fn mysql_provider_async_cache_concurrency_perf() {
+    let _guard = mysql_test_guard().lock().expect("mysql test guard");
+    let url = mysql_url();
     let rows = perf_env_usize("WP_KDB_PERF_ROWS", 10_000).max(1);
     let ops = perf_env_usize("WP_KDB_PERF_OPS", 20_000).max(1);
     let hotset = perf_env_usize("WP_KDB_PERF_HOTSET", 128).clamp(1, rows);
-    seed_postgres_perf_table(&url, rows);
+    seed_mysql_perf_table(&url, rows);
     let workload = build_perf_workload(ops, hotset);
 
     eprintln!(
-        "[wp-knowledge][postgres-async-cache-concurrency] rows={} ops={} hotset={} concurrencies={:?}",
+        "[wp-knowledge][mysql-async-cache-concurrency] rows={} ops={} hotset={} concurrencies={:?}",
         rows,
         ops,
         hotset,
@@ -826,8 +766,8 @@ fn postgres_provider_async_cache_concurrency_perf() {
             AsyncPerfMode::GlobalCache,
             AsyncPerfMode::LocalCache,
         ] {
-            let result = run_postgres_async_cache_concurrency(&url, &workload, concurrency, mode);
-            print_concurrent_latency_result("postgres", &result);
+            let result = run_mysql_async_cache_concurrency(&url, &workload, concurrency, mode);
+            print_concurrent_latency_result("mysql", &result);
         }
     }
 }

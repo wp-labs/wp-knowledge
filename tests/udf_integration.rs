@@ -75,7 +75,10 @@ CREATE INDEX IF NOT EXISTS idx_{table}_end   ON {table}(ip_end_int);
     // 3) query with UDF on read connection
     let rows = kdb::query_fields(
         "SELECT zone FROM zone WHERE ip4_between(:ip, ip_start_int, ip_end_int)=1 LIMIT 1",
-        &[DataField::from_chars(":ip".to_string(), "10.0.10.5".to_string())],
+        &[DataField::from_chars(
+            ":ip".to_string(),
+            "10.0.10.5".to_string(),
+        )],
     )
     .expect("query zone by ip");
     assert_eq!(rows.len(), 1);
@@ -83,7 +86,10 @@ CREATE INDEX IF NOT EXISTS idx_{table}_end   ON {table}(ip_end_int);
 
     let rows = kdb::query_fields(
         "SELECT cidr4_contains(:ip, '10.0.0.0/8') AS ok",
-        &[DataField::from_chars(":ip".to_string(), "10.1.2.3".to_string())],
+        &[DataField::from_chars(
+            ":ip".to_string(),
+            "10.1.2.3".to_string(),
+        )],
     )
     .expect("query cidr contains");
     assert_eq!(rows[0].to_string(), "digit(1)");
