@@ -1,6 +1,6 @@
 [package]
 name = "wp-knowledge"
-version = "0.11.3" # @gxl:set(version)
+version = "0.11.4" # @gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "KnowDB loader and SQLite-backed query facade for the Warp Parse stack."
@@ -47,7 +47,7 @@ rand = "0.10"
 toml = "1.0"
 wp-data-fmt = "0.2"
 testcontainers = { version = "0.27", features = ["blocking"] }
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
 
 [[bench]]
 name = "read_bench"
