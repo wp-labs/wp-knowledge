@@ -37,7 +37,7 @@ lru = "0.16"
 async-trait = "0.1"
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
 mysql = "28.0.0"
-mysql_async = "0.34"
+mysql_async = "0.36"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
