@@ -46,7 +46,7 @@ once_cell = "1.21"
 rand = "0.10"
 toml = "1.0"
 wp-data-fmt = "0.2"
-testcontainers = { version = "0.23", features = ["blocking"] }
+testcontainers = { version = "0.27", features = ["blocking"] }
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 
 [[bench]]
