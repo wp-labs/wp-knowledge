@@ -15,27 +15,27 @@ trim       = true
 [[tables]]
 name = "example"
 dir  = "example"
+enabled = true
 columns.by_header = ["name", "pinying"]
 [tables.expected_rows]
 min = 5
 max = 100
-enabled = true
 
 [[tables]]
 name = "address"
 dir  = "address"
+enabled = true
 columns.by_header = ["value"]
 [tables.expected_rows]
 min = 5
 max = 110
-enabled = true
 
 [[tables]]
 name = "zone"
 dir  = "zone"
 data_file = "data.scv"
+enabled = true
 columns.by_header = ["start_ip", "end_ip", "zone"]
 [tables.expected_rows]
 min = 4
 max = 16
-enabled = true

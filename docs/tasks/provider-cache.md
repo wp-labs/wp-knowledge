@@ -18,7 +18,7 @@
 
 对应架构方案见：
 
-- [PROVIDER_CACHE_ARCHITECTURE.md](./PROVIDER_CACHE_ARCHITECTURE.md)
+- [provider-cache.md](../architecture/provider-cache.md)
 
 当前状态适合继续扩展数据库接入，但还不足以支撑“多 provider + 可控缓存 + reload”的长期演进。
 

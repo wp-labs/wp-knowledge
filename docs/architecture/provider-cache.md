@@ -2,7 +2,7 @@
 
 配套实施任务清单见：
 
-- [PROVIDER_CACHE_TASKS.md](./PROVIDER_CACHE_TASKS.md)
+- [provider-cache.md](../tasks/provider-cache.md)
 
 ## 背景
 
