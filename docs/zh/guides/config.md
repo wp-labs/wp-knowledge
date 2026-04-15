@@ -1,5 +1,7 @@
 # KnowDB 配置说明
 
+中文 | [English](../../en/guides/config.md)
+
 这份文档只回答 4 件事：
 
 1. `knowdb.toml` 应该怎么写。

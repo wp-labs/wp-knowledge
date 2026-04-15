@@ -1,5 +1,7 @@
 # wp-knowledge Provider 与 Cache 重构方案
 
+中文 | [English](../../en/architecture/provider-cache.md)
+
 配套实施任务清单见：
 
 - [provider-cache.md](../tasks/provider-cache.md)

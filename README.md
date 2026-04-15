@@ -20,12 +20,17 @@
 - `docs/`：架构与使用说明。
 - `.github/workflows/ci.yml`：独立仓库可直接使用的 CI。
 
-## 更多说明
+## 更多说明 / More Docs
 
-- [文档索引](docs/README.md)
-- [KnowDB 配置说明](docs/guides/config.md)
-- [Provider 与 Cache 架构说明](docs/architecture/provider-cache.md)
-- [Async Provider 性能测试与结论](docs/performance/async-provider.md)
+- [文档索引 / Docs Index](docs/README.md)
+- [English Docs Index](docs/en/README.md)
+- [中文文档索引](docs/zh/README.md)
+- [KnowDB 配置说明](docs/zh/guides/config.md)
+- [KnowDB Configuration](docs/en/guides/config.md)
+- [Provider 与 Cache 架构说明](docs/zh/architecture/provider-cache.md)
+- [Provider and Cache Architecture](docs/en/architecture/provider-cache.md)
+- [Async Provider 性能测试与结论](docs/zh/performance/async-provider.md)
+- [Async Provider Performance](docs/en/performance/async-provider.md)
 
 ## 快速开始
 

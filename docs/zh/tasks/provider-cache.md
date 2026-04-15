@@ -1,5 +1,7 @@
 # Provider / Cache Refactor Tasks
 
+中文 | [English](../../en/tasks/provider-cache.md)
+
 ## Context
 
 `wp-knowledge` 现在已经同时支持：

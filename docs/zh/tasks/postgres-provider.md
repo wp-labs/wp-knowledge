@@ -1,5 +1,7 @@
 # PostgreSQL Provider Tasks
 
+中文 | [English](../../en/tasks/postgres-provider.md)
+
 ## Context
 
 `wp-knowledge` 已经具备外部 PostgreSQL provider 的基础能力：
