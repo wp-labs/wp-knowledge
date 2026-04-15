@@ -2,152 +2,77 @@
 
 [中文](../../zh/tasks/postgres-provider.md) | English
 
-## Context
+## Current baseline
 
-`wp-knowledge` already has baseline support for an external PostgreSQL provider:
+Already available:
 
-- `knowdb.toml` supports `[provider] kind = "postgres"`
-- `facade::query_fields(...)` and `cache_query_fields(...)` are the recommended provider-neutral entry points
-- `facade::query_named(...)` and `cache_query(...)` are still kept as wrappers for the older SQLite-shaped parameter interface
-- baseline PostgreSQL queries, named-parameter rewriting, and manual verification scripts are already available
+- `[provider] kind = "postgres"` support
+- `query_fields(...)` / `cache_query_fields(...)` as the recommended path
+- baseline queries, named-parameter rewriting, and manual verification scripts
 
-The current state is good enough to validate the main flow, but not yet strong enough to be treated as long-term, production-grade PostgreSQL support.
+This is enough to validate the main flow, but not yet enough for long-term production-grade PostgreSQL support.
 
-## Priority 1
+## Remaining work
 
-### 1. Replace single-client provider with a connection pool
+### 1. Connection pool
 
-Current:
+- Current: `src/postgres.rs` still behaves like a serialized single-client path
+- Goal:
+  - integrate a connection pool
+  - define connect/disconnect/retry behavior
+  - remove dependence on one serialized client
 
-- `src/postgres.rs` uses `Mutex<Client>`, so all queries are serialized through one client
+### 2. Startup validation
 
-Tasks:
+- Current: startup mostly checks only basic connectivity
+- Goal:
+  - validate database, schema, permissions, and key objects at startup
+  - fail early on wrong DB, wrong schema, or wrong permissions
 
-- evaluate and integrate a PostgreSQL connection pool
-- move from a single client to pooled connection checkout
-- define clear behavior for connect failures, disconnects, and retries
+### 3. SQL / UDF boundary
 
-Acceptance:
+- Current: baseline SQL works, but SQLite UDF assumptions are still incomplete
+- Goal:
+  - list SQL that can move directly
+  - list SQL that must be rewritten
+  - list functions users must provide in PostgreSQL themselves
 
-- concurrent queries no longer depend on one serialized client
-- baseline tests and PostgreSQL integration tests all pass
+### 4. Type coverage
 
-### 2. Add provider startup validation
+- Current: result-type support and bind behavior are still incomplete
+- Goal:
+  - cover common numeric, temporal, JSON, and network types
+  - return clearer errors for unsupported types
 
-Current:
+### 5. Automated verification
 
-- provider initialization only checks whether a connection can be established
-- missing tables, permission issues, and schema drift are only exposed when real queries run
+- Current: verification is still too manual
+- Goal:
+  - add a stable CI path
+  - choose one main path between Compose and `testcontainers`
+  - emit enough diagnostics on failure
 
-Tasks:
+### 6. End-to-end example in a consuming repo
 
-- add basic startup self-checks
-- emit clear errors that distinguish connection problems, permission problems, and schema problems
+- Current: `wp-knowledge` can validate itself, but the consuming-repo chain is incomplete
+- Goal:
+  - add a PostgreSQL example in a consumer repo
+  - validate `wp-oml` with a real schema
+  - provide reusable run instructions
 
-Acceptance:
+### 7. Compatibility cleanup
 
-- wrong database, wrong schema, or wrong permissions fail during initialization
+- Current: `query_named(...)` / `cache_query(...)` still preserve older SQLite-shaped behavior
+- Goal:
+  - make provider-neutral APIs the default for new code
+  - define the retention and deprecation strategy for compatibility APIs
 
-## Priority 2
-
-### 3. Define SQL/UDF compatibility boundary
-
-Current:
-
-- PostgreSQL currently supports baseline SQL querying and named-parameter rewriting
-- the SQLite UDF set has not been migrated to PostgreSQL
-
-Tasks:
-
-- inventory the common SQLite UDF dependencies used by `wp-knowledge` and `wp-oml`
-- define which SQL can move directly to PostgreSQL
-- define which SQL must be rewritten or requires user-provided PostgreSQL functions
-- document the boundary in docs and examples
-
-Acceptance:
-
-- external users can see a clear list of SQL capabilities that work directly versus those that require adaptation
-
-### 4. Expand PostgreSQL type coverage
-
-Current:
-
-- `src/postgres.rs` supports only part of the result-column type space
-- many `DataField` values still degrade to text when bound as parameters
-
-Tasks:
-
-- extend PostgreSQL result-type mappings
-- evaluate and add more appropriate parameter binding behavior
-- return more specific errors for unsupported types
-
-Acceptance:
-
-- common numeric, temporal, JSON, and network-related types have an explicit support strategy
-
-## Priority 3
-
-### 5. Complete provider-neutral API migration
-
-Current:
-
-- new code can use `query_fields(...)` and `cache_query_fields(...)`
-- compatibility APIs still expose `rusqlite::ToSql`
-
-Tasks:
-
-- continue migrating in-repo call sites to the provider-neutral APIs
-- evaluate whether compatibility APIs should be marked `deprecated`
-- define the long-term keep/remove strategy for `query_named(...)` and `cache_query(...)`
-
-Acceptance:
-
-- new code paths no longer depend on SQLite-only types by default
-- the role of the compatibility layer is clear
-
-### 6. Improve automated verification
-
-Current:
-
-- `tests/postgres_provider.rs` requires explicit environment preparation
-- `tests/postgres_testcontainers.rs` is currently `ignored`
-- `tests/test-postgres-provider.sh` is available for manual verification with local Docker Desktop
-
-Tasks:
-
-- design an automated PostgreSQL validation path for CI
-- decide whether to keep Compose or adopt `testcontainers`
-- make sure failures provide enough diagnostics for connections, containers, and SQL
-
-Acceptance:
-
-- PostgreSQL provider behavior can be verified reliably in normal development and CI workflows
-
-## Priority 4
-
-### 7. Add end-to-end example in a consuming repo
-
-Current:
-
-- `wp-knowledge` itself already supports a PostgreSQL provider
-- but `wp-motor` / `wp-oml` still lacks a complete, reproducible PostgreSQL example chain
-
-Tasks:
-
-- add a PostgreSQL knowdb configuration example in a consuming repository
-- validate the `wp-oml` call chain with a real schema and queries
-- document the steps so team members can reuse them directly
-
-Acceptance:
-
-- a consuming project can verify the full PostgreSQL provider integration path end to end
-
-## Suggested execution order
+## Suggested order
 
 1. connection pool
 2. startup validation
-3. SQL/UDF capability boundary docs
-4. type coverage expansion
+3. SQL / UDF boundary
+4. type coverage
 5. automated verification
-6. end-to-end example in a consuming repo
-7. compatibility API deprecation strategy
+6. end-to-end example
+7. compatibility cleanup

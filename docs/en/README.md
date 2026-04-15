@@ -1,11 +1,11 @@
-# Docs Index
+# wp-knowledge Docs Index
 
 Language switch:
 
 - English: current directory
 - 中文：[docs/zh/README.md](../zh/README.md)
 
-`wp-knowledge/docs` is organized into 4 categories, and each category now has both Chinese and English entry points.
+This index lists English documents only. For Chinese documents, enter `../zh/`.
 
 ## Guides
 
@@ -13,7 +13,7 @@ Language switch:
 
 ## Architecture
 
-- [Provider and Cache Architecture](./architecture/provider-cache.md)
+- [Provider and Cache Refactor Plan](./architecture/provider-cache.md)
 
 ## Performance
 
@@ -24,9 +24,13 @@ Language switch:
 - [PostgreSQL Provider Tasks](./tasks/postgres-provider.md)
 - [Provider / Cache Refactor Tasks](./tasks/provider-cache.md)
 
-## Conventions
+## Directory Conventions
 
-- `guides/` contains user-facing usage and configuration docs.
-- `architecture/` contains design notes, boundaries, and longer-term direction.
-- `performance/` contains benchmark records and conclusions.
-- `tasks/` contains staged work plans and is usually treated as internal working documentation.
+- `guides/`
+  - User-facing usage, configuration, and getting-started documents.
+- `architecture/`
+  - Design notes, boundaries, core abstractions, and long-term direction.
+- `performance/`
+  - Benchmark records, experiments, and conclusions.
+- `tasks/`
+  - Staged work breakdowns, usually maintained as internal working documents.
