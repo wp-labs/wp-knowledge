@@ -10,6 +10,14 @@ WAIT_SECONDS="${WAIT_SECONDS:-90}"
 export WP_KDB_PERF_ROWS="${WP_KDB_PERF_ROWS:-10000}"
 export WP_KDB_PERF_OPS="${WP_KDB_PERF_OPS:-10000}"
 export WP_KDB_PERF_HOTSET="${WP_KDB_PERF_HOTSET:-128}"
+POSTGRES_TESTS=(
+  postgres_provider_reconnects_after_backend_termination
+  postgres_provider_init_and_query_inside_tokio_runtime
+  postgres_provider_query_and_pool
+  postgres_provider_cache_perf
+  postgres_provider_sync_vs_async_perf
+  postgres_provider_async_cache_concurrency_perf
+)
 
 cleanup() {
   if [[ "${KEEP_DB}" == "1" ]]; then
@@ -75,4 +83,7 @@ fi
 export WP_KDB_TEST_POSTGRES_URL="${TEST_URL}"
 
 echo "[wp-knowledge] running postgres_provider with ${WP_KDB_TEST_POSTGRES_URL} (perf rows=${WP_KDB_PERF_ROWS} ops=${WP_KDB_PERF_OPS} hotset=${WP_KDB_PERF_HOTSET})"
-cargo test --test postgres_provider -- --ignored --nocapture
+for test_name in "${POSTGRES_TESTS[@]}"; do
+  echo "[wp-knowledge] running postgres_provider::${test_name}"
+  cargo test --test postgres_provider "${test_name}" -- --ignored --nocapture
+done

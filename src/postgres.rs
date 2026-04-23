@@ -8,13 +8,15 @@ use std::thread;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use orion_error::{ToStructError, UvsFrom};
 use tokio::runtime::{Builder, Runtime};
+use tokio::sync::Mutex;
 use tokio_postgres::types::{ToSql, Type};
 use tokio_postgres::{Client, NoTls, Row, Statement};
 use wp_error::{KnowledgeReason, KnowledgeResult};
+use wp_log::warn_kdb;
 use wp_model_core::model::{DataField, DataType, Value};
 
 use crate::loader::ProviderKind;
-use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init_async_for_scope};
+use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init_async_for_scope_typed};
 use crate::runtime::MetadataCacheScope;
 
 #[derive(Debug, Clone)]
@@ -49,9 +51,44 @@ impl PostgresProviderConfig {
 
 pub struct PostgresProvider {
     runtime: Option<Runtime>,
-    clients: Vec<Arc<Client>>,
+    connection_uri: String,
+    clients: Vec<Arc<PostgresClientSlot>>,
     next_client: AtomicUsize,
     metadata_scope: MetadataCacheScope,
+}
+
+struct PostgresClientSlot {
+    client: Mutex<Arc<Client>>,
+}
+
+impl PostgresClientSlot {
+    fn new(client: Arc<Client>) -> Self {
+        Self {
+            client: Mutex::new(client),
+        }
+    }
+
+    async fn active_client(&self, connection_uri: &str) -> KnowledgeResult<Arc<Client>> {
+        let mut client = self.client.lock().await;
+        if client.is_closed() {
+            warn_kdb!("[kdb] postgres pooled client is closed; reconnecting");
+            *client = Arc::new(connect_postgres_client(connection_uri).await?);
+        }
+        Ok(client.clone())
+    }
+
+    async fn reconnect_after_failure(
+        &self,
+        connection_uri: &str,
+        failed_client: &Arc<Client>,
+    ) -> KnowledgeResult<Arc<Client>> {
+        let mut client = self.client.lock().await;
+        if Arc::ptr_eq(&client, failed_client) || client.is_closed() {
+            warn_kdb!("[kdb] postgres query hit a closed connection; reconnecting");
+            *client = Arc::new(connect_postgres_client(connection_uri).await?);
+        }
+        Ok(client.clone())
+    }
 }
 
 impl PostgresProvider {
@@ -77,30 +114,19 @@ impl PostgresProvider {
                             .with_detail(format!("create postgres tokio runtime failed: {err}"))
                     });
                 let result = runtime.and_then(|runtime| {
+                    let connection_uri_for_clients = connection_uri.clone();
                     let clients = runtime.block_on(async move {
                         let mut clients = Vec::with_capacity(pool_size);
                         for _ in 0..pool_size {
-                            let (client, connection) =
-                                tokio_postgres::connect(&connection_uri, NoTls)
-                                    .await
-                                    .map_err(|err| {
-                                        KnowledgeReason::from_conf().to_err().with_detail(format!(
-                                            "create postgres client failed: {err}"
-                                        ))
-                                    })?;
-                            tokio::spawn(async move {
-                                let _ = connection.await;
-                            });
-                            client
-                                .simple_query("SELECT 1")
-                                .await
-                                .map_err(|err| validation_err("connection", err))?;
-                            clients.push(Arc::new(client));
+                            let client =
+                                connect_postgres_client(&connection_uri_for_clients).await?;
+                            clients.push(Arc::new(PostgresClientSlot::new(Arc::new(client))));
                         }
-                        Ok::<Vec<Arc<Client>>, wp_error::KnowledgeError>(clients)
+                        Ok::<Vec<Arc<PostgresClientSlot>>, wp_error::KnowledgeError>(clients)
                     })?;
                     Ok::<PostgresProvider, wp_error::KnowledgeError>(Self {
                         runtime: Some(runtime),
+                        connection_uri,
                         clients,
                         next_client: AtomicUsize::new(0),
                         metadata_scope: metadata_scope_for_thread,
@@ -124,66 +150,116 @@ impl PostgresProvider {
     }
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        let client = self.pick_client()?;
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
         let sql = sql.to_string();
         let metadata_scope = self.metadata_scope.clone();
         self.block_on_task(
-            async move { execute_query(&client, &metadata_scope, &sql).await },
+            async move {
+                execute_with_reconnect(slot, connection_uri, "query", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    async move { execute_query(&client, &metadata_scope, &sql).await }
+                })
+                .await
+            },
             "query",
         )
     }
 
     pub fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
-        let client = self.pick_client()?;
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
         let sql = sql.to_string();
         let metadata_scope = self.metadata_scope.clone();
         self.block_on_task(
-            async move { execute_query_row(&client, &metadata_scope, &sql).await },
+            async move {
+                execute_with_reconnect(slot, connection_uri, "query_row", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    async move { execute_query_row(&client, &metadata_scope, &sql).await }
+                })
+                .await
+            },
             "query_row",
         )
     }
 
     pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
-        let client = self.pick_client()?;
-        let sql = sql.to_string();
-        let params = params.to_vec();
-        let metadata_scope = self.metadata_scope.clone();
-        self.block_on_task(
-            async move { execute_query_fields(&client, &metadata_scope, &sql, &params).await },
-            "query_fields",
-        )
-    }
-
-    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
-        let client = self.pick_client()?;
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
         let sql = sql.to_string();
         let params = params.to_vec();
         let metadata_scope = self.metadata_scope.clone();
         self.block_on_task(
             async move {
-                execute_query_named_fields(&client, &metadata_scope, &sql, &params).await
+                execute_with_reconnect(slot, connection_uri, "query_fields", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    let params = params.clone();
+                    async move { execute_query_fields(&client, &metadata_scope, &sql, &params).await }
+                })
+                .await
+            },
+            "query_fields",
+        )
+    }
+
+    pub fn query_named_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
+        let sql = sql.to_string();
+        let params = params.to_vec();
+        let metadata_scope = self.metadata_scope.clone();
+        self.block_on_task(
+            async move {
+                execute_with_reconnect(slot, connection_uri, "query_named_fields", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    let params = params.clone();
+                    async move {
+                        execute_query_named_fields(&client, &metadata_scope, &sql, &params).await
+                    }
+                })
+                .await
             },
             "query_named_fields",
         )
     }
 
     pub async fn query_async(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        let client = self.pick_client()?;
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
         let sql = sql.to_string();
         let metadata_scope = self.metadata_scope.clone();
         self.run_task(
-            async move { execute_query(&client, &metadata_scope, &sql).await },
+            async move {
+                execute_with_reconnect(slot, connection_uri, "query", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    async move { execute_query(&client, &metadata_scope, &sql).await }
+                })
+                .await
+            },
             "query",
         )
         .await
     }
 
     pub async fn query_row_async(&self, sql: &str) -> KnowledgeResult<RowData> {
-        let client = self.pick_client()?;
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
         let sql = sql.to_string();
         let metadata_scope = self.metadata_scope.clone();
         self.run_task(
-            async move { execute_query_row(&client, &metadata_scope, &sql).await },
+            async move {
+                execute_with_reconnect(slot, connection_uri, "query_row", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    async move { execute_query_row(&client, &metadata_scope, &sql).await }
+                })
+                .await
+            },
             "query_row",
         )
         .await
@@ -194,12 +270,21 @@ impl PostgresProvider {
         sql: &str,
         params: &[DataField],
     ) -> KnowledgeResult<Vec<RowData>> {
-        let client = self.pick_client()?;
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
         let sql = sql.to_string();
         let params = params.to_vec();
         let metadata_scope = self.metadata_scope.clone();
         self.run_task(
-            async move { execute_query_fields(&client, &metadata_scope, &sql, &params).await },
+            async move {
+                execute_with_reconnect(slot, connection_uri, "query_fields", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    let params = params.clone();
+                    async move { execute_query_fields(&client, &metadata_scope, &sql, &params).await }
+                })
+                .await
+            },
             "query_fields",
         )
         .await
@@ -210,20 +295,29 @@ impl PostgresProvider {
         sql: &str,
         params: &[DataField],
     ) -> KnowledgeResult<RowData> {
-        let client = self.pick_client()?;
+        let slot = self.pick_client()?;
+        let connection_uri = self.connection_uri.clone();
         let sql = sql.to_string();
         let params = params.to_vec();
         let metadata_scope = self.metadata_scope.clone();
         self.run_task(
             async move {
-                execute_query_named_fields(&client, &metadata_scope, &sql, &params).await
+                execute_with_reconnect(slot, connection_uri, "query_named_fields", move |client| {
+                    let metadata_scope = metadata_scope.clone();
+                    let sql = sql.clone();
+                    let params = params.clone();
+                    async move {
+                        execute_query_named_fields(&client, &metadata_scope, &sql, &params).await
+                    }
+                })
+                .await
             },
             "query_named_fields",
         )
         .await
     }
 
-    fn pick_client(&self) -> KnowledgeResult<Arc<Client>> {
+    fn pick_client(&self) -> KnowledgeResult<Arc<PostgresClientSlot>> {
         if self.clients.is_empty() {
             return Err(KnowledgeReason::from_conf()
                 .to_err()
@@ -276,25 +370,122 @@ impl Drop for PostgresProvider {
     }
 }
 
+async fn connect_postgres_client(connection_uri: &str) -> KnowledgeResult<Client> {
+    let (client, connection) = tokio_postgres::connect(connection_uri, NoTls)
+        .await
+        .map_err(|err| {
+            KnowledgeReason::from_conf()
+                .to_err()
+                .with_detail(format!("create postgres client failed: {err}"))
+        })?;
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            warn_kdb!("[kdb] postgres connection task ended: {}", err);
+        }
+    });
+    client
+        .simple_query("SELECT 1")
+        .await
+        .map_err(|err| validation_err("connection", err))?;
+    Ok(client)
+}
+
+async fn execute_with_reconnect<T, F, Fut>(
+    slot: Arc<PostgresClientSlot>,
+    connection_uri: String,
+    action: &str,
+    execute: F,
+) -> KnowledgeResult<T>
+where
+    F: Fn(Arc<Client>) -> Fut,
+    Fut: Future<Output = Result<T, PostgresQueryError>>,
+{
+    let client = slot.active_client(&connection_uri).await?;
+    match execute(client.clone()).await {
+        Ok(value) => Ok(value),
+        Err(PostgresQueryError::ConnectionClosed(err)) => {
+            warn_kdb!(
+                "[kdb] postgres {action} failed on a closed connection; retrying once: {}",
+                err
+            );
+            let client = slot
+                .reconnect_after_failure(&connection_uri, &client)
+                .await?;
+            execute(client)
+                .await
+                .map_err(PostgresQueryError::into_inner)
+        }
+        Err(err) if client.is_closed() => {
+            warn_kdb!(
+                "[kdb] postgres {action} closed the connection after failure; retrying once: {}",
+                err.as_ref()
+            );
+            let client = slot
+                .reconnect_after_failure(&connection_uri, &client)
+                .await?;
+            execute(client)
+                .await
+                .map_err(PostgresQueryError::into_inner)
+        }
+        Err(err) => Err(err.into_inner()),
+    }
+}
+
+enum PostgresQueryError {
+    ConnectionClosed(wp_error::KnowledgeError),
+    Other(wp_error::KnowledgeError),
+}
+
+impl PostgresQueryError {
+    fn as_ref(&self) -> &wp_error::KnowledgeError {
+        match self {
+            PostgresQueryError::ConnectionClosed(err) | PostgresQueryError::Other(err) => err,
+        }
+    }
+
+    fn into_inner(self) -> wp_error::KnowledgeError {
+        match self {
+            PostgresQueryError::ConnectionClosed(err) | PostgresQueryError::Other(err) => err,
+        }
+    }
+}
+
+impl From<wp_error::KnowledgeError> for PostgresQueryError {
+    fn from(err: wp_error::KnowledgeError) -> Self {
+        Self::Other(err)
+    }
+}
+
+fn pg_operation_err(stage: &str, err: tokio_postgres::Error) -> PostgresQueryError {
+    let is_closed = err.is_closed();
+    let err = KnowledgeReason::from_rule()
+        .to_err()
+        .with_detail(format!("postgres {stage} failed: {err}"));
+    if is_closed {
+        PostgresQueryError::ConnectionClosed(err)
+    } else {
+        PostgresQueryError::Other(err)
+    }
+}
+
 async fn execute_query(
     client: &Client,
     metadata_scope: &MetadataCacheScope,
     sql: &str,
-) -> KnowledgeResult<Vec<RowData>> {
+) -> Result<Vec<RowData>, PostgresQueryError> {
     let mut prepared_stmt = None;
-    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+    let col_names = metadata_cache_get_or_try_init_async_for_scope_typed(
         metadata_scope,
         Some(ProviderKind::Postgres),
         sql,
         || async {
-            let stmt = client.prepare(sql).await.map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query prepare failed: {err}"))
-            })?;
+            let stmt = client
+                .prepare(sql)
+                .await
+                .map_err(|err| pg_operation_err("query prepare", err))?;
             let names = statement_col_names(&stmt);
             prepared_stmt = Some(stmt);
-            Ok(Some(names))
+            Ok::<Option<Vec<String>>, PostgresQueryError>(Some(names))
         },
     )
     .await?;
@@ -303,33 +494,30 @@ async fn execute_query(
     } else {
         client.query(sql, &[]).await
     }
-    .map_err(|err| {
-        KnowledgeReason::from_rule()
-            .to_err()
-            .with_detail(format!("postgres query failed: {err}"))
-    })?;
-    rows.iter().map(|row| map_row(row, &col_names)).collect()
+    .map_err(|err| pg_operation_err("query", err))?;
+    rows.iter()
+        .map(|row| map_row(row, &col_names).map_err(Into::into))
+        .collect()
 }
 
 async fn execute_query_row(
     client: &Client,
     metadata_scope: &MetadataCacheScope,
     sql: &str,
-) -> KnowledgeResult<RowData> {
+) -> Result<RowData, PostgresQueryError> {
     let mut prepared_stmt = None;
-    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+    let col_names = metadata_cache_get_or_try_init_async_for_scope_typed(
         metadata_scope,
         Some(ProviderKind::Postgres),
         sql,
         || async {
-            let stmt = client.prepare(sql).await.map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query_row prepare failed: {err}"))
-            })?;
+            let stmt = client
+                .prepare(sql)
+                .await
+                .map_err(|err| pg_operation_err("query_row prepare", err))?;
             let names = statement_col_names(&stmt);
             prepared_stmt = Some(stmt);
-            Ok(Some(names))
+            Ok::<Option<Vec<String>>, PostgresQueryError>(Some(names))
         },
     )
     .await?;
@@ -338,13 +526,9 @@ async fn execute_query_row(
     } else {
         client.query_opt(sql, &[]).await
     }
-    .map_err(|err| {
-        KnowledgeReason::from_rule()
-            .to_err()
-            .with_detail(format!("postgres query_row failed: {err}"))
-    })?;
+    .map_err(|err| pg_operation_err("query_row", err))?;
     if let Some(row) = row.as_ref() {
-        map_row(row, &col_names)
+        map_row(row, &col_names).map_err(Into::into)
     } else {
         Ok(Vec::new())
     }
@@ -355,7 +539,7 @@ async fn execute_query_fields(
     metadata_scope: &MetadataCacheScope,
     sql: &str,
     params: &[DataField],
-) -> KnowledgeResult<Vec<RowData>> {
+) -> Result<Vec<RowData>, PostgresQueryError> {
     let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
     let bind_values: Vec<PostgresBindValue> = ordered_params
         .iter()
@@ -367,19 +551,18 @@ async fn execute_query_fields(
         .collect();
 
     let mut prepared_stmt = None;
-    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+    let col_names = metadata_cache_get_or_try_init_async_for_scope_typed(
         metadata_scope,
         Some(ProviderKind::Postgres),
         sql,
         || async {
-            let stmt = client.prepare(&rewritten_sql).await.map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query_fields prepare failed: {err}"))
-            })?;
+            let stmt = client
+                .prepare(&rewritten_sql)
+                .await
+                .map_err(|err| pg_operation_err("query_fields prepare", err))?;
             let names = statement_col_names(&stmt);
             prepared_stmt = Some(stmt);
-            Ok(Some(names))
+            Ok::<Option<Vec<String>>, PostgresQueryError>(Some(names))
         },
     )
     .await?;
@@ -388,12 +571,10 @@ async fn execute_query_fields(
     } else {
         client.query(&rewritten_sql, &bind_refs).await
     }
-    .map_err(|err| {
-        KnowledgeReason::from_rule()
-            .to_err()
-            .with_detail(format!("postgres query_fields failed: {err}"))
-    })?;
-    rows.iter().map(|row| map_row(row, &col_names)).collect()
+    .map_err(|err| pg_operation_err("query_fields", err))?;
+    rows.iter()
+        .map(|row| map_row(row, &col_names).map_err(Into::into))
+        .collect()
 }
 
 async fn execute_query_named_fields(
@@ -401,7 +582,7 @@ async fn execute_query_named_fields(
     metadata_scope: &MetadataCacheScope,
     sql: &str,
     params: &[DataField],
-) -> KnowledgeResult<RowData> {
+) -> Result<RowData, PostgresQueryError> {
     let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
     let bind_values: Vec<PostgresBindValue> = ordered_params
         .iter()
@@ -413,19 +594,18 @@ async fn execute_query_named_fields(
         .collect();
 
     let mut prepared_stmt = None;
-    let col_names = metadata_cache_get_or_try_init_async_for_scope(
+    let col_names = metadata_cache_get_or_try_init_async_for_scope_typed(
         metadata_scope,
         Some(ProviderKind::Postgres),
         sql,
         || async {
-            let stmt = client.prepare(&rewritten_sql).await.map_err(|err| {
-                KnowledgeReason::from_rule()
-                    .to_err()
-                    .with_detail(format!("postgres query_named_fields prepare failed: {err}"))
-            })?;
+            let stmt = client
+                .prepare(&rewritten_sql)
+                .await
+                .map_err(|err| pg_operation_err("query_named_fields prepare", err))?;
             let names = statement_col_names(&stmt);
             prepared_stmt = Some(stmt);
-            Ok(Some(names))
+            Ok::<Option<Vec<String>>, PostgresQueryError>(Some(names))
         },
     )
     .await?;
@@ -434,13 +614,9 @@ async fn execute_query_named_fields(
     } else {
         client.query_opt(&rewritten_sql, &bind_refs).await
     }
-    .map_err(|err| {
-        KnowledgeReason::from_rule()
-            .to_err()
-            .with_detail(format!("postgres query_named_fields failed: {err}"))
-    })?;
+    .map_err(|err| pg_operation_err("query_named_fields", err))?;
     if let Some(row) = row.as_ref() {
-        map_row(row, &col_names)
+        map_row(row, &col_names).map_err(Into::into)
     } else {
         Ok(Vec::new())
     }

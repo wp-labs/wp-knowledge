@@ -137,6 +137,19 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = KnowledgeResult<Option<Vec<String>>>>,
 {
+    metadata_cache_get_or_try_init_async_for_scope_typed(scope, provider_kind, sql, load).await
+}
+
+pub(crate) async fn metadata_cache_get_or_try_init_async_for_scope_typed<F, Fut, E>(
+    scope: &MetadataCacheScope,
+    provider_kind: Option<ProviderKind>,
+    sql: &str,
+    load: F,
+) -> Result<Vec<String>, E>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<Option<Vec<String>>, E>>,
+{
     let cache_key = metadata_cache_key_for_scope(scope, sql);
     if let Some(names) = COLNAME_CACHE
         .read()

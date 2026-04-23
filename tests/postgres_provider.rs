@@ -11,7 +11,7 @@ use tokio_postgres::{Client, NoTls};
 use wp_knowledge::cache::FieldQueryCache;
 use wp_knowledge::facade as kdb;
 use wp_knowledge::runtime::{CachePolicy, QueryRequest, fields_to_params, runtime};
-use wp_model_core::model::DataField;
+use wp_model_core::model::{DataField, Value};
 
 fn postgres_url() -> String {
     std::env::var("WP_KDB_TEST_POSTGRES_URL")
@@ -76,6 +76,13 @@ VALUES
     });
 }
 
+fn datafield_digit(field: &DataField) -> i64 {
+    match field.get_value() {
+        Value::Digit(value) => *value,
+        other => panic!("expected digit field, got {other:?}"),
+    }
+}
+
 fn ensure_postgres_provider_initialized() -> String {
     static INIT: OnceLock<String> = OnceLock::new();
     INIT.get_or_init(|| {
@@ -116,6 +123,55 @@ connection_uri = "{url}"
         url
     })
     .clone()
+}
+
+#[test]
+#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
+fn postgres_provider_reconnects_after_backend_termination() {
+    let _guard = postgres_test_guard().lock().expect("postgres test guard");
+    let url = postgres_url();
+    seed_postgres_lookup_table(&url);
+
+    kdb::init_postgres_provider(&url, Some(1)).expect("init single-client postgres provider");
+
+    let pid_row = kdb::query_row("SELECT pg_backend_pid() AS pid").expect("query backend pid");
+    let pid = datafield_digit(&pid_row[0]);
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build tokio runtime for postgres backend termination");
+    rt.block_on(async {
+        let admin = connect_postgres_with_retry(&url).await;
+        let terminated = admin
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .await
+            .expect("terminate provider backend");
+        assert!(
+            terminated.get::<usize, bool>(0),
+            "postgres did not terminate backend pid {pid}"
+        );
+    });
+
+    let params = [DataField::from_chars(
+        ":name".to_string(),
+        "令狐冲".to_string(),
+    )];
+    let row = kdb::query_fields(
+        "SELECT pinying FROM wp_knowledge_pg_lookup WHERE name=:name",
+        &params,
+    )
+    .expect("postgres query should reconnect after backend termination");
+    assert_eq!(row.len(), 1);
+    assert_eq!(row[0].to_string(), "chars(linghuchong)");
+
+    let new_pid_row =
+        kdb::query_row("SELECT pg_backend_pid() AS pid").expect("query reconnected backend pid");
+    let new_pid = datafield_digit(&new_pid_row[0]);
+    assert_ne!(
+        new_pid, pid,
+        "provider reused a terminated postgres backend"
+    );
 }
 
 #[test]
