@@ -14,6 +14,7 @@ POSTGRES_TESTS=(
   postgres_provider_reconnects_after_backend_termination
   postgres_provider_init_and_query_inside_tokio_runtime
   postgres_provider_query_and_pool
+  postgres_provider_sqlx_type_compatibility
   postgres_provider_cache_perf
   postgres_provider_sync_vs_async_perf
   postgres_provider_async_cache_concurrency_perf

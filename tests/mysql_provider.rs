@@ -6,7 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
-use mysql::{Opts, Pool};
+use mysql::{Opts, Pool, PooledConn};
 use tokio::sync::Barrier;
 use tokio::task::JoinSet;
 use wp_knowledge::cache::FieldQueryCache;
@@ -28,13 +28,17 @@ fn mysql_test_guard() -> &'static Mutex<()> {
     GUARD.get_or_init(|| Mutex::new(()))
 }
 
+fn connect_mysql_admin(url: &str) -> PooledConn {
+    let opts = Opts::from_url(url).expect("parse WP_KDB_TEST_MYSQL_URL failed");
+    let pool = Pool::new(opts).expect("connect to WP_KDB_TEST_MYSQL_URL failed");
+    pool.get_conn().expect("open mysql admin connection failed")
+}
+
 fn ensure_mysql_provider_initialized() -> String {
     static INIT: OnceLock<String> = OnceLock::new();
     INIT.get_or_init(|| {
         let url = mysql_url();
-        let opts = Opts::from_url(&url).expect("parse WP_KDB_TEST_MYSQL_URL failed");
-        let pool = Pool::new(opts).expect("connect to WP_KDB_TEST_MYSQL_URL failed");
-        let mut admin = pool.get_conn().expect("open mysql admin connection failed");
+        let mut admin = connect_mysql_admin(&url);
         admin
             .query_drop(
                 r#"
@@ -94,6 +98,13 @@ pool_size = 8
         url
     })
     .clone()
+}
+
+fn datafield_digit(field: &DataField) -> i64 {
+    match field.get_value() {
+        wp_model_core::model::Value::Digit(value) => *value,
+        other => panic!("expected digit field, got {other:?}"),
+    }
 }
 
 fn perf_env_usize(key: &str, default: usize) -> usize {
@@ -667,6 +678,125 @@ WHERE name=:name
         started.elapsed() < Duration::from_millis(900),
         "mysql pooled queries look serialized: {:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+#[ignore = "requires WP_KDB_TEST_MYSQL_URL and a reachable MySQL instance"]
+fn mysql_provider_sqlx_type_compatibility() {
+    let _guard = mysql_test_guard().lock().expect("mysql test guard");
+    let url = mysql_url();
+    let mut admin = connect_mysql_admin(&url);
+    admin
+        .query_drop(
+            r#"
+CREATE TABLE IF NOT EXISTS wp_knowledge_mysql_type_compat (
+    id BIGINT UNSIGNED PRIMARY KEY,
+    amount DECIMAL(20, 4) NOT NULL,
+    flags BIT(4) NOT NULL,
+    enabled TINYINT(1) NOT NULL,
+    wide_flags BIT(64) NOT NULL
+)
+"#,
+        )
+        .expect("create mysql type compatibility table failed");
+    admin
+        .query_drop("TRUNCATE TABLE wp_knowledge_mysql_type_compat")
+        .expect("truncate mysql type compatibility table failed");
+    admin
+        .query_drop(
+            r#"
+INSERT INTO wp_knowledge_mysql_type_compat (id, amount, flags, enabled, wide_flags)
+VALUES (9223372036854775808, 12345.6789, b'1010', 1, b'1111111111111111111111111111111111111111111111111111111111111111')
+"#,
+        )
+        .expect("seed mysql type compatibility table failed");
+
+    kdb::init_mysql_provider(&url, Some(4)).expect("init mysql provider for type compatibility");
+
+    let count = kdb::query_row("SELECT COUNT(*) AS row_count FROM wp_knowledge_mysql_type_compat")
+        .expect("query mysql count");
+    assert_eq!(datafield_digit(&count[0]), 1);
+
+    let row = kdb::query_named_fields(
+        "SELECT id, amount, flags, enabled, wide_flags FROM wp_knowledge_mysql_type_compat WHERE id=:id",
+        &[DataField::from_chars(
+            ":id".to_string(),
+            "9223372036854775808".to_string(),
+        )],
+    )
+    .expect("query mysql unsigned decimal bit values");
+    assert_eq!(row[0].get_name(), "id");
+    assert_eq!(row[0].to_string(), "chars(9223372036854775808)");
+    assert_eq!(row[1].get_name(), "amount");
+    assert_eq!(row[1].to_string(), "chars(12345.6789)");
+    assert_eq!(row[2].get_name(), "flags");
+    assert_eq!(datafield_digit(&row[2]), 10);
+    assert_eq!(row[3].get_name(), "enabled");
+    assert_eq!(datafield_digit(&row[3]), 1);
+    assert_eq!(row[4].get_name(), "wide_flags");
+    assert_eq!(row[4].to_string(), "chars(18446744073709551615)");
+}
+
+#[test]
+#[ignore = "requires WP_KDB_TEST_MYSQL_URL and a reachable MySQL instance"]
+fn mysql_provider_reconnects_after_connection_kill() {
+    let _guard = mysql_test_guard().lock().expect("mysql test guard");
+    let url = mysql_url();
+    let mut admin = connect_mysql_admin(&url);
+    admin
+        .query_drop(
+            r#"
+CREATE TABLE IF NOT EXISTS wp_knowledge_mysql_lookup (
+    id BIGINT PRIMARY KEY,
+    name TEXT NOT NULL,
+    pinying TEXT NOT NULL
+)
+"#,
+        )
+        .expect("create mysql_provider test table failed");
+    admin
+        .query_drop("TRUNCATE TABLE wp_knowledge_mysql_lookup")
+        .expect("truncate mysql_provider test table failed");
+    admin
+        .query_drop(
+            r#"
+INSERT INTO wp_knowledge_mysql_lookup (id, name, pinying)
+VALUES
+    (1, '令狐冲', 'linghuchong'),
+    (2, '小龙女', 'xiaolongnu')
+"#,
+        )
+        .expect("seed mysql_provider test data failed");
+
+    kdb::init_mysql_provider(&url, Some(1)).expect("init single-connection mysql provider");
+
+    let connection_id_row = kdb::query_row("SELECT CONNECTION_ID() AS connection_id")
+        .expect("query mysql connection id");
+    let connection_id = datafield_digit(&connection_id_row[0]);
+
+    admin
+        .exec_drop("KILL CONNECTION ?", (connection_id,))
+        .expect("kill mysql provider connection");
+
+    let params = [DataField::from_chars(
+        ":name".to_string(),
+        "令狐冲".to_string(),
+    )];
+    let row = kdb::query_fields(
+        "SELECT pinying FROM wp_knowledge_mysql_lookup WHERE name=:name",
+        &params,
+    )
+    .expect("mysql query should reconnect after connection kill");
+    assert_eq!(row.len(), 1);
+    assert_eq!(row[0].to_string(), "chars(linghuchong)");
+
+    let new_connection_id_row = kdb::query_row("SELECT CONNECTION_ID() AS connection_id")
+        .expect("query reconnected mysql connection id");
+    let new_connection_id = datafield_digit(&new_connection_id_row[0]);
+    assert_ne!(
+        new_connection_id, connection_id,
+        "provider reused a killed mysql connection"
     );
 }
 

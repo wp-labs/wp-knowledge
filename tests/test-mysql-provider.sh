@@ -11,7 +11,9 @@ export WP_KDB_PERF_ROWS="${WP_KDB_PERF_ROWS:-10000}"
 export WP_KDB_PERF_OPS="${WP_KDB_PERF_OPS:-10000}"
 export WP_KDB_PERF_HOTSET="${WP_KDB_PERF_HOTSET:-128}"
 MYSQL_TESTS=(
+  mysql_provider_reconnects_after_connection_kill
   mysql_provider_query_and_pool
+  mysql_provider_sqlx_type_compatibility
   mysql_provider_cache_perf
   mysql_provider_sync_vs_async_perf
   mysql_provider_async_cache_concurrency_perf

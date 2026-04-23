@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.5]
+
+### Changed
+- Replace PostgreSQL and MySQL provider internals with `sqlx` pools, while keeping existing facade APIs and named-parameter behavior.  
+  将 PostgreSQL 与 MySQL Provider 内部实现替换为 `sqlx` 连接池，同时保持现有 facade API 与命名参数行为不变。
+
+### Fixed
+- Fix MySQL/PostgreSQL type decoding compatibility and reconnect regression coverage.  
+  修复 MySQL/PostgreSQL 类型解码兼容性问题，并补齐重连回归覆盖。
+
 ## [0.11.1]
 
 ### Added

@@ -136,6 +136,7 @@ fn postgres_provider_reconnects_after_backend_termination() {
 
     let pid_row = kdb::query_row("SELECT pg_backend_pid() AS pid").expect("query backend pid");
     let pid = datafield_digit(&pid_row[0]);
+    let pid_i32 = i32::try_from(pid).expect("postgres backend pid should fit int4");
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -144,7 +145,7 @@ fn postgres_provider_reconnects_after_backend_termination() {
     rt.block_on(async {
         let admin = connect_postgres_with_retry(&url).await;
         let terminated = admin
-            .query_one("SELECT pg_terminate_backend($1)", &[&pid])
+            .query_one("SELECT pg_terminate_backend($1)", &[&pid_i32])
             .await
             .expect("terminate provider backend");
         assert!(
@@ -784,6 +785,33 @@ WHERE name=:name
         "postgres pooled queries look serialized: {:?}",
         started.elapsed()
     );
+}
+
+#[test]
+#[ignore = "requires WP_KDB_TEST_POSTGRES_URL and a reachable PostgreSQL instance"]
+fn postgres_provider_sqlx_type_compatibility() {
+    let _guard = postgres_test_guard().lock().expect("postgres test guard");
+    let url = ensure_postgres_provider_initialized();
+
+    kdb::init_postgres_provider(&url, Some(4))
+        .expect("init postgres provider for type compatibility");
+
+    let count = kdb::query_row("SELECT COUNT(*) AS row_count FROM wp_knowledge_pg_lookup")
+        .expect("query postgres count");
+    assert_eq!(datafield_digit(&count[0]), 2);
+
+    let row = kdb::query_row("SELECT 'pg_class'::regclass::oid AS class_oid")
+        .expect("query postgres oid");
+    assert_eq!(row[0].get_name(), "class_oid");
+    assert!(
+        datafield_digit(&row[0]) > 0,
+        "postgres oid should decode as a positive digit"
+    );
+
+    let row = kdb::query_row("SELECT 12345.6789::numeric(20, 4) AS amount")
+        .expect("query postgres numeric");
+    assert_eq!(row[0].get_name(), "amount");
+    assert_eq!(row[0].to_string(), "chars(12345.6789)");
 }
 
 #[test]
