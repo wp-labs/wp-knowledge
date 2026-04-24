@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.6]
+
+### Added
+- Add dedicated correctness/perf provider scripts and GitHub Actions workflows for MySQL and PostgreSQL validation.  
+  增加面向 MySQL 与 PostgreSQL 的 correctness/perf 独立脚本，以及对应的 GitHub Actions 工作流。
+
+### Changed
+- Refactor provider runtime and shared helpers to reduce duplicated MySQL/PostgreSQL logic while keeping existing facade behavior stable.  
+  重构 provider runtime 与公共辅助逻辑，减少 MySQL/PostgreSQL 间重复实现，同时保持现有 facade 行为稳定。
+- Extend provider pool configuration with `min_connections`, `acquire_timeout_ms`, `idle_timeout_ms`, and `max_lifetime_ms`.  
+  扩展 provider 连接池配置，增加 `min_connections`、`acquire_timeout_ms`、`idle_timeout_ms`、`max_lifetime_ms`。
+
+### Fixed
+- Fix binary/text decoding semantics and expand type compatibility coverage for MySQL/PostgreSQL, including `BYTEA`, `ENUM`, `SET`, `UUID`, `INET`, and `CIDR`.  
+  修复 MySQL/PostgreSQL 的二进制与文本解码语义，并扩展类型兼容覆盖，包括 `BYTEA`、`ENUM`、`SET`、`UUID`、`INET`、`CIDR`。
+
 ## [0.11.5]
 
 ### Changed

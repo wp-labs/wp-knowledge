@@ -107,6 +107,14 @@ fn datafield_digit(field: &DataField) -> i64 {
     }
 }
 
+fn assert_row_strings(row: &[DataField], expected: &[(&str, &str)]) {
+    assert_eq!(row.len(), expected.len(), "row length mismatch");
+    for (field, (name, value)) in row.iter().zip(expected.iter()) {
+        assert_eq!(field.get_name(), *name);
+        assert_eq!(field.to_string(), *value);
+    }
+}
+
 fn perf_env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -688,14 +696,20 @@ fn mysql_provider_sqlx_type_compatibility() {
     let url = mysql_url();
     let mut admin = connect_mysql_admin(&url);
     admin
+        .query_drop("DROP TABLE IF EXISTS wp_knowledge_mysql_type_compat")
+        .expect("drop mysql type compatibility table failed");
+    admin
         .query_drop(
             r#"
-CREATE TABLE IF NOT EXISTS wp_knowledge_mysql_type_compat (
+CREATE TABLE wp_knowledge_mysql_type_compat (
     id BIGINT UNSIGNED PRIMARY KEY,
     amount DECIMAL(20, 4) NOT NULL,
     flags BIT(4) NOT NULL,
     enabled TINYINT(1) NOT NULL,
-    wide_flags BIT(64) NOT NULL
+    wide_flags BIT(64) NOT NULL,
+    payload VARBINARY(4) NOT NULL,
+    mood ENUM('sad', 'ok', 'happy') NOT NULL,
+    perms SET('read', 'write', 'admin') NOT NULL
 )
 "#,
         )
@@ -706,8 +720,8 @@ CREATE TABLE IF NOT EXISTS wp_knowledge_mysql_type_compat (
     admin
         .query_drop(
             r#"
-INSERT INTO wp_knowledge_mysql_type_compat (id, amount, flags, enabled, wide_flags)
-VALUES (9223372036854775808, 12345.6789, b'1010', 1, b'1111111111111111111111111111111111111111111111111111111111111111')
+INSERT INTO wp_knowledge_mysql_type_compat (id, amount, flags, enabled, wide_flags, payload, mood, perms)
+VALUES (9223372036854775808, 12345.6789, b'1010', 1, b'1111111111111111111111111111111111111111111111111111111111111111', X'00FF10AA', 'happy', 'read,admin')
 "#,
         )
         .expect("seed mysql type compatibility table failed");
@@ -719,23 +733,35 @@ VALUES (9223372036854775808, 12345.6789, b'1010', 1, b'1111111111111111111111111
     assert_eq!(datafield_digit(&count[0]), 1);
 
     let row = kdb::query_named_fields(
-        "SELECT id, amount, flags, enabled, wide_flags FROM wp_knowledge_mysql_type_compat WHERE id=:id",
+        "SELECT id, amount, flags, enabled, wide_flags, payload, mood, perms FROM wp_knowledge_mysql_type_compat WHERE id=:id",
         &[DataField::from_chars(
             ":id".to_string(),
             "9223372036854775808".to_string(),
         )],
     )
     .expect("query mysql unsigned decimal bit values");
-    assert_eq!(row[0].get_name(), "id");
-    assert_eq!(row[0].to_string(), "chars(9223372036854775808)");
-    assert_eq!(row[1].get_name(), "amount");
-    assert_eq!(row[1].to_string(), "chars(12345.6789)");
+    assert_row_strings(
+        &[
+            row[0].clone(),
+            row[1].clone(),
+            row[4].clone(),
+            row[5].clone(),
+            row[6].clone(),
+            row[7].clone(),
+        ],
+        &[
+            ("id", "chars(9223372036854775808)"),
+            ("amount", "chars(12345.6789)"),
+            ("wide_flags", "chars(18446744073709551615)"),
+            ("payload", "chars(0x00ff10aa)"),
+            ("mood", "chars(happy)"),
+            ("perms", "chars(read,admin)"),
+        ],
+    );
     assert_eq!(row[2].get_name(), "flags");
     assert_eq!(datafield_digit(&row[2]), 10);
     assert_eq!(row[3].get_name(), "enabled");
     assert_eq!(datafield_digit(&row[3]), 1);
-    assert_eq!(row[4].get_name(), "wide_flags");
-    assert_eq!(row[4].to_string(), "chars(18446744073709551615)");
 }
 
 #[test]

@@ -83,6 +83,14 @@ fn datafield_digit(field: &DataField) -> i64 {
     }
 }
 
+fn assert_row_strings(row: &[DataField], expected: &[(&str, &str)]) {
+    assert_eq!(row.len(), expected.len(), "row length mismatch");
+    for (field, (name, value)) in row.iter().zip(expected.iter()) {
+        assert_eq!(field.get_name(), *name);
+        assert_eq!(field.to_string(), *value);
+    }
+}
+
 fn ensure_postgres_provider_initialized() -> String {
     static INIT: OnceLock<String> = OnceLock::new();
     INIT.get_or_init(|| {
@@ -810,8 +818,24 @@ fn postgres_provider_sqlx_type_compatibility() {
 
     let row = kdb::query_row("SELECT 12345.6789::numeric(20, 4) AS amount")
         .expect("query postgres numeric");
-    assert_eq!(row[0].get_name(), "amount");
-    assert_eq!(row[0].to_string(), "chars(12345.6789)");
+    assert_row_strings(&row, &[("amount", "chars(12345.6789)")]);
+
+    let row = kdb::query_row(
+        "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid AS id, '10.0.0.0/24'::inet AS inet_addr, '10.0.1.0/24'::cidr AS cidr_addr",
+    )
+    .expect("query postgres uuid and network types");
+    assert_row_strings(
+        &row,
+        &[
+            ("id", "chars(550e8400-e29b-41d4-a716-446655440000)"),
+            ("inet_addr", "chars(10.0.0.0/24)"),
+            ("cidr_addr", "chars(10.0.1.0/24)"),
+        ],
+    );
+
+    let row = kdb::query_row("SELECT decode('00ff10aa', 'hex') AS payload")
+        .expect("query postgres bytea");
+    assert_row_strings(&row, &[("payload", "chars(0x00ff10aa)")]);
 }
 
 #[test]

@@ -205,12 +205,18 @@ pub fn init_mem_provider(memdb: MemDB) -> KnowledgeResult<()> {
 }
 
 pub fn init_postgres_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
-    let datasource_id = datasource_id_for(ProviderKind::Postgres, connection_uri);
+    init_postgres_provider_with_config(
+        PostgresProviderConfig::new(connection_uri).with_pool_size(pool_size),
+    )
+}
+
+pub fn init_postgres_provider_with_config(config: PostgresProviderConfig) -> KnowledgeResult<()> {
+    let connection_uri = config.connection_uri().to_string();
+    let datasource_id = datasource_id_for(ProviderKind::Postgres, &connection_uri);
     install_provider(
         ProviderKind::Postgres,
         datasource_id.clone(),
         |generation| {
-            let config = PostgresProviderConfig::new(connection_uri).with_pool_size(pool_size);
             let provider = PostgresProvider::connect(
                 &config,
                 MetadataCacheScope {
@@ -224,9 +230,15 @@ pub fn init_postgres_provider(connection_uri: &str, pool_size: Option<u32>) -> K
 }
 
 pub fn init_mysql_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
-    let datasource_id = datasource_id_for(ProviderKind::Mysql, connection_uri);
+    init_mysql_provider_with_config(
+        MySqlProviderConfig::new(connection_uri).with_pool_size(pool_size),
+    )
+}
+
+pub fn init_mysql_provider_with_config(config: MySqlProviderConfig) -> KnowledgeResult<()> {
+    let connection_uri = config.connection_uri().to_string();
+    let datasource_id = datasource_id_for(ProviderKind::Mysql, &connection_uri);
     install_provider(ProviderKind::Mysql, datasource_id.clone(), |generation| {
-        let config = MySqlProviderConfig::new(connection_uri).with_pool_size(pool_size);
         let provider = MySqlProvider::connect(
             &config,
             MetadataCacheScope {
@@ -509,7 +521,14 @@ pub fn init_thread_cloned_from_knowdb(
         match provider.kind {
             ProviderKind::Postgres => {
                 info_ctrl!("init postgres knowdb provider({}) ", conf_abs.display(),);
-                init_postgres_provider(provider.connection_uri.as_str(), provider.pool_size)?;
+                init_postgres_provider_with_config(
+                    PostgresProviderConfig::new(provider.connection_uri)
+                        .with_pool_size(provider.pool_size)
+                        .with_min_connections(provider.min_connections)
+                        .with_acquire_timeout_ms(provider.acquire_timeout_ms)
+                        .with_idle_timeout_ms(provider.idle_timeout_ms)
+                        .with_max_lifetime_ms(provider.max_lifetime_ms),
+                )?;
                 runtime().configure_result_cache(
                     conf.cache.enabled,
                     conf.cache.capacity,
@@ -519,7 +538,14 @@ pub fn init_thread_cloned_from_knowdb(
             }
             ProviderKind::Mysql => {
                 info_ctrl!("init mysql knowdb provider({}) ", conf_abs.display(),);
-                init_mysql_provider(provider.connection_uri.as_str(), provider.pool_size)?;
+                init_mysql_provider_with_config(
+                    MySqlProviderConfig::new(provider.connection_uri)
+                        .with_pool_size(provider.pool_size)
+                        .with_min_connections(provider.min_connections)
+                        .with_acquire_timeout_ms(provider.acquire_timeout_ms)
+                        .with_idle_timeout_ms(provider.idle_timeout_ms)
+                        .with_max_lifetime_ms(provider.max_lifetime_ms),
+                )?;
                 runtime().configure_result_cache(
                     conf.cache.enabled,
                     conf.cache.capacity,

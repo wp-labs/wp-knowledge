@@ -1,31 +1,31 @@
 use std::future::Future;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use orion_error::{ToStructError, UvsFrom};
 use sqlx::mysql::{MySqlArguments, MySqlColumn, MySqlPoolOptions, MySqlRow};
 use sqlx::{Column, Executor, MySql, Pool, Row, TypeInfo, ValueRef};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
 
+use crate::field_format::{bytes_to_prefixed_hex, chars_field, display_chars_field};
 use crate::loader::ProviderKind;
 use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init_async_for_scope};
+use crate::pool_config::CommonPoolConfig as MySqlPoolConfig;
+use crate::provider_runtime;
 use crate::runtime::MetadataCacheScope;
 
 #[derive(Debug, Clone)]
 pub struct MySqlProviderConfig {
     connection_uri: String,
-    pool_size: u32,
+    pool: MySqlPoolConfig,
 }
 
 impl MySqlProviderConfig {
     pub fn new(connection_uri: impl Into<String>) -> Self {
         Self {
             connection_uri: connection_uri.into(),
-            pool_size: 8,
+            pool: MySqlPoolConfig::default(),
         }
     }
 
@@ -33,14 +33,32 @@ impl MySqlProviderConfig {
         &self.connection_uri
     }
 
-    pub fn pool_size(&self) -> u32 {
-        self.pool_size
+    pub(crate) fn pool(&self) -> &MySqlPoolConfig {
+        &self.pool
     }
 
     pub fn with_pool_size(mut self, pool_size: Option<u32>) -> Self {
-        if let Some(pool_size) = pool_size.filter(|size| *size > 0) {
-            self.pool_size = pool_size;
-        }
+        self.pool = self.pool.with_pool_size(pool_size);
+        self
+    }
+
+    pub fn with_min_connections(mut self, min_connections: Option<u32>) -> Self {
+        self.pool = self.pool.with_min_connections(min_connections);
+        self
+    }
+
+    pub fn with_acquire_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.pool = self.pool.with_acquire_timeout_ms(timeout_ms);
+        self
+    }
+
+    pub fn with_idle_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.pool = self.pool.with_idle_timeout_ms(timeout_ms);
+        self
+    }
+
+    pub fn with_max_lifetime_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.pool = self.pool.with_max_lifetime_ms(timeout_ms);
         self
     }
 }
@@ -56,57 +74,43 @@ impl MySqlProvider {
         config: &MySqlProviderConfig,
         metadata_scope: MetadataCacheScope,
     ) -> KnowledgeResult<Self> {
-        let pool_size = config.pool_size().max(1);
+        let pool_config = config
+            .pool()
+            .clone()
+            .with_pool_size(Some(config.pool().pool_size().max(1)));
+        let pool_size = pool_config.pool_size();
         let connection_uri = config.connection_uri().to_string();
-        let metadata_scope_for_thread = metadata_scope.clone();
-        let (tx, rx) = mpsc::channel();
-        thread::Builder::new()
-            .name("wp-kdb-mysql-init".to_string())
-            .spawn(move || {
-                let runtime = Builder::new_multi_thread()
-                    .worker_threads(pool_size as usize)
-                    .enable_all()
-                    .thread_name("wp-kdb-mysql")
-                    .build()
-                    .map_err(|err| {
-                        KnowledgeReason::from_conf()
-                            .to_err()
-                            .with_detail(format!("create mysql tokio runtime failed: {err}"))
-                    });
-                let result = runtime.and_then(|runtime| {
-                    let pool = runtime.block_on(async {
-                        let pool = MySqlPoolOptions::new()
-                            .max_connections(pool_size)
-                            .min_connections(0)
-                            .idle_timeout(Some(Duration::from_secs(60)))
-                            .connect(&connection_uri)
-                            .await
-                            .map_err(|err| {
-                                KnowledgeReason::from_conf()
-                                    .to_err()
-                                    .with_detail(format!("create mysql pool failed: {err}"))
-                            })?;
-                        validate_startup(&pool).await?;
-                        Ok::<Pool<MySql>, wp_error::KnowledgeError>(pool)
-                    })?;
-                    Ok::<MySqlProvider, wp_error::KnowledgeError>(Self {
-                        runtime: Some(runtime),
-                        pool,
-                        metadata_scope: metadata_scope_for_thread,
-                    })
-                });
-                let _ = tx.send(result);
-            })
-            .map_err(|err| {
-                KnowledgeReason::from_conf()
-                    .to_err()
-                    .with_detail(format!("spawn mysql init thread failed: {err}"))
-            })?;
-        rx.recv().map_err(|err| {
-            KnowledgeReason::from_conf()
-                .to_err()
-                .with_detail(format!("receive mysql init result failed: {err}"))
-        })?
+        provider_runtime::init_provider_runtime(
+            "mysql",
+            "wp-kdb-mysql-init",
+            "wp-kdb-mysql",
+            pool_size,
+            move |runtime| {
+                let metadata_scope_for_thread = metadata_scope;
+                let pool = runtime.block_on(async {
+                    let pool = MySqlPoolOptions::new()
+                        .max_connections(pool_size)
+                        .min_connections(pool_config.min_connections())
+                        .acquire_timeout(pool_config.acquire_timeout())
+                        .idle_timeout(pool_config.idle_timeout())
+                        .max_lifetime(pool_config.max_lifetime())
+                        .connect(&connection_uri)
+                        .await
+                        .map_err(|err| {
+                            KnowledgeReason::from_conf()
+                                .to_err()
+                                .with_detail(format!("create mysql pool failed: {err}"))
+                        })?;
+                    validate_startup(&pool).await?;
+                    Ok::<Pool<MySql>, wp_error::KnowledgeError>(pool)
+                })?;
+                Ok(Self {
+                    runtime: Some(runtime),
+                    pool,
+                    metadata_scope: metadata_scope_for_thread,
+                })
+            },
+        )
     }
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
@@ -210,13 +214,13 @@ impl MySqlProvider {
         T: Send + 'static,
         F: Future<Output = KnowledgeResult<T>> + Send + 'static,
     {
-        self.runtime
-            .as_ref()
-            .expect("mysql runtime available")
-            .handle()
-            .spawn(fut)
-            .await
-            .map_err(|err| join_err("mysql", action, err))?
+        provider_runtime::run_task(
+            self.runtime.as_ref().expect("mysql runtime available"),
+            "mysql",
+            action,
+            fut,
+        )
+        .await
     }
 
     fn block_on_task<T, F>(&self, fut: F, action: &str) -> KnowledgeResult<T>
@@ -224,19 +228,12 @@ impl MySqlProvider {
         T: Send + 'static,
         F: Future<Output = KnowledgeResult<T>> + Send + 'static,
     {
-        let (tx, rx) = mpsc::channel();
-        self.runtime
-            .as_ref()
-            .expect("mysql runtime available")
-            .handle()
-            .spawn(async move {
-                let _ = tx.send(fut.await);
-            });
-        rx.recv().map_err(|err| {
-            KnowledgeReason::from_logic().to_err().with_detail(format!(
-                "mysql async task channel failed during {action}: {err}"
-            ))
-        })?
+        provider_runtime::block_on_task(
+            self.runtime.as_ref().expect("mysql runtime available"),
+            "mysql",
+            action,
+            fut,
+        )
     }
 }
 
@@ -284,12 +281,36 @@ async fn mysql_col_names(
     .await
 }
 
+async fn mysql_col_names_from_row_or_describe(
+    pool: &Pool<MySql>,
+    metadata_scope: &MetadataCacheScope,
+    cache_sql: &str,
+    exec_sql: &str,
+    row: Option<&MySqlRow>,
+) -> KnowledgeResult<Vec<String>> {
+    if let Some(row) = row {
+        let names: Vec<String> = row
+            .columns()
+            .iter()
+            .map(|col| col.name().to_string())
+            .collect();
+        return metadata_cache_get_or_try_init_async_for_scope(
+            metadata_scope,
+            Some(ProviderKind::Mysql),
+            cache_sql,
+            || async move { Ok(Some(names)) },
+        )
+        .await;
+    }
+
+    mysql_col_names(pool, metadata_scope, cache_sql, exec_sql).await
+}
+
 async fn execute_query(
     pool: Pool<MySql>,
     metadata_scope: MetadataCacheScope,
     sql: String,
 ) -> KnowledgeResult<Vec<RowData>> {
-    let col_names = mysql_col_names(&pool, &metadata_scope, &sql, &sql).await?;
     let rows = sqlx::query::<MySql>(&sql)
         .fetch_all(&pool)
         .await
@@ -298,6 +319,9 @@ async fn execute_query(
                 .to_err()
                 .with_detail(format!("mysql query failed: {err}"))
         })?;
+    let col_names =
+        mysql_col_names_from_row_or_describe(&pool, &metadata_scope, &sql, &sql, rows.first())
+            .await?;
     rows.iter().map(|row| map_row(row, &col_names)).collect()
 }
 
@@ -306,7 +330,6 @@ async fn execute_query_row(
     metadata_scope: MetadataCacheScope,
     sql: String,
 ) -> KnowledgeResult<RowData> {
-    let col_names = mysql_col_names(&pool, &metadata_scope, &sql, &sql).await?;
     let row = sqlx::query::<MySql>(&sql)
         .fetch_optional(&pool)
         .await
@@ -315,6 +338,9 @@ async fn execute_query_row(
                 .to_err()
                 .with_detail(format!("mysql query_row failed: {err}"))
         })?;
+    let col_names =
+        mysql_col_names_from_row_or_describe(&pool, &metadata_scope, &sql, &sql, row.as_ref())
+            .await?;
     match row {
         Some(row) => map_row(&row, &col_names),
         None => Ok(Vec::new()),
@@ -328,7 +354,6 @@ async fn execute_query_fields(
     params: Vec<DataField>,
 ) -> KnowledgeResult<Vec<RowData>> {
     let (rewritten_sql, ordered_params) = rewrite_sql(&sql, &params)?;
-    let col_names = mysql_col_names(&pool, &metadata_scope, &sql, &rewritten_sql).await?;
     let query = ordered_params
         .iter()
         .fold(sqlx::query::<MySql>(&rewritten_sql), |query, field| {
@@ -339,6 +364,14 @@ async fn execute_query_fields(
             .to_err()
             .with_detail(format!("mysql query_fields failed: {err}"))
     })?;
+    let col_names = mysql_col_names_from_row_or_describe(
+        &pool,
+        &metadata_scope,
+        &sql,
+        &rewritten_sql,
+        rows.first(),
+    )
+    .await?;
     rows.iter().map(|row| map_row(row, &col_names)).collect()
 }
 
@@ -349,7 +382,6 @@ async fn execute_query_named_fields(
     params: Vec<DataField>,
 ) -> KnowledgeResult<RowData> {
     let (rewritten_sql, ordered_params) = rewrite_sql(&sql, &params)?;
-    let col_names = mysql_col_names(&pool, &metadata_scope, &sql, &rewritten_sql).await?;
     let query = ordered_params
         .iter()
         .fold(sqlx::query::<MySql>(&rewritten_sql), |query, field| {
@@ -360,6 +392,14 @@ async fn execute_query_named_fields(
             .to_err()
             .with_detail(format!("mysql query_named_fields failed: {err}"))
     })?;
+    let col_names = mysql_col_names_from_row_or_describe(
+        &pool,
+        &metadata_scope,
+        &sql,
+        &rewritten_sql,
+        row.as_ref(),
+    )
+    .await?;
     match row {
         Some(row) => map_row(&row, &col_names),
         None => Ok(Vec::new()),
@@ -369,12 +409,6 @@ async fn execute_query_named_fields(
 fn validation_err(stage: &str, err: sqlx::Error) -> wp_error::KnowledgeError {
     KnowledgeReason::from_conf().to_err().with_detail(format!(
         "mysql startup validation failed during {stage}: connection issue: {err}"
-    ))
-}
-
-fn join_err(provider: &str, action: &str, err: tokio::task::JoinError) -> wp_error::KnowledgeError {
-    KnowledgeReason::from_logic().to_err().with_detail(format!(
-        "{provider} async task join failed during {action}: {err}"
     ))
 }
 
@@ -606,70 +640,203 @@ fn map_value(row: &MySqlRow, idx: usize, name: &str) -> KnowledgeResult<DataFiel
 
     let ty = row.column(idx).type_info().name().to_ascii_uppercase();
     let (base_ty, is_unsigned) = mysql_type_base_name(&ty);
-    match base_ty {
-        "BOOL" | "BOOLEAN" => row
-            .try_get::<i8, _>(idx)
-            .map(|value| DataField::from_digit(name, i64::from(value)))
-            .or_else(|_| {
-                row.try_get::<bool, _>(idx)
-                    .map(|value| DataField::from_digit(name, if value { 1 } else { 0 }))
-            })
-            .map_err(mysql_decode_err),
-        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "YEAR" => {
-            if is_unsigned {
-                row.try_get::<u64, _>(idx)
-                    .map(|value| {
-                        if value <= i64::MAX as u64 {
-                            DataField::from_digit(name, value as i64)
-                        } else {
-                            DataField::from_chars(name, value.to_string())
-                        }
-                    })
-                    .map_err(mysql_decode_err)
-            } else {
-                row.try_get::<i64, _>(idx)
-                    .map(|value| DataField::from_digit(name, value))
-                    .map_err(mysql_decode_err)
-            }
-        }
+    if let Some(field) = decode_mysql_boolean(row, idx, name, base_ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_mysql_integer(row, idx, name, base_ty, is_unsigned)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_mysql_binary(row, idx, name, base_ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_mysql_float(row, idx, name, base_ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_mysql_decimal(row, idx, name, base_ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_mysql_temporal(row, idx, name, base_ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_mysql_json(row, idx, name, base_ty)? {
+        return Ok(field);
+    }
+
+    decode_mysql_text_like(row, idx, name)
+}
+
+fn decode_mysql_boolean(
+    row: &MySqlRow,
+    idx: usize,
+    name: &str,
+    base_ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if !matches!(base_ty, "BOOL" | "BOOLEAN") {
+        return Ok(None);
+    }
+
+    row.try_get::<i8, _>(idx)
+        .map(|value| DataField::from_digit(name, i64::from(value)))
+        .or_else(|_| {
+            row.try_get::<bool, _>(idx)
+                .map(|value| DataField::from_digit(name, if value { 1 } else { 0 }))
+        })
+        .map(Some)
+        .map_err(mysql_decode_err)
+}
+
+fn decode_mysql_integer(
+    row: &MySqlRow,
+    idx: usize,
+    name: &str,
+    base_ty: &str,
+    is_unsigned: bool,
+) -> KnowledgeResult<Option<DataField>> {
+    if !matches!(
+        base_ty,
+        "TINYINT" | "SMALLINT" | "MEDIUMINT" | "INT" | "INTEGER" | "BIGINT" | "YEAR" | "BIT"
+    ) {
+        return Ok(None);
+    }
+
+    let field = match base_ty {
         "BIT" => row
             .try_get::<u64, _>(idx)
             .map(|value| mysql_bit_u64_to_field(name, value))
-            .map_err(mysql_decode_err),
-        "FLOAT" | "DOUBLE" | "REAL" => row
-            .try_get::<f64, _>(idx)
-            .map(|value| DataField::from_float(name, value))
-            .map_err(mysql_decode_err),
-        "DECIMAL" => row
-            .try_get::<sqlx::types::BigDecimal, _>(idx)
-            .map(|value| DataField::from_chars(name, value.to_string()))
-            .map_err(mysql_decode_err),
+            .map_err(mysql_decode_err)?,
+        _ if is_unsigned => row
+            .try_get::<u64, _>(idx)
+            .map(|value| {
+                if value <= i64::MAX as u64 {
+                    DataField::from_digit(name, value as i64)
+                } else {
+                    DataField::from_chars(name, value.to_string())
+                }
+            })
+            .map_err(mysql_decode_err)?,
+        _ => row
+            .try_get::<i64, _>(idx)
+            .map(|value| DataField::from_digit(name, value))
+            .map_err(mysql_decode_err)?,
+    };
+
+    Ok(Some(field))
+}
+
+fn decode_mysql_binary(
+    row: &MySqlRow,
+    idx: usize,
+    name: &str,
+    base_ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if matches!(base_ty, "ENUM" | "SET") {
+        return row
+            .try_get::<String, _>(idx)
+            .map(|value| chars_field(name, value))
+            .map(Some)
+            .map_err(mysql_decode_err);
+    }
+
+    if !matches!(
+        base_ty,
+        "BINARY" | "VARBINARY" | "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB"
+    ) {
+        return Ok(None);
+    }
+
+    row.try_get::<Vec<u8>, _>(idx)
+        .map(|value| chars_field(name, bytes_to_prefixed_hex(&value)))
+        .map(Some)
+        .map_err(mysql_decode_err)
+}
+
+fn decode_mysql_float(
+    row: &MySqlRow,
+    idx: usize,
+    name: &str,
+    base_ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if !matches!(base_ty, "FLOAT" | "DOUBLE" | "REAL") {
+        return Ok(None);
+    }
+
+    row.try_get::<f64, _>(idx)
+        .map(|value| DataField::from_float(name, value))
+        .map(Some)
+        .map_err(mysql_decode_err)
+}
+
+fn decode_mysql_decimal(
+    row: &MySqlRow,
+    idx: usize,
+    name: &str,
+    base_ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if base_ty != "DECIMAL" {
+        return Ok(None);
+    }
+
+    row.try_get::<sqlx::types::BigDecimal, _>(idx)
+        .map(|value| display_chars_field(name, value))
+        .map(Some)
+        .map_err(mysql_decode_err)
+}
+
+fn decode_mysql_temporal(
+    row: &MySqlRow,
+    idx: usize,
+    name: &str,
+    base_ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    let field = match base_ty {
         "DATE" => row
             .try_get::<NaiveDate, _>(idx)
-            .map(|value| DataField::from_chars(name, value.to_string()))
-            .map_err(mysql_decode_err),
+            .map(|value| display_chars_field(name, value))
+            .map_err(mysql_decode_err)?,
         "TIME" => row
             .try_get::<NaiveTime, _>(idx)
-            .map(|value| DataField::from_chars(name, value.to_string()))
-            .map_err(mysql_decode_err),
+            .map(|value| display_chars_field(name, value))
+            .map_err(mysql_decode_err)?,
         "DATETIME" | "TIMESTAMP" => row
             .try_get::<NaiveDateTime, _>(idx)
-            .map(|value| DataField::from_chars(name, value.to_string()))
-            .map_err(mysql_decode_err),
-        "JSON" => row
-            .try_get::<serde_json::Value, _>(idx)
-            .map(|value| DataField::from_chars(name, value.to_string()))
-            .map_err(mysql_decode_err),
-        _ => row
-            .try_get::<String, _>(idx)
-            .map(|value| DataField::from_chars(name, value))
-            .or_else(|_| {
-                row.try_get::<Vec<u8>, _>(idx).map(|value| {
-                    DataField::from_chars(name, String::from_utf8_lossy(&value).to_string())
-                })
-            })
-            .map_err(mysql_decode_err),
+            .map(|value| display_chars_field(name, value))
+            .map_err(mysql_decode_err)?,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(field))
+}
+
+fn decode_mysql_json(
+    row: &MySqlRow,
+    idx: usize,
+    name: &str,
+    base_ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if base_ty != "JSON" {
+        return Ok(None);
     }
+
+    row.try_get::<serde_json::Value, _>(idx)
+        .map(|value| display_chars_field(name, value))
+        .map(Some)
+        .map_err(mysql_decode_err)
+}
+
+fn decode_mysql_text_like(row: &MySqlRow, idx: usize, name: &str) -> KnowledgeResult<DataField> {
+    row.try_get::<String, _>(idx)
+        .map(|value| chars_field(name, value))
+        .or_else(|_| {
+            row.try_get::<Vec<u8>, _>(idx)
+                .map(|value| chars_field(name, bytes_to_prefixed_hex(&value)))
+        })
+        .map_err(mysql_decode_err)
 }
 
 fn mysql_type_base_name(ty: &str) -> (&str, bool) {
@@ -693,7 +860,10 @@ fn mysql_decode_err(err: sqlx::Error) -> wp_error::KnowledgeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{mysql_bit_u64_to_field, mysql_type_base_name};
+    use std::time::Duration;
+
+    use super::{MySqlPoolConfig, mysql_bit_u64_to_field, mysql_type_base_name};
+    use crate::field_format::bytes_to_hex;
     use wp_model_core::model::Value;
 
     #[test]
@@ -722,5 +892,25 @@ mod tests {
             field.get_value(),
             &Value::Chars("18446744073709551615".into())
         );
+    }
+
+    #[test]
+    fn bytes_to_hex_formats_lowercase_hex() {
+        assert_eq!(bytes_to_hex(&[0x00, 0xff, 0x10, 0xaa]), "00ff10aa");
+    }
+
+    #[test]
+    fn mysql_pool_config_clamps_min_connections_and_handles_zero_timeouts() {
+        let pool = MySqlPoolConfig::default()
+            .with_pool_size(Some(4))
+            .with_min_connections(Some(8))
+            .with_idle_timeout_ms(Some(0))
+            .with_max_lifetime_ms(Some(0))
+            .with_acquire_timeout_ms(Some(2500));
+        assert_eq!(pool.pool_size(), 4);
+        assert_eq!(pool.min_connections(), 4);
+        assert_eq!(pool.acquire_timeout(), Duration::from_millis(2500));
+        assert_eq!(pool.idle_timeout(), None);
+        assert_eq!(pool.max_lifetime(), None);
     }
 }

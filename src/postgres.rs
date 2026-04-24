@@ -1,32 +1,32 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::mpsc;
-use std::thread;
-use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use orion_error::{ToStructError, UvsFrom};
 use sqlx::postgres::{PgArguments, PgColumn, PgPoolOptions, PgRow, types::Oid};
 use sqlx::{Column, Executor, Pool, Postgres, Row, TypeInfo, ValueRef};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
 
+use crate::field_format::{bytes_to_prefixed_hex, chars_field, display_chars_field};
 use crate::loader::ProviderKind;
 use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init_async_for_scope_typed};
+use crate::pool_config::CommonPoolConfig as PostgresPoolConfig;
+use crate::provider_runtime;
 use crate::runtime::MetadataCacheScope;
 
 #[derive(Debug, Clone)]
 pub struct PostgresProviderConfig {
     connection_uri: String,
-    pool_size: u32,
+    pool: PostgresPoolConfig,
 }
 
 impl PostgresProviderConfig {
     pub fn new(connection_uri: impl Into<String>) -> Self {
         Self {
             connection_uri: connection_uri.into(),
-            pool_size: 8,
+            pool: PostgresPoolConfig::default(),
         }
     }
 
@@ -34,14 +34,32 @@ impl PostgresProviderConfig {
         &self.connection_uri
     }
 
-    pub fn pool_size(&self) -> u32 {
-        self.pool_size
+    pub(crate) fn pool(&self) -> &PostgresPoolConfig {
+        &self.pool
     }
 
     pub fn with_pool_size(mut self, pool_size: Option<u32>) -> Self {
-        if let Some(pool_size) = pool_size.filter(|size| *size > 0) {
-            self.pool_size = pool_size;
-        }
+        self.pool = self.pool.with_pool_size(pool_size);
+        self
+    }
+
+    pub fn with_min_connections(mut self, min_connections: Option<u32>) -> Self {
+        self.pool = self.pool.with_min_connections(min_connections);
+        self
+    }
+
+    pub fn with_acquire_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.pool = self.pool.with_acquire_timeout_ms(timeout_ms);
+        self
+    }
+
+    pub fn with_idle_timeout_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.pool = self.pool.with_idle_timeout_ms(timeout_ms);
+        self
+    }
+
+    pub fn with_max_lifetime_ms(mut self, timeout_ms: Option<u64>) -> Self {
+        self.pool = self.pool.with_max_lifetime_ms(timeout_ms);
         self
     }
 }
@@ -57,60 +75,43 @@ impl PostgresProvider {
         config: &PostgresProviderConfig,
         metadata_scope: MetadataCacheScope,
     ) -> KnowledgeResult<Self> {
-        let pool_size = config.pool_size().max(1);
+        let pool_config = config
+            .pool()
+            .clone()
+            .with_pool_size(Some(config.pool().pool_size().max(1)));
+        let pool_size = pool_config.pool_size();
         let connection_uri = config.connection_uri().to_string();
-        let metadata_scope_for_thread = metadata_scope.clone();
-        let (tx, rx) = mpsc::channel();
-        thread::Builder::new()
-            .name("wp-kdb-pg-init".to_string())
-            .spawn(move || {
-                let runtime = Builder::new_multi_thread()
-                    .worker_threads(pool_size as usize)
-                    .enable_all()
-                    .thread_name("wp-kdb-pg")
-                    .build()
-                    .map_err(|err| {
-                        KnowledgeReason::from_conf()
-                            .to_err()
-                            .with_detail(format!("create postgres tokio runtime failed: {err}"))
-                    });
-                let result = runtime.and_then(|runtime| {
-                    let pool = runtime.block_on(async {
-                        let pool = PgPoolOptions::new()
-                            .max_connections(pool_size)
-                            .min_connections(0)
-                            .idle_timeout(Some(Duration::from_secs(60)))
-                            .connect(&connection_uri)
-                            .await
-                            .map_err(|err| {
-                                KnowledgeReason::from_conf()
-                                    .to_err()
-                                    .with_detail(format!("create postgres pool failed: {err}"))
-                            })?;
-                        validate_startup(&pool).await?;
-                        Ok::<Pool<Postgres>, wp_error::KnowledgeError>(pool)
-                    })?;
-                    Ok::<PostgresProvider, wp_error::KnowledgeError>(Self {
-                        runtime: Some(runtime),
-                        pool,
-                        metadata_scope: metadata_scope_for_thread,
-                    })
-                });
-                let _ = tx.send(result);
-            })
-            .map_err(|err| {
-                KnowledgeReason::from_conf()
-                    .to_err()
-                    .with_detail(format!("spawn postgres init thread failed: {err}"))
-            })?;
-
-        rx.recv()
-            .map_err(|err| {
-                KnowledgeReason::from_conf()
-                    .to_err()
-                    .with_detail(format!("receive postgres init result failed: {err}"))
-            })
-            .and_then(|result| result)
+        provider_runtime::init_provider_runtime(
+            "postgres",
+            "wp-kdb-pg-init",
+            "wp-kdb-pg",
+            pool_size,
+            move |runtime| {
+                let metadata_scope_for_thread = metadata_scope;
+                let pool = runtime.block_on(async {
+                    let pool = PgPoolOptions::new()
+                        .max_connections(pool_size)
+                        .min_connections(pool_config.min_connections())
+                        .acquire_timeout(pool_config.acquire_timeout())
+                        .idle_timeout(pool_config.idle_timeout())
+                        .max_lifetime(pool_config.max_lifetime())
+                        .connect(&connection_uri)
+                        .await
+                        .map_err(|err| {
+                            KnowledgeReason::from_conf()
+                                .to_err()
+                                .with_detail(format!("create postgres pool failed: {err}"))
+                        })?;
+                    validate_startup(&pool).await?;
+                    Ok::<Pool<Postgres>, wp_error::KnowledgeError>(pool)
+                })?;
+                Ok(Self {
+                    runtime: Some(runtime),
+                    pool,
+                    metadata_scope: metadata_scope_for_thread,
+                })
+            },
+        )
     }
 
     pub fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
@@ -214,13 +215,13 @@ impl PostgresProvider {
         T: Send + 'static,
         F: Future<Output = KnowledgeResult<T>> + Send + 'static,
     {
-        self.runtime
-            .as_ref()
-            .expect("postgres runtime available")
-            .handle()
-            .spawn(fut)
-            .await
-            .map_err(|err| join_err("postgres", action, err))?
+        provider_runtime::run_task(
+            self.runtime.as_ref().expect("postgres runtime available"),
+            "postgres",
+            action,
+            fut,
+        )
+        .await
     }
 
     fn block_on_task<T, F>(&self, fut: F, action: &str) -> KnowledgeResult<T>
@@ -228,19 +229,12 @@ impl PostgresProvider {
         T: Send + 'static,
         F: Future<Output = KnowledgeResult<T>> + Send + 'static,
     {
-        let (tx, rx) = mpsc::channel();
-        self.runtime
-            .as_ref()
-            .expect("postgres runtime available")
-            .handle()
-            .spawn(async move {
-                let _ = tx.send(fut.await);
-            });
-        rx.recv().map_err(|err| {
-            KnowledgeReason::from_logic().to_err().with_detail(format!(
-                "postgres async task channel failed during {action}: {err}"
-            ))
-        })?
+        provider_runtime::block_on_task(
+            self.runtime.as_ref().expect("postgres runtime available"),
+            "postgres",
+            action,
+            fut,
+        )
     }
 }
 
@@ -288,12 +282,36 @@ async fn postgres_col_names(
     .await
 }
 
+async fn postgres_col_names_from_row_or_describe(
+    pool: &Pool<Postgres>,
+    metadata_scope: &MetadataCacheScope,
+    cache_sql: &str,
+    exec_sql: &str,
+    row: Option<&PgRow>,
+) -> KnowledgeResult<Vec<String>> {
+    if let Some(row) = row {
+        let names: Vec<String> = row
+            .columns()
+            .iter()
+            .map(|col| col.name().to_string())
+            .collect();
+        return metadata_cache_get_or_try_init_async_for_scope_typed(
+            metadata_scope,
+            Some(ProviderKind::Postgres),
+            cache_sql,
+            || async move { Ok::<Option<Vec<String>>, wp_error::KnowledgeError>(Some(names)) },
+        )
+        .await;
+    }
+
+    postgres_col_names(pool, metadata_scope, cache_sql, exec_sql).await
+}
+
 async fn execute_query(
     pool: Pool<Postgres>,
     metadata_scope: &MetadataCacheScope,
     sql: &str,
 ) -> KnowledgeResult<Vec<RowData>> {
-    let col_names = postgres_col_names(&pool, metadata_scope, sql, sql).await?;
     let rows = sqlx::query::<Postgres>(sql)
         .fetch_all(&pool)
         .await
@@ -302,6 +320,9 @@ async fn execute_query(
                 .to_err()
                 .with_detail(format!("postgres query failed: {err}"))
         })?;
+    let col_names =
+        postgres_col_names_from_row_or_describe(&pool, metadata_scope, sql, sql, rows.first())
+            .await?;
     rows.iter().map(|row| map_row(row, &col_names)).collect()
 }
 
@@ -310,7 +331,6 @@ async fn execute_query_row(
     metadata_scope: &MetadataCacheScope,
     sql: &str,
 ) -> KnowledgeResult<RowData> {
-    let col_names = postgres_col_names(&pool, metadata_scope, sql, sql).await?;
     let row = sqlx::query::<Postgres>(sql)
         .fetch_optional(&pool)
         .await
@@ -319,6 +339,9 @@ async fn execute_query_row(
                 .to_err()
                 .with_detail(format!("postgres query_row failed: {err}"))
         })?;
+    let col_names =
+        postgres_col_names_from_row_or_describe(&pool, metadata_scope, sql, sql, row.as_ref())
+            .await?;
     if let Some(row) = row.as_ref() {
         map_row(row, &col_names)
     } else {
@@ -333,7 +356,6 @@ async fn execute_query_fields(
     params: &[DataField],
 ) -> KnowledgeResult<Vec<RowData>> {
     let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
-    let col_names = postgres_col_names(&pool, metadata_scope, sql, &rewritten_sql).await?;
     let query = ordered_params
         .iter()
         .fold(sqlx::query::<Postgres>(&rewritten_sql), |query, field| {
@@ -344,6 +366,14 @@ async fn execute_query_fields(
             .to_err()
             .with_detail(format!("postgres query_fields failed: {err}"))
     })?;
+    let col_names = postgres_col_names_from_row_or_describe(
+        &pool,
+        metadata_scope,
+        sql,
+        &rewritten_sql,
+        rows.first(),
+    )
+    .await?;
     rows.iter().map(|row| map_row(row, &col_names)).collect()
 }
 
@@ -354,7 +384,6 @@ async fn execute_query_named_fields(
     params: &[DataField],
 ) -> KnowledgeResult<RowData> {
     let (rewritten_sql, ordered_params) = rewrite_sql(sql, params)?;
-    let col_names = postgres_col_names(&pool, metadata_scope, sql, &rewritten_sql).await?;
     let query = ordered_params
         .iter()
         .fold(sqlx::query::<Postgres>(&rewritten_sql), |query, field| {
@@ -365,6 +394,14 @@ async fn execute_query_named_fields(
             .to_err()
             .with_detail(format!("postgres query_named_fields failed: {err}"))
     })?;
+    let col_names = postgres_col_names_from_row_or_describe(
+        &pool,
+        metadata_scope,
+        sql,
+        &rewritten_sql,
+        row.as_ref(),
+    )
+    .await?;
     if let Some(row) = row.as_ref() {
         map_row(row, &col_names)
     } else {
@@ -400,12 +437,6 @@ fn bind_postgres_field<'q>(
 fn validation_err(stage: &str, err: sqlx::Error) -> wp_error::KnowledgeError {
     KnowledgeReason::from_conf().to_err().with_detail(format!(
         "postgres startup validation failed during {stage}: connection issue: {err}"
-    ))
-}
-
-fn join_err(provider: &str, action: &str, err: tokio::task::JoinError) -> wp_error::KnowledgeError {
-    KnowledgeReason::from_logic().to_err().with_detail(format!(
-        "{provider} async task join failed during {action}: {err}"
     ))
 }
 
@@ -620,68 +651,225 @@ fn map_value(row: &PgRow, idx: usize, name: &str) -> KnowledgeResult<DataField> 
     }
 
     let ty = row.column(idx).type_info().name().to_ascii_uppercase();
-    match ty.as_str() {
-        "BOOL" => Ok(row
-            .try_get::<bool, _>(idx)
-            .map(|value| DataField::from_bool(name.to_string(), value))
-            .map_err(pg_decode_err)?),
-        "INT2" => Ok(row
+    if let Some(field) = decode_postgres_boolean(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_integer(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_float(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_decimal(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_network(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_binary(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_text(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_temporal(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    if let Some(field) = decode_postgres_json(row, idx, name, &ty)? {
+        return Ok(field);
+    }
+
+    row.try_get::<String, _>(idx)
+        .map(|value| DataField::from_chars(name.to_string(), value))
+        .map_err(pg_decode_err)
+}
+
+fn decode_postgres_boolean(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if ty != "BOOL" {
+        return Ok(None);
+    }
+
+    row.try_get::<bool, _>(idx)
+        .map(|value| DataField::from_bool(name.to_string(), value))
+        .map(Some)
+        .map_err(pg_decode_err)
+}
+
+fn decode_postgres_integer(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    let field = match ty {
+        "INT2" => row
             .try_get::<i16, _>(idx)
             .map(|value| DataField::from_digit(name.to_string(), i64::from(value)))
-            .map_err(pg_decode_err)?),
-        "INT4" => Ok(row
+            .map_err(pg_decode_err)?,
+        "INT4" => row
             .try_get::<i32, _>(idx)
             .map(|value| DataField::from_digit(name.to_string(), i64::from(value)))
-            .map_err(pg_decode_err)?),
-        "INT8" => Ok(row
+            .map_err(pg_decode_err)?,
+        "INT8" => row
             .try_get::<i64, _>(idx)
             .map(|value| DataField::from_digit(name.to_string(), value))
-            .map_err(pg_decode_err)?),
-        "OID" => Ok(row
+            .map_err(pg_decode_err)?,
+        "OID" => row
             .try_get::<Oid, _>(idx)
             .map(|value| DataField::from_digit(name.to_string(), i64::from(value.0)))
-            .map_err(pg_decode_err)?),
-        "FLOAT4" => Ok(row
+            .map_err(pg_decode_err)?,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(field))
+}
+
+fn decode_postgres_float(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    let field = match ty {
+        "FLOAT4" => row
             .try_get::<f32, _>(idx)
             .map(|value| DataField::from_float(name.to_string(), f64::from(value)))
-            .map_err(pg_decode_err)?),
-        "FLOAT8" => Ok(row
+            .map_err(pg_decode_err)?,
+        "FLOAT8" => row
             .try_get::<f64, _>(idx)
             .map(|value| DataField::from_float(name.to_string(), value))
-            .map_err(pg_decode_err)?),
-        "NUMERIC" => Ok(row
-            .try_get::<sqlx::types::BigDecimal, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .map_err(pg_decode_err)?),
-        "VARCHAR" | "TEXT" | "BPCHAR" | "NAME" | "UNKNOWN" => Ok(row
-            .try_get::<String, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value))
-            .map_err(pg_decode_err)?),
-        "TIMESTAMP" => Ok(row
-            .try_get::<NaiveDateTime, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .map_err(pg_decode_err)?),
-        "TIMESTAMPTZ" => Ok(row
-            .try_get::<DateTime<Utc>, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value.to_rfc3339()))
-            .map_err(pg_decode_err)?),
-        "DATE" => Ok(row
-            .try_get::<NaiveDate, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .map_err(pg_decode_err)?),
-        "TIME" => Ok(row
-            .try_get::<NaiveTime, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .map_err(pg_decode_err)?),
-        "JSON" | "JSONB" => Ok(row
-            .try_get::<serde_json::Value, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value.to_string()))
-            .map_err(pg_decode_err)?),
-        _ => Ok(row
-            .try_get::<String, _>(idx)
-            .map(|value| DataField::from_chars(name.to_string(), value))
-            .map_err(pg_decode_err)?),
+            .map_err(pg_decode_err)?,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(field))
+}
+
+fn decode_postgres_decimal(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if ty != "NUMERIC" {
+        return Ok(None);
     }
+
+    row.try_get::<sqlx::types::BigDecimal, _>(idx)
+        .map(|value| display_chars_field(name.to_string(), value))
+        .map(Some)
+        .map_err(pg_decode_err)
+}
+
+fn decode_postgres_network(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    match ty {
+        "UUID" => row
+            .try_get::<sqlx::types::Uuid, _>(idx)
+            .map(|value| chars_field(name.to_string(), value.to_string()))
+            .map(Some)
+            .map_err(pg_decode_err),
+        "INET" | "CIDR" => row
+            .try_get::<sqlx::types::ipnet::IpNet, _>(idx)
+            .map(|value| chars_field(name.to_string(), value.to_string()))
+            .map(Some)
+            .map_err(pg_decode_err),
+        _ => Ok(None),
+    }
+}
+
+fn decode_postgres_binary(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if ty != "BYTEA" {
+        return Ok(None);
+    }
+
+    row.try_get::<Vec<u8>, _>(idx)
+        .map(|value| chars_field(name.to_string(), bytes_to_prefixed_hex(&value)))
+        .map(Some)
+        .map_err(pg_decode_err)
+}
+
+fn decode_postgres_text(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if !matches!(ty, "VARCHAR" | "TEXT" | "BPCHAR" | "NAME" | "UNKNOWN") {
+        return Ok(None);
+    }
+
+    row.try_get::<String, _>(idx)
+        .map(|value| chars_field(name.to_string(), value))
+        .map(Some)
+        .map_err(pg_decode_err)
+}
+
+fn decode_postgres_temporal(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    let field = match ty {
+        "TIMESTAMP" => row
+            .try_get::<NaiveDateTime, _>(idx)
+            .map(|value| display_chars_field(name.to_string(), value))
+            .map_err(pg_decode_err)?,
+        "TIMESTAMPTZ" => row
+            .try_get::<DateTime<Utc>, _>(idx)
+            .map(|value| chars_field(name.to_string(), value.to_rfc3339()))
+            .map_err(pg_decode_err)?,
+        "DATE" => row
+            .try_get::<NaiveDate, _>(idx)
+            .map(|value| display_chars_field(name.to_string(), value))
+            .map_err(pg_decode_err)?,
+        "TIME" => row
+            .try_get::<NaiveTime, _>(idx)
+            .map(|value| display_chars_field(name.to_string(), value))
+            .map_err(pg_decode_err)?,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(field))
+}
+
+fn decode_postgres_json(
+    row: &PgRow,
+    idx: usize,
+    name: &str,
+    ty: &str,
+) -> KnowledgeResult<Option<DataField>> {
+    if !matches!(ty, "JSON" | "JSONB") {
+        return Ok(None);
+    }
+
+    row.try_get::<serde_json::Value, _>(idx)
+        .map(|value| display_chars_field(name.to_string(), value))
+        .map(Some)
+        .map_err(pg_decode_err)
 }
 
 fn pg_decode_err(err: sqlx::Error) -> wp_error::KnowledgeError {
@@ -692,7 +880,10 @@ fn pg_decode_err(err: sqlx::Error) -> wp_error::KnowledgeError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::field_format::bytes_to_hex;
     use wp_model_core::model::DataField;
 
     #[test]
@@ -728,5 +919,25 @@ WHERE id = :id
             "SELECT * FROM demo WHERE left_id=$1 OR right_id=$1"
         );
         assert_eq!(ordered.len(), 1);
+    }
+
+    #[test]
+    fn bytes_to_hex_formats_lowercase_hex() {
+        assert_eq!(bytes_to_hex(&[0x00, 0xff, 0x10, 0xaa]), "00ff10aa");
+    }
+
+    #[test]
+    fn postgres_pool_config_clamps_min_connections_and_handles_zero_timeouts() {
+        let pool = PostgresPoolConfig::default()
+            .with_pool_size(Some(4))
+            .with_min_connections(Some(8))
+            .with_idle_timeout_ms(Some(0))
+            .with_max_lifetime_ms(Some(0))
+            .with_acquire_timeout_ms(Some(2500));
+        assert_eq!(pool.pool_size(), 4);
+        assert_eq!(pool.min_connections(), 4);
+        assert_eq!(pool.acquire_timeout(), Duration::from_millis(2500));
+        assert_eq!(pool.idle_timeout(), None);
+        assert_eq!(pool.max_lifetime(), None);
     }
 }

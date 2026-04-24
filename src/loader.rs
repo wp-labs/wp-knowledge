@@ -65,6 +65,14 @@ pub struct ProviderSpec {
     pub connection_uri: String,
     #[serde(default)]
     pub pool_size: Option<u32>,
+    #[serde(default)]
+    pub min_connections: Option<u32>,
+    #[serde(default)]
+    pub acquire_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub max_lifetime_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -469,6 +477,10 @@ version = 2
 [provider]
 kind = "postgres"
 connection_uri = "postgres://demo:demo@127.0.0.1/demo"
+min_connections = 2
+acquire_timeout_ms = 1500
+idle_timeout_ms = 30000
+max_lifetime_ms = 60000
 "#,
             &dict,
         )
@@ -481,6 +493,10 @@ connection_uri = "postgres://demo:demo@127.0.0.1/demo"
             provider.connection_uri,
             "postgres://demo:demo@127.0.0.1/demo"
         );
+        assert_eq!(provider.min_connections, Some(2));
+        assert_eq!(provider.acquire_timeout_ms, Some(1500));
+        assert_eq!(provider.idle_timeout_ms, Some(30000));
+        assert_eq!(provider.max_lifetime_ms, Some(60000));
     }
 
     #[test]
@@ -494,6 +510,10 @@ version = 2
 kind = "mysql"
 connection_uri = "mysql://demo:demo@127.0.0.1:3306/demo"
 pool_size = 12
+min_connections = 3
+acquire_timeout_ms = 2500
+idle_timeout_ms = 45000
+max_lifetime_ms = 120000
 "#,
             &dict,
         )
@@ -506,6 +526,10 @@ pool_size = 12
             "mysql://demo:demo@127.0.0.1:3306/demo"
         );
         assert_eq!(provider.pool_size, Some(12));
+        assert_eq!(provider.min_connections, Some(3));
+        assert_eq!(provider.acquire_timeout_ms, Some(2500));
+        assert_eq!(provider.idle_timeout_ms, Some(45000));
+        assert_eq!(provider.max_lifetime_ms, Some(120000));
     }
 
     #[test]

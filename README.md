@@ -187,10 +187,19 @@ docker compose -f tests/docker-compose.yml down -v
 也可以直接执行仓库脚本：
 
 ```bash
+bash tests/test-postgres-provider-correctness.sh
+bash tests/test-postgres-provider-perf.sh
+```
+
+如果你想沿用旧入口，也可以执行：
+
+```bash
 bash tests/test-postgres-provider.sh
 ```
 
-默认会在测试结束后执行 `docker compose down -v`；如果你想保留数据库容器和数据卷，执行 `KEEP_DB=1 bash tests/test-postgres-provider.sh`。如果要覆盖默认连接串，执行 `TEST_URL='postgres://user:pass@127.0.0.1:5432/db' bash tests/test-postgres-provider.sh`。
+默认会在测试结束后执行 `docker compose down -v`；如果你想保留数据库容器和数据卷，执行 `KEEP_DB=1 bash tests/test-postgres-provider-correctness.sh` 或 `KEEP_DB=1 bash tests/test-postgres-provider-perf.sh`。如果要覆盖默认连接串，执行 `TEST_URL='postgres://user:pass@127.0.0.1:5432/db' bash tests/test-postgres-provider-correctness.sh`。
+
+如果你想并行运行多个 provider 脚本，可以分别覆盖不同的 `COMPOSE_PROJECT_NAME`。
 
 依赖本机或外部现成 MySQL 的手工测试：
 
@@ -204,10 +213,19 @@ cargo test --test mysql_provider -- --ignored --nocapture
 如果你想用仓库内置的 MySQL 容器，也可以直接执行：
 
 ```bash
+bash tests/test-mysql-provider-correctness.sh
+bash tests/test-mysql-provider-perf.sh
+```
+
+如果你想沿用旧入口，也可以执行：
+
+```bash
 bash tests/test-mysql-provider.sh
 ```
 
-默认会在测试结束后执行 `docker compose down -v`；如果你想保留数据库容器和数据卷，执行 `KEEP_DB=1 bash tests/test-mysql-provider.sh`。如果要覆盖默认连接串，执行 `TEST_URL='mysql://user:pass@127.0.0.1:3306/db' bash tests/test-mysql-provider.sh`。
+默认会在测试结束后执行 `docker compose down -v`；如果你想保留数据库容器和数据卷，执行 `KEEP_DB=1 bash tests/test-mysql-provider-correctness.sh` 或 `KEEP_DB=1 bash tests/test-mysql-provider-perf.sh`。如果要覆盖默认连接串，执行 `TEST_URL='mysql://user:pass@127.0.0.1:3306/db' bash tests/test-mysql-provider-correctness.sh`。
+
+如果你想并行运行多个 provider 脚本，可以分别覆盖不同的 `COMPOSE_PROJECT_NAME`。
 
 自包含的 `testcontainers` 测试：
 
