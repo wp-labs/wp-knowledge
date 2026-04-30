@@ -5,11 +5,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::error::{KnowledgeResult, Reason};
 use async_trait::async_trait;
 use lru::LruCache;
-use orion_error::{ToStructError, UvsFrom};
+use orion_error::UvsFrom;
+use orion_error::conversion::ToStructError;
 use tokio::task;
-use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_log::{debug_kdb, warn_kdb};
 use wp_model_core::model::{DataField, DataType, Value};
 
@@ -702,7 +703,7 @@ impl KnowledgeRuntime {
             return task::spawn_blocking(move || runtime().execute_with_handle(&handle, &req))
                 .await
                 .map_err(|err| {
-                    KnowledgeReason::from_logic()
+                    Reason::from_logic()
                         .to_err()
                         .with_detail(format!("knowledge async sqlite query join failed: {err}"))
                 })?;
@@ -814,7 +815,7 @@ impl KnowledgeRuntime {
             })
             .await
             .map_err(|err| {
-                KnowledgeReason::from_logic().to_err().with_detail(format!(
+                Reason::from_logic().to_err().with_detail(format!(
                     "knowledge async sqlite first-row query join failed: {err}"
                 ))
             })?;
@@ -897,7 +898,7 @@ impl KnowledgeRuntime {
             .expect("runtime provider lock poisoned")
             .clone()
             .ok_or_else(|| {
-                KnowledgeReason::from_logic()
+                Reason::from_logic()
                     .to_err()
                     .with_detail("knowledge provider not initialized")
             })

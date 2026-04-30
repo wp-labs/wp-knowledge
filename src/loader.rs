@@ -6,11 +6,14 @@ use orion_conf::EnvTomlLoad;
 use serde::Deserialize;
 use wp_log::info_ctrl;
 
+use crate::error::{KnowledgeResult, Reason};
 use crate::mem::memdb::MemDB;
-use orion_error::{ContextRecord, ErrorOwe, OperationContext, ToStructError, UvsFrom};
+use orion_error::compat_traits::ErrorOweBase;
+use orion_error::conversion::ToStructError;
+use orion_error::runtime::ContextRecord;
+use orion_error::{OperationContext, UvsFrom};
 use orion_variate::EnvDict;
 use rusqlite::OpenFlags;
-use wp_error::{KnowledgeReason, KnowledgeResult};
 
 /// V2 KnowDB 配置：目录式 + 外置 SQL。仅支持单一数据文件：`<table_dir>/data.csv`，
 /// 或通过 `tables[n].data_file` 相对 `<table_dir>` 指定。
@@ -179,9 +182,9 @@ const fn default_result_cache_ttl_ms() -> u64 {
 
 /// 读取文本文件，返回字符串
 fn read_to_string(path: &Path) -> KnowledgeResult<String> {
-    let mut f = fs::File::open(path).owe_res()?;
+    let mut f = fs::File::open(path).owe(Reason::from_res())?;
     let mut buf = String::new();
-    f.read_to_string(&mut buf).owe_res()?;
+    f.read_to_string(&mut buf).owe(Reason::from_res())?;
     Ok(buf)
 }
 
@@ -204,7 +207,7 @@ pub fn build_authority_from_knowdb(
     authority_uri: &str,
     dict: &EnvDict,
 ) -> KnowledgeResult<Vec<String>> {
-    let mut opx = OperationContext::want("build authority from knowdb").with_auto_log();
+    let mut opx = OperationContext::doing("build authority from knowdb").with_auto_log();
     // 1) 解析配置与 base_dir
     let (conf, conf_abs, base_dir) = parse_knowdb_conf(root, conf_path, dict)?;
     opx.record("conf", &conf_abs);
@@ -236,10 +239,10 @@ pub fn parse_knowdb_conf(
         root.join(conf_path)
     };
     let conf_txt = read_to_string(&conf_abs)?;
-    let conf: KnowDbConf =
-        <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(&conf_txt, dict).owe_conf()?;
+    let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(&conf_txt, dict)
+        .owe(Reason::from_conf())?;
     if conf.version != 2 {
-        return Err(KnowledgeReason::from_conf()
+        return Err(Reason::from_conf()
             .to_err()
             .with_detail("unsupported knowdb.version"));
     }
@@ -282,7 +285,7 @@ fn load_one_table(
     load: &OptLoadSpec,
 ) -> KnowledgeResult<()> {
     // 目录与必须文件
-    let mut opx = OperationContext::want("load table to kdb")
+    let mut opx = OperationContext::doing("load table to kdb")
         .with_auto_log()
         .with_mod_path("ctrl");
     let dir_name: &str = t.dir.as_deref().unwrap_or(&t.name);
@@ -305,7 +308,7 @@ fn load_one_table(
         conn.execute_batch(&clean_sql)?;
         Ok::<(), anyhow::Error>(())
     })
-    .owe_res()?;
+    .owe(Reason::from_res())?;
 
     // 数据源
     let data_path = match &t.data_file {
@@ -313,7 +316,7 @@ fn load_one_table(
         None => table_dir.join("data.csv"),
     };
     if !data_path.exists() {
-        return Err(KnowledgeReason::from_conf()
+        return Err(Reason::from_conf()
             .to_err()
             .with_detail("data.csv not found"));
     }
@@ -324,12 +327,12 @@ fn load_one_table(
 
     // 列映射
     let col_indices: Vec<usize> = if !t.columns.by_header.is_empty() {
-        let headers = rdr.headers().owe_res()?;
+        let headers = rdr.headers().owe(Reason::from_res())?;
         select_indices_by_header(headers, &t.columns.by_header)?
     } else if !t.columns.by_index.is_empty() {
         t.columns.by_index.clone()
     } else {
-        return Err(KnowledgeReason::from_conf()
+        return Err(Reason::from_conf()
             .to_err()
             .with_detail("columns mapping required"));
     };
@@ -379,15 +382,13 @@ fn load_one_table(
         }
         Ok::<(), anyhow::Error>(())
     })
-    .owe_res()?;
+    .owe(Reason::from_res())?;
 
     // 行数校验
     if let Some(min) = t.expected_rows.min
         && inserted < min
     {
-        return Err(KnowledgeReason::from_conf()
-            .to_err()
-            .with_detail("table data less"));
+        return Err(Reason::from_conf().to_err().with_detail("table data less"));
     }
     if let Some(max) = t.expected_rows.max
         && inserted > max
@@ -411,7 +412,7 @@ fn build_csv_reader(
     data_path: &Path,
 ) -> KnowledgeResult<csv::Reader<std::fs::File>> {
     if csvd.encoding.to_lowercase() != "utf-8" {
-        return Err(KnowledgeReason::from_conf()
+        return Err(Reason::from_conf()
             .to_err()
             .with_detail("only utf-8 csv is supported"));
     }
@@ -423,7 +424,7 @@ fn build_csv_reader(
     if csvd.trim {
         rdr_b.trim(csv::Trim::All);
     }
-    rdr_b.from_path(data_path).owe_res()
+    rdr_b.from_path(data_path).owe(Reason::from_res())
 }
 
 fn select_indices_by_header(
@@ -432,11 +433,10 @@ fn select_indices_by_header(
 ) -> KnowledgeResult<Vec<usize>> {
     let mut out = Vec::with_capacity(wanted.len());
     for name in wanted {
-        let pos = headers.iter().position(|h| h == name).ok_or_else(|| {
-            KnowledgeReason::from_conf()
-                .to_err()
-                .with_detail("header not found")
-        })?;
+        let pos = headers
+            .iter()
+            .position(|h| h == name)
+            .ok_or_else(|| Reason::from_conf().to_err().with_detail("header not found"))?;
         out.push(pos);
     }
     Ok(out)

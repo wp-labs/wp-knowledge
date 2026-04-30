@@ -6,10 +6,10 @@ use std::{
     hash::{Hash, Hasher},
 };
 
+use crate::error::KnowledgeResult;
 use async_trait::async_trait;
 use rusqlite::ToSql;
 use rusqlite::{Connection, OpenFlags};
-use wp_error::KnowledgeResult;
 use wp_log::{info_ctrl, warn_kdb};
 use wp_model_core::model::DataField;
 
@@ -585,6 +585,7 @@ fn stable_hash(value: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::cache::FieldQueryCache;
+    use crate::error::Reason;
     use crate::mem::memdb::MemDB;
     use crate::mem::query_util::{COLNAME_CACHE, metadata_cache_key_for_scope};
     use crate::runtime::fields_to_params;
@@ -592,14 +593,14 @@ mod tests {
         CacheLayer, CacheTelemetryEvent, KnowledgeTelemetry, QueryTelemetryEvent,
         ReloadTelemetryEvent, reset_telemetry,
     };
-    use orion_error::{ToStructError, UvsFrom};
+    use orion_error::UvsFrom;
+    use orion_error::conversion::ToStructError;
     use orion_variate::EnvDict;
     use std::fs;
     use std::hint::black_box;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
-    use wp_error::KnowledgeReason;
 
     #[derive(Default)]
     struct TestTelemetry {
@@ -1237,7 +1238,7 @@ connection_uri = "{connection_uri}"
             ProviderKind::SqliteAuthority,
             datasource_id_for(ProviderKind::SqliteAuthority, "reload-failure"),
             |_generation| {
-                Err(KnowledgeReason::from_logic()
+                Err(Reason::from_logic()
                     .to_err()
                     .with_detail("expected reload failure"))
             },
@@ -1324,7 +1325,7 @@ connection_uri = "{connection_uri}"
             ProviderKind::SqliteAuthority,
             datasource_id_for(ProviderKind::SqliteAuthority, "telemetry-failure"),
             |_generation| {
-                Err(KnowledgeReason::from_logic()
+                Err(Reason::from_logic()
                     .to_err()
                     .with_detail("expected telemetry reload failure"))
             },

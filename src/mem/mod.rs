@@ -6,16 +6,14 @@ pub mod thread_clone;
 
 use std::fmt::Display;
 
+use crate::error::KnowledgeResult;
 use crate::mem::memdb::MDBEnum;
 use crate::mem::memdb::MemDB;
 use crate::mem::stub::StubMDB;
 use enum_dispatch::enum_dispatch;
 use rusqlite::Params;
 use rusqlite::ToSql;
-use wp_error::KnowledgeResult;
 use wp_model_core::model::DataField;
-
-pub type AnyResult<T> = anyhow::Result<T>;
 
 pub type RowData = Vec<DataField>;
 

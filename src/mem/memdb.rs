@@ -1,14 +1,15 @@
 use crate::DBQuery;
 use crate::cache::CacheAble;
+use crate::error::{KnowledgeResult, Reason};
 use crate::mem::RowData;
 use crate::mem::stub::StubMDB;
 use csv::Reader;
 use enum_dispatch::enum_dispatch;
 use lazy_static::lazy_static;
-use orion_error::ErrorOwe;
 use orion_error::ErrorWith;
-use orion_error::ToStructError;
 use orion_error::UvsFrom;
+use orion_error::compat_traits::ErrorOweBase;
+use orion_error::conversion::ToStructError;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use rusqlite::Params;
@@ -16,15 +17,12 @@ use rusqlite::ToSql;
 use rusqlite::types::ToSqlOutput;
 use rusqlite::types::Value;
 use std::path::PathBuf;
-use wp_error::KnowledgeReason;
-use wp_error::KnowledgeResult;
 use wp_log::debug_kdb;
 use wp_log::info_kdb;
 use wp_log::warn_kdb;
 use wp_model_core::model;
 use wp_model_core::model::DataField;
 
-use super::AnyResult;
 use super::SqlNamedParam;
 use crate::loader::ProviderKind;
 use crate::runtime::MetadataCacheScope;
@@ -61,7 +59,7 @@ impl MDBEnum {
     pub fn global() -> Self {
         MDBEnum::Use(MemDB::global())
     }
-    pub fn load_test() -> AnyResult<()> {
+    pub fn load_test() -> KnowledgeResult<()> {
         MemDB::load_test()?;
         Ok(())
     }
@@ -103,13 +101,21 @@ impl ToSql for SqlNamedParam {
 
 impl DBQuery for MemDB {
     fn query(&self, sql: &str) -> KnowledgeResult<Vec<RowData>> {
-        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let conn = self
+            .conn
+            .get()
+            .owe(Reason::from_res())
+            .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_cached(&conn, sql, [])
     }
 
     fn query_row(&self, sql: &str) -> KnowledgeResult<RowData> {
-        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let conn = self
+            .conn
+            .get()
+            .owe(Reason::from_res())
+            .doing("get memdb connect")?;
         // Ensure SQLite UDFs are available on this connection (ip4_int/cidr4_* etc.)
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_first_row_cached(&conn, sql, [])
@@ -117,7 +123,7 @@ impl DBQuery for MemDB {
 
     fn query_row_params<P: Params>(&self, sql: &str, params: P) -> KnowledgeResult<RowData> {
         debug_kdb!("[memdb] query_row_params: {}", sql);
-        let conn = self.conn.get().owe_res()?;
+        let conn = self.conn.get().owe(Reason::from_res())?;
         // Ensure SQLite UDFs are available on this connection
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_first_row_cached(&conn, sql, params)
@@ -140,7 +146,11 @@ impl MemDB {
         scope: &MetadataCacheScope,
         sql: &str,
     ) -> KnowledgeResult<Vec<RowData>> {
-        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let conn = self
+            .conn
+            .get()
+            .owe(Reason::from_res())
+            .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_cached_with_scope(
             &conn,
@@ -156,7 +166,11 @@ impl MemDB {
         scope: &MetadataCacheScope,
         sql: &str,
     ) -> KnowledgeResult<RowData> {
-        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let conn = self
+            .conn
+            .get()
+            .owe(Reason::from_res())
+            .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_first_row_cached_with_scope(
             &conn,
@@ -173,7 +187,11 @@ impl MemDB {
         sql: &str,
         params: &[DataField],
     ) -> KnowledgeResult<Vec<RowData>> {
-        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let conn = self
+            .conn
+            .get()
+            .owe(Reason::from_res())
+            .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         let named_params = params
             .iter()
@@ -204,7 +222,11 @@ impl MemDB {
     }
 
     pub fn query_fields(&self, sql: &str, params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
-        let conn = self.conn.get().owe_res().want("get memdb connect")?;
+        let conn = self
+            .conn
+            .get()
+            .owe(Reason::from_res())
+            .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         let named_params = params
             .iter()
@@ -234,7 +256,7 @@ impl MemDB {
     }
     /// Experimental: shared in-memory SQLite via URI with a pool size > 1.
     /// Requires SQLite compiled with shared-cache support.
-    pub fn shared_pool(max_size: u32) -> AnyResult<Self> {
+    pub fn shared_pool(max_size: u32) -> KnowledgeResult<Self> {
         // Shared in-memory URI. Every connection to this URI shares same DB.
         // Note: this depends on platform SQLite features.
         let uri = "file:wp_knowledge_shm?mode=memory&cache=shared";
@@ -243,7 +265,10 @@ impl MemDB {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_URI,
         );
-        let pool = r2d2::Pool::builder().max_size(max_size).build(manager)?;
+        let pool = r2d2::Pool::builder()
+            .max_size(max_size)
+            .build(manager)
+            .owe(Reason::from_res())?;
         Ok(Self { conn: pool })
     }
 
@@ -257,38 +282,38 @@ impl MemDB {
         let pool = r2d2::Pool::builder()
             .max_size(max_size)
             .build(manager)
-            .owe_res()?;
+            .owe(Reason::from_res())?;
         Ok(Self { conn: pool })
     }
     // V1 init_load_by_conf removed: use loader::build_authority_from_knowdb for V2
 
     /// Execute a closure with a checked-out SQLite connection from the pool.
     /// Useful for one-time prepared statements or specialized operations.
-    pub fn with_conn<T, F: FnOnce(&rusqlite::Connection) -> AnyResult<T>>(
+    pub fn with_conn<T, F: FnOnce(&rusqlite::Connection) -> anyhow::Result<T>>(
         &self,
         f: F,
-    ) -> AnyResult<T> {
+    ) -> anyhow::Result<T> {
         let pooled = self.conn.get()?;
         let conn_ref: &rusqlite::Connection = &pooled;
         f(conn_ref)
     }
 
-    pub fn table_create(&self, sql: &str) -> anyhow::Result<()> {
-        let conn = self.conn.get()?;
-        conn.execute(sql, ())?;
+    pub fn table_create(&self, sql: &str) -> KnowledgeResult<()> {
+        let conn = self.conn.get().owe(Reason::from_res())?;
+        conn.execute(sql, ()).owe(Reason::from_rule())?;
         debug_kdb!("crate table: {} ", sql);
         Ok(())
     }
-    pub fn execute(&self, sql: &str) -> anyhow::Result<()> {
-        let conn = self.conn.get()?;
-        conn.execute(sql, ())?;
+    pub fn execute(&self, sql: &str) -> KnowledgeResult<()> {
+        let conn = self.conn.get().owe(Reason::from_res())?;
+        conn.execute(sql, ()).owe(Reason::from_rule())?;
         debug_kdb!("execute: {} ", sql);
         Ok(())
     }
 
-    pub fn table_clean(&self, sql: &str) -> anyhow::Result<()> {
-        let conn = self.conn.get()?;
-        conn.execute(sql, ())?;
+    pub fn table_clean(&self, sql: &str) -> KnowledgeResult<()> {
+        let conn = self.conn.get().owe(Reason::from_res())?;
+        conn.execute(sql, ()).owe(Reason::from_rule())?;
         debug_kdb!("clean table: {} ", sql);
         Ok(())
     }
@@ -299,47 +324,55 @@ impl MemDB {
         csv_path: PathBuf,
         cols: Vec<usize>,
         max: usize,
-    ) -> AnyResult<usize> {
+    ) -> KnowledgeResult<usize> {
         info_kdb!("load table data in {}", csv_path.display());
         if !csv_path.exists() {
             warn_kdb!("{} not find, load knowdb failed", csv_path.display());
             return Ok(0);
         }
-        let mut rdr = Reader::from_path(&csv_path)?;
-        let conn = self.conn.get()?;
+        let mut rdr = Reader::from_path(&csv_path).owe(Reason::from_res())?;
+        let conn = self.conn.get().owe(Reason::from_res())?;
         let mut load_cnt: usize = 0;
         // Prepare once outside loop for performance
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(sql).owe(Reason::from_rule())?;
         for (idx, result) in rdr.records().enumerate() {
             if load_cnt >= max {
                 break;
             }
             let record = result.map_err(|e| {
-                anyhow::anyhow!("read csv record failed at line {}: {}", idx + 1, e)
+                Reason::from_rule().to_err().with_detail(format!(
+                    "read csv record failed at line {}: {}",
+                    idx + 1,
+                    e
+                ))
             })?;
 
             // Basic bounds check to avoid panic on bad column indices
             if let Some(max_col) = cols.iter().max()
                 && *max_col >= record.len()
             {
-                return Err(anyhow::anyhow!(
+                return Err(Reason::from_rule().to_err().with_detail(format!(
                     "csv has insufficient columns at line {}: need index {}, got {} columns",
                     idx + 1,
                     *max_col,
                     record.len()
-                ));
+                )));
             }
 
             // Unified dynamic binding (strict): any missing column is an error
             let mut vec: Vec<&str> = Vec::with_capacity(cols.len());
             for &ci in &cols {
-                let v = record
-                    .get(ci)
-                    .ok_or_else(|| anyhow::anyhow!("line {} col {} missing", idx + 1, ci))?;
+                let v = record.get(ci).ok_or_else(|| {
+                    Reason::from_rule().to_err().with_detail(format!(
+                        "line {} col {} missing",
+                        idx + 1,
+                        ci
+                    ))
+                })?;
                 vec.push(v);
             }
             let params = rusqlite::params_from_iter(vec);
-            stmt.execute(params)?;
+            stmt.execute(params).owe(Reason::from_rule())?;
             load_cnt += 1;
         }
         info_kdb!("from {} load data cnt: {}", csv_path.display(), load_cnt);
@@ -347,19 +380,19 @@ impl MemDB {
     }
 
     pub fn check_data(&self, table: &str, scope: (usize, usize)) -> KnowledgeResult<usize> {
-        let conn = self.conn.get().owe_res()?;
+        let conn = self.conn.get().owe(Reason::from_res())?;
         let count_sql = format!("select count(*) from {}", table);
         let count: usize = conn
             .query_row(count_sql.as_str(), (), |row| row.get(0))
-            .owe_rule()?;
+            .owe(Reason::from_rule())?;
         if count >= scope.0 {
             Ok(count)
         } else {
-            Err(KnowledgeReason::from_conf()
+            Err(Reason::from_conf()
                 .to_err()
                 .with_detail("table data less")
-                .with(("table", table))
-                .with(("count", count.to_string())))
+                .with_context(("table", table))
+                .with_context(("count", count.to_string())))
 
             /*
             Err(anyhow!(
@@ -376,7 +409,7 @@ impl MemDB {
             conn: MEM_SQLITE_INS.clone(),
         }
     }
-    pub fn load_test() -> AnyResult<Self> {
+    pub fn load_test() -> KnowledgeResult<Self> {
         let db = Self::global();
         debug_kdb!("[memdb] load_test invoked");
         db.table_create(EXAMPLE_CREATE_SQL)?;
@@ -406,16 +439,19 @@ mod tests {
 
     use super::*;
     // V1 TableConf removed
+    use crate::error::{KnowledgeResult, Reason};
     use crate::mem::ToSqlParams;
-    use anyhow::Context;
+
     use orion_conf::EnvTomlLoad;
+    use orion_error::UvsFrom;
+    use orion_error::compat_traits::ErrorOweBase;
     use orion_variate::EnvDict;
     use serde::Serialize;
     use std::fs;
     use wp_data_fmt::{Csv, RecordFormatter};
 
     #[test]
-    fn test_load() -> AnyResult<()> {
+    fn test_load() -> KnowledgeResult<()> {
         let db = MemDB::instance();
         db.table_create(EXAMPLE_CREATE_SQL)?;
         let loaded = db.table_load(
@@ -434,7 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn test_csv_off_by_one() -> AnyResult<()> {
+    fn test_csv_off_by_one() -> KnowledgeResult<()> {
         let db = MemDB::instance();
         db.table_create(EXAMPLE_CREATE_SQL)?;
         // Expect only 1 row loaded when max=1 (no off-by-one)
@@ -449,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_null_mapping() -> AnyResult<()> {
+    fn test_row_null_mapping() -> KnowledgeResult<()> {
         let db = MemDB::instance();
         db.execute("CREATE TABLE tnull (v TEXT)")?;
         db.execute("INSERT INTO tnull (v) VALUES (NULL)")?;
@@ -462,7 +498,7 @@ mod tests {
     }
 
     #[test]
-    fn test_row_blob_mapping() -> AnyResult<()> {
+    fn test_row_blob_mapping() -> KnowledgeResult<()> {
         let db = MemDB::instance();
         db.execute("CREATE TABLE tblob (b BLOB)")?;
         // Insert ASCII 'ABC' as blob
@@ -476,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn test_csv_missing_column_error() -> AnyResult<()> {
+    fn test_csv_missing_column_error() -> KnowledgeResult<()> {
         use std::fs;
         use std::io::Write;
         let db = MemDB::instance();
@@ -485,9 +521,9 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push("wp_knowledge_csv_missing_col.csv");
         {
-            let mut f = fs::File::create(&path)?;
-            writeln!(f, "name")?;
-            writeln!(f, "only_one_col")?;
+            let mut f = fs::File::create(&path).owe(Reason::from_res())?;
+            writeln!(f, "name").owe(Reason::from_res())?;
+            writeln!(f, "only_one_col").owe(Reason::from_res())?;
         }
         let res = db.table_load(
             EXAMPLE_INSERT_SQL,
@@ -505,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn test_global_persistence_across_handles() -> AnyResult<()> {
+    fn test_global_persistence_across_handles() -> KnowledgeResult<()> {
         // Create table via one global handle
         {
             let db1 = MemDB::global();
@@ -523,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    fn test_init_by_conf() -> AnyResult<()> {
+    fn test_init_by_conf() -> KnowledgeResult<()> {
         let db = MemDB::global();
         db.table_create(EXAMPLE_CREATE_SQL)?;
         let _ = db.table_clean(EXAMPLE_CLEAN_SQL);
@@ -539,7 +575,7 @@ mod tests {
     // V1 conf serde test removed
 
     #[test]
-    fn test_alter_level() -> anyhow::Result<()> {
+    fn test_alter_level() -> KnowledgeResult<()> {
         let db = MemDB::global();
         // ensure clean state across global in-memory handle
         let _ = db.execute("DROP TABLE IF EXISTS alert_cat_level");
@@ -584,7 +620,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tosql_bind_various_types() -> AnyResult<()> {
+    fn test_tosql_bind_various_types() -> KnowledgeResult<()> {
         use chrono::NaiveDate;
         use std::net::{IpAddr, Ipv4Addr};
         use wp_model_core::model::types::value::ObjectValue;
@@ -667,7 +703,7 @@ mod tests {
     }
 
     #[test]
-    fn test_column_alias_names() -> AnyResult<()> {
+    fn test_column_alias_names() -> KnowledgeResult<()> {
         let db = MemDB::instance();
         // Create a simple one-shot table/view using alias
         db.execute("CREATE TABLE ctest (a INTEGER, b TEXT)")?;
@@ -680,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_concurrent_inserts() -> AnyResult<()> {
+    fn test_concurrent_inserts() -> KnowledgeResult<()> {
         use std::thread;
         let db = MemDB::global();
         db.execute("CREATE TABLE IF NOT EXISTS concur (v INTEGER)")?;
@@ -704,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn test_query_returns_all_rows() -> AnyResult<()> {
+    fn test_query_returns_all_rows() -> KnowledgeResult<()> {
         let db = MemDB::instance();
         db.execute("CREATE TABLE multi (id INTEGER, name TEXT)")?;
         let rows = db.query("SELECT * FROM multi")?;
@@ -720,23 +756,25 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    fn load_toml_conf<T: serde::de::DeserializeOwned>(path: &str) -> AnyResult<T> {
-        let mut f = File::open(path).with_context(|| format!("conf file not found: {}", path))?;
+    fn load_toml_conf<T: serde::de::DeserializeOwned>(path: &str) -> KnowledgeResult<T> {
+        let mut f = File::open(path)
+            .owe(Reason::from_res())
+            .doing(format!("conf file not found: {}", path))?;
         let mut buffer = Vec::with_capacity(10240);
-        f.read_to_end(&mut buffer).expect("read conf file error");
-        let conf_data = String::from_utf8(buffer)?;
+        f.read_to_end(&mut buffer).owe(Reason::from_res())?;
+        let conf_data = String::from_utf8(buffer).owe(Reason::from_rule())?;
         let dict = EnvDict::new();
-        let conf: T = T::env_parse_toml(conf_data.as_str(), &dict)?;
+        let conf: T = T::env_parse_toml(conf_data.as_str(), &dict).owe(Reason::from_conf())?;
         Ok(conf)
     }
 
     #[allow(dead_code)]
-    fn export_toml_local<T: Serialize>(val: &T, path: &str) -> AnyResult<()> {
-        let data = toml::to_string_pretty(val)?;
+    fn export_toml_local<T: Serialize>(val: &T, path: &str) -> KnowledgeResult<()> {
+        let data = toml::to_string_pretty(val).owe(Reason::from_rule())?;
         if let Some(parent) = std::path::Path::new(path).parent() {
-            fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent).owe(Reason::from_res())?;
         }
-        fs::write(path, data)?;
+        fs::write(path, data).owe(Reason::from_res())?;
         Ok(())
     }
 }

@@ -1,5 +1,5 @@
 use crate::cache::CacheAble;
-use wp_error::KnowledgeResult;
+use crate::error::KnowledgeResult;
 use wp_log::warn_kdb;
 use wp_model_core::model::DataField;
 

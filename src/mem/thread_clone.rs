@@ -2,12 +2,14 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use crate::DBQuery;
+use crate::error::{KnowledgeResult, Reason};
 use crate::mem::RowData;
-use orion_error::{ErrorOwe, ErrorWith};
+use orion_error::ErrorWith;
+use orion_error::UvsFrom;
+use orion_error::compat_traits::ErrorOweBase;
 use rusqlite::ToSql;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, Params};
-use wp_error::KnowledgeResult;
 use wp_log::debug_kdb;
 use wp_model_core::model::DataField;
 
@@ -92,15 +94,19 @@ impl ThreadClonedMDB {
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_URI,
                 )
-                .owe_res()
-                .want("connect db")?;
-                let mut dst = Connection::open_in_memory().owe_res().want("oepn conn")?;
+                .owe(Reason::from_res())
+                .doing("connect db")?;
+                let mut dst = Connection::open_in_memory()
+                    .owe(Reason::from_res())
+                    .doing("oepn conn")?;
                 {
-                    let bk = Backup::new(&src, &mut dst).owe_conf().want("backup")?;
+                    let bk = Backup::new(&src, &mut dst)
+                        .owe(Reason::from_conf())
+                        .doing("backup")?;
                     // Copy all pages with small sleep to yield
                     bk.run_to_completion(50, Duration::from_millis(0), None)
-                        .owe_res()
-                        .want("backup run")?;
+                        .owe(Reason::from_res())
+                        .doing("backup run")?;
                 }
                 // 为查询连接注册内置 UDF（只读场景也可用在 SQL/OML 查询中）
                 let _ = crate::sqlite_ext::register_builtin(&dst);

@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::future::Future;
 
+use crate::error::{KnowledgeResult, Reason};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use orion_error::{ToStructError, UvsFrom};
+use orion_error::UvsFrom;
+use orion_error::conversion::ToStructError;
 use sqlx::postgres::{PgArguments, PgColumn, PgPoolOptions, PgRow, types::Oid};
 use sqlx::{Column, Executor, Pool, Postgres, Row, TypeInfo, ValueRef};
 use tokio::runtime::Runtime;
-use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
 
 use crate::field_format::{bytes_to_prefixed_hex, chars_field, display_chars_field};
@@ -98,12 +99,12 @@ impl PostgresProvider {
                         .connect(&connection_uri)
                         .await
                         .map_err(|err| {
-                            KnowledgeReason::from_conf()
+                            Reason::from_conf()
                                 .to_err()
                                 .with_detail(format!("create postgres pool failed: {err}"))
                         })?;
                     validate_startup(&pool).await?;
-                    Ok::<Pool<Postgres>, wp_error::KnowledgeError>(pool)
+                    Ok::<Pool<Postgres>, crate::error::KnowledgeError>(pool)
                 })?;
                 Ok(Self {
                     runtime: Some(runtime),
@@ -266,11 +267,11 @@ async fn postgres_col_names(
         cache_sql,
         || async {
             let describe = pool.describe(exec_sql).await.map_err(|err| {
-                KnowledgeReason::from_rule()
+                Reason::from_rule()
                     .to_err()
                     .with_detail(format!("postgres describe failed: {err}"))
             })?;
-            Ok::<Option<Vec<String>>, wp_error::KnowledgeError>(Some(
+            Ok::<Option<Vec<String>>, crate::error::KnowledgeError>(Some(
                 describe
                     .columns()
                     .iter()
@@ -299,7 +300,7 @@ async fn postgres_col_names_from_row_or_describe(
             metadata_scope,
             Some(ProviderKind::Postgres),
             cache_sql,
-            || async move { Ok::<Option<Vec<String>>, wp_error::KnowledgeError>(Some(names)) },
+            || async move { Ok::<Option<Vec<String>>, crate::error::KnowledgeError>(Some(names)) },
         )
         .await;
     }
@@ -316,7 +317,7 @@ async fn execute_query(
         .fetch_all(&pool)
         .await
         .map_err(|err| {
-            KnowledgeReason::from_rule()
+            Reason::from_rule()
                 .to_err()
                 .with_detail(format!("postgres query failed: {err}"))
         })?;
@@ -335,7 +336,7 @@ async fn execute_query_row(
         .fetch_optional(&pool)
         .await
         .map_err(|err| {
-            KnowledgeReason::from_rule()
+            Reason::from_rule()
                 .to_err()
                 .with_detail(format!("postgres query_row failed: {err}"))
         })?;
@@ -362,7 +363,7 @@ async fn execute_query_fields(
             bind_postgres_field(query, field)
         });
     let rows = query.fetch_all(&pool).await.map_err(|err| {
-        KnowledgeReason::from_rule()
+        Reason::from_rule()
             .to_err()
             .with_detail(format!("postgres query_fields failed: {err}"))
     })?;
@@ -390,7 +391,7 @@ async fn execute_query_named_fields(
             bind_postgres_field(query, field)
         });
     let row = query.fetch_optional(&pool).await.map_err(|err| {
-        KnowledgeReason::from_rule()
+        Reason::from_rule()
             .to_err()
             .with_detail(format!("postgres query_named_fields failed: {err}"))
     })?;
@@ -434,8 +435,8 @@ fn bind_postgres_field<'q>(
     }
 }
 
-fn validation_err(stage: &str, err: sqlx::Error) -> wp_error::KnowledgeError {
-    KnowledgeReason::from_conf().to_err().with_detail(format!(
+fn validation_err(stage: &str, err: sqlx::Error) -> crate::error::KnowledgeError {
+    Reason::from_conf().to_err().with_detail(format!(
         "postgres startup validation failed during {stage}: connection issue: {err}"
     ))
 }
@@ -570,7 +571,7 @@ fn rewrite_sql<'a>(
                 }
                 let raw_name = &sql[start..i];
                 let field = by_name.get(raw_name).ok_or_else(|| {
-                    KnowledgeReason::from_rule()
+                    Reason::from_rule()
                         .to_err()
                         .with_detail(format!("postgres query missing param: {raw_name}"))
                 })?;
@@ -872,8 +873,8 @@ fn decode_postgres_json(
         .map_err(pg_decode_err)
 }
 
-fn pg_decode_err(err: sqlx::Error) -> wp_error::KnowledgeError {
-    KnowledgeReason::from_rule()
+fn pg_decode_err(err: sqlx::Error) -> crate::error::KnowledgeError {
+    Reason::from_rule()
         .to_err()
         .with_detail(format!("postgres row decode failed: {err}"))
 }

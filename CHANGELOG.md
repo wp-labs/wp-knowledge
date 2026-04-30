@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0]
+
+### Changed
+- **Error handling**: Replace `wp_error::KnowledgeReason` with local `Reason` type using `#[derive(OrionError)]` pattern, providing stable error codes (`biz.not_data`, transparent `Uvs`) via `StructError<Reason>`.  
+  将 `wp_error::KnowledgeReason` 替换为本地 `Reason` 类型，使用 `#[derive(OrionError)]` 模式，通过 `StructError<Reason>` 提供稳定的错误码。
+- **Remove `AnyResult`**: Remove the `AnyResult` type alias; convert all production and test code from `anyhow::Result` to `KnowledgeResult` (`StructError`-based), keeping `with_conn` as the intentional anyhow bridge.  
+  删除 `AnyResult` 类型别名，将所有生产与测试代码从 `anyhow::Result` 改造为 `KnowledgeResult`（基于 `StructError`），保留 `with_conn` 作为有意的 anyhow 桥接层。
+- **orion-error 0.7 migration**: Upgrade orion-error 0.6 → 0.7; migrate error-building callsites to new API — `ErrorOweBase::owe()` replaces deprecated `ErrorOwe::owe_res/owe_conf/owe_rule`, `OperationContext::doing()` replaces `.want()`, `ToStructError` from `conversion::`, `ContextRecord` from `runtime::`.  
+  升级 orion-error 0.6 → 0.7，迁移错误构建调用点到新 API。
+
+### Removed
+- **`wp-error` dependency**: Remove `wp-error = "0.9"` dependency; add `derive_more = "2.0"` for `From` derive support on `Reason`.  
+  删除 `wp-error = "0.9"` 依赖，增加 `derive_more = "2.0"` 以支持 `Reason` 的 `From` derive。
+
 ## [0.11.6]
 
 ### Added

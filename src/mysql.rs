@@ -1,11 +1,12 @@
 use std::future::Future;
 
+use crate::error::{KnowledgeResult, Reason};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use orion_error::{ToStructError, UvsFrom};
+use orion_error::UvsFrom;
+use orion_error::conversion::ToStructError;
 use sqlx::mysql::{MySqlArguments, MySqlColumn, MySqlPoolOptions, MySqlRow};
 use sqlx::{Column, Executor, MySql, Pool, Row, TypeInfo, ValueRef};
 use tokio::runtime::Runtime;
-use wp_error::{KnowledgeReason, KnowledgeResult};
 use wp_model_core::model::{DataField, DataType, Value};
 
 use crate::field_format::{bytes_to_prefixed_hex, chars_field, display_chars_field};
@@ -97,12 +98,12 @@ impl MySqlProvider {
                         .connect(&connection_uri)
                         .await
                         .map_err(|err| {
-                            KnowledgeReason::from_conf()
+                            Reason::from_conf()
                                 .to_err()
                                 .with_detail(format!("create mysql pool failed: {err}"))
                         })?;
                     validate_startup(&pool).await?;
-                    Ok::<Pool<MySql>, wp_error::KnowledgeError>(pool)
+                    Ok::<Pool<MySql>, crate::error::KnowledgeError>(pool)
                 })?;
                 Ok(Self {
                     runtime: Some(runtime),
@@ -265,7 +266,7 @@ async fn mysql_col_names(
         cache_sql,
         || async {
             let describe = pool.describe(exec_sql).await.map_err(|err| {
-                KnowledgeReason::from_rule()
+                Reason::from_rule()
                     .to_err()
                     .with_detail(format!("mysql describe failed: {err}"))
             })?;
@@ -315,7 +316,7 @@ async fn execute_query(
         .fetch_all(&pool)
         .await
         .map_err(|err| {
-            KnowledgeReason::from_rule()
+            Reason::from_rule()
                 .to_err()
                 .with_detail(format!("mysql query failed: {err}"))
         })?;
@@ -334,7 +335,7 @@ async fn execute_query_row(
         .fetch_optional(&pool)
         .await
         .map_err(|err| {
-            KnowledgeReason::from_rule()
+            Reason::from_rule()
                 .to_err()
                 .with_detail(format!("mysql query_row failed: {err}"))
         })?;
@@ -360,7 +361,7 @@ async fn execute_query_fields(
             bind_mysql_field(query, field)
         });
     let rows = query.fetch_all(&pool).await.map_err(|err| {
-        KnowledgeReason::from_rule()
+        Reason::from_rule()
             .to_err()
             .with_detail(format!("mysql query_fields failed: {err}"))
     })?;
@@ -388,7 +389,7 @@ async fn execute_query_named_fields(
             bind_mysql_field(query, field)
         });
     let row = query.fetch_optional(&pool).await.map_err(|err| {
-        KnowledgeReason::from_rule()
+        Reason::from_rule()
             .to_err()
             .with_detail(format!("mysql query_named_fields failed: {err}"))
     })?;
@@ -406,8 +407,8 @@ async fn execute_query_named_fields(
     }
 }
 
-fn validation_err(stage: &str, err: sqlx::Error) -> wp_error::KnowledgeError {
-    KnowledgeReason::from_conf().to_err().with_detail(format!(
+fn validation_err(stage: &str, err: sqlx::Error) -> crate::error::KnowledgeError {
+    Reason::from_conf().to_err().with_detail(format!(
         "mysql startup validation failed during {stage}: connection issue: {err}"
     ))
 }
@@ -541,7 +542,7 @@ fn rewrite_sql<'a>(
                 }
                 let raw_name = &sql[start..i];
                 let field = by_name.get(raw_name).ok_or_else(|| {
-                    KnowledgeReason::from_rule()
+                    Reason::from_rule()
                         .to_err()
                         .with_detail(format!("mysql query missing param: {raw_name}"))
                 })?;
@@ -852,8 +853,8 @@ fn mysql_bit_u64_to_field(name: &str, value: u64) -> DataField {
     }
 }
 
-fn mysql_decode_err(err: sqlx::Error) -> wp_error::KnowledgeError {
-    KnowledgeReason::from_rule()
+fn mysql_decode_err(err: sqlx::Error) -> crate::error::KnowledgeError {
+    Reason::from_rule()
         .to_err()
         .with_detail(format!("mysql row decode failed: {err}"))
 }

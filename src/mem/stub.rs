@@ -1,6 +1,6 @@
+use crate::error::KnowledgeResult;
 use crate::{DBQuery, mem::RowData};
 use rusqlite::Params;
-use wp_error::KnowledgeResult;
 use wp_model_core::model::DataField;
 
 #[derive(Debug, Clone)]
