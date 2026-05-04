@@ -19,7 +19,7 @@ name = "wp_knowledge"
 orion-error = "0.7"
 derive_more = "2.0"
 orion-variate = "0.12"
-orion_conf = { version = "0.6", features = ["yaml", "toml"] }
+orion_conf = { version = "0.7", features = ["yaml", "toml"] }
 wp-log = "0.3"
 wp-model-core = "0.8"
 log = "0.4"
