@@ -18,7 +18,7 @@ name = "wp_knowledge"
 # Keep wp-knowledge on the same error stack as wp-error/orion_conf (0.5.x).
 orion-error = "0.7"
 derive_more = "2.0"
-orion-variate = "0.12"
+orion-variate = "0.13"
 orion_conf = { version = "0.6", features = ["yaml", "toml"] }
 wp-log = "0.3"
 wp-model-core = "0.8"
