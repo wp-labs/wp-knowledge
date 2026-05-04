@@ -5,3 +5,5 @@ Cargo.lock
 /wp_bench_authority.sqlite
 .report
 .run.gxl
+tmp
+.tmp
