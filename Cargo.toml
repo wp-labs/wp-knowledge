@@ -16,7 +16,7 @@ name = "wp_knowledge"
 
 [dependencies]
 # Keep wp-knowledge on the same error stack as wp-error/orion_conf (0.5.x).
-orion-error = "0.7"
+orion-error = "0.8"
 derive_more = "2.0"
 orion-variate = "0.12"
 orion_conf = { version = "0.6", features = ["yaml", "toml"] }
