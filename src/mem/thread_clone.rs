@@ -2,11 +2,9 @@ use std::cell::RefCell;
 use std::time::Duration;
 
 use crate::DBQuery;
-use crate::error::{KnowledgeResult, Reason};
+use crate::error::{KnowReason, KnowledgeResult};
 use crate::mem::RowData;
-use orion_error::ErrorWith;
-use orion_error::UvsFrom;
-use orion_error::compat_traits::ErrorOweBase;
+use orion_error::conversion::{ErrorWith, SourceRawErr};
 use rusqlite::ToSql;
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, Params};
@@ -94,18 +92,18 @@ impl ThreadClonedMDB {
                     rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                         | rusqlite::OpenFlags::SQLITE_OPEN_URI,
                 )
-                .owe(Reason::from_res())
+                .source_raw_err(KnowReason::from_res(), "source error")
                 .doing("connect db")?;
                 let mut dst = Connection::open_in_memory()
-                    .owe(Reason::from_res())
+                    .source_raw_err(KnowReason::from_res(), "source error")
                     .doing("oepn conn")?;
                 {
                     let bk = Backup::new(&src, &mut dst)
-                        .owe(Reason::from_conf())
+                        .source_raw_err(KnowReason::from_conf(), "source error")
                         .doing("backup")?;
                     // Copy all pages with small sleep to yield
                     bk.run_to_completion(50, Duration::from_millis(0), None)
-                        .owe(Reason::from_res())
+                        .source_raw_err(KnowReason::from_res(), "source error")
                         .doing("backup run")?;
                 }
                 // 为查询连接注册内置 UDF（只读场景也可用在 SQL/OML 查询中）

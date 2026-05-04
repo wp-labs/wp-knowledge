@@ -1,5 +1,4 @@
-use crate::error::{KnowledgeResult, Reason};
-use orion_error::UvsFrom;
+use crate::error::{KnowReason, KnowledgeResult};
 use orion_error::conversion::ToStructError;
 use rusqlite::ToSql;
 use rusqlite::types::{ToSqlOutput, Value as SqlValue, ValueRef};
@@ -18,7 +17,7 @@ pub fn named_params_to_fields(params: &[(&str, &dyn ToSql)]) -> KnowledgeResult<
         .iter()
         .map(|(name, value)| {
             let output = value.to_sql().map_err(|err| {
-                Reason::from_rule()
+                KnowReason::from_rule()
                     .to_err()
                     .with_detail(format!("sql param encode failed: {err}"))
             })?;
@@ -43,7 +42,7 @@ fn data_field_from_value_ref(name: String, value: ValueRef<'_>) -> KnowledgeResu
         ValueRef::Text(value) => DataField::from_chars(
             name,
             String::from_utf8(value.to_vec()).map_err(|err| {
-                Reason::from_rule()
+                KnowReason::from_rule()
                     .to_err()
                     .with_detail(format!("sql text param utf8 decode failed: {err}"))
             })?,

@@ -1,9 +1,8 @@
 use std::future::Future;
 use std::thread;
 
-use crate::error::{KnowledgeResult, Reason};
+use crate::error::{KnowReason, KnowledgeResult};
 use futures::executor;
-use orion_error::UvsFrom;
 use orion_error::conversion::ToStructError;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::oneshot;
@@ -29,7 +28,7 @@ where
                 .thread_name(worker_thread_name)
                 .build()
                 .map_err(|err| {
-                    Reason::from_conf()
+                    KnowReason::from_conf()
                         .to_err()
                         .with_detail(format!("create {provider} tokio runtime failed: {err}"))
                 });
@@ -37,13 +36,13 @@ where
             let _ = tx.send(result);
         })
         .map_err(|err| {
-            Reason::from_conf()
+            KnowReason::from_conf()
                 .to_err()
                 .with_detail(format!("spawn {provider} init thread failed: {err}"))
         })?;
 
     executor::block_on(rx).map_err(|err| {
-        Reason::from_conf()
+        KnowReason::from_conf()
             .to_err()
             .with_detail(format!("receive {provider} init result failed: {err}"))
     })?
@@ -91,7 +90,7 @@ fn recv_err(
     action: &str,
     err: tokio::sync::oneshot::error::RecvError,
 ) -> crate::error::KnowledgeError {
-    Reason::from_logic().to_err().with_detail(format!(
+    KnowReason::from_logic().to_err().with_detail(format!(
         "{provider} async task receive failed during {action}: {err}"
     ))
 }
@@ -101,7 +100,7 @@ fn join_err(
     action: &str,
     err: tokio::task::JoinError,
 ) -> crate::error::KnowledgeError {
-    Reason::from_logic().to_err().with_detail(format!(
+    KnowReason::from_logic().to_err().with_detail(format!(
         "{provider} async task join failed during {action}: {err}"
     ))
 }

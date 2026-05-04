@@ -1,8 +1,7 @@
 use std::future::Future;
 
-use crate::error::{KnowledgeResult, Reason};
+use crate::error::{KnowReason, KnowledgeResult};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
-use orion_error::UvsFrom;
 use orion_error::conversion::ToStructError;
 use sqlx::mysql::{MySqlArguments, MySqlColumn, MySqlPoolOptions, MySqlRow};
 use sqlx::{Column, Executor, MySql, Pool, Row, TypeInfo, ValueRef};
@@ -98,7 +97,7 @@ impl MySqlProvider {
                         .connect(&connection_uri)
                         .await
                         .map_err(|err| {
-                            Reason::from_conf()
+                            KnowReason::from_conf()
                                 .to_err()
                                 .with_detail(format!("create mysql pool failed: {err}"))
                         })?;
@@ -266,7 +265,7 @@ async fn mysql_col_names(
         cache_sql,
         || async {
             let describe = pool.describe(exec_sql).await.map_err(|err| {
-                Reason::from_rule()
+                KnowReason::from_rule()
                     .to_err()
                     .with_detail(format!("mysql describe failed: {err}"))
             })?;
@@ -316,7 +315,7 @@ async fn execute_query(
         .fetch_all(&pool)
         .await
         .map_err(|err| {
-            Reason::from_rule()
+            KnowReason::from_rule()
                 .to_err()
                 .with_detail(format!("mysql query failed: {err}"))
         })?;
@@ -335,7 +334,7 @@ async fn execute_query_row(
         .fetch_optional(&pool)
         .await
         .map_err(|err| {
-            Reason::from_rule()
+            KnowReason::from_rule()
                 .to_err()
                 .with_detail(format!("mysql query_row failed: {err}"))
         })?;
@@ -361,7 +360,7 @@ async fn execute_query_fields(
             bind_mysql_field(query, field)
         });
     let rows = query.fetch_all(&pool).await.map_err(|err| {
-        Reason::from_rule()
+        KnowReason::from_rule()
             .to_err()
             .with_detail(format!("mysql query_fields failed: {err}"))
     })?;
@@ -389,7 +388,7 @@ async fn execute_query_named_fields(
             bind_mysql_field(query, field)
         });
     let row = query.fetch_optional(&pool).await.map_err(|err| {
-        Reason::from_rule()
+        KnowReason::from_rule()
             .to_err()
             .with_detail(format!("mysql query_named_fields failed: {err}"))
     })?;
@@ -408,7 +407,7 @@ async fn execute_query_named_fields(
 }
 
 fn validation_err(stage: &str, err: sqlx::Error) -> crate::error::KnowledgeError {
-    Reason::from_conf().to_err().with_detail(format!(
+    KnowReason::from_conf().to_err().with_detail(format!(
         "mysql startup validation failed during {stage}: connection issue: {err}"
     ))
 }
@@ -542,7 +541,7 @@ fn rewrite_sql<'a>(
                 }
                 let raw_name = &sql[start..i];
                 let field = by_name.get(raw_name).ok_or_else(|| {
-                    Reason::from_rule()
+                    KnowReason::from_rule()
                         .to_err()
                         .with_detail(format!("mysql query missing param: {raw_name}"))
                 })?;
@@ -854,7 +853,7 @@ fn mysql_bit_u64_to_field(name: &str, value: u64) -> DataField {
 }
 
 fn mysql_decode_err(err: sqlx::Error) -> crate::error::KnowledgeError {
-    Reason::from_rule()
+    KnowReason::from_rule()
         .to_err()
         .with_detail(format!("mysql row decode failed: {err}"))
 }

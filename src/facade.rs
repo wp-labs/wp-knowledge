@@ -585,7 +585,7 @@ fn stable_hash(value: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::cache::FieldQueryCache;
-    use crate::error::Reason;
+    use crate::error::KnowReason;
     use crate::mem::memdb::MemDB;
     use crate::mem::query_util::{COLNAME_CACHE, metadata_cache_key_for_scope};
     use crate::runtime::fields_to_params;
@@ -593,7 +593,6 @@ mod tests {
         CacheLayer, CacheTelemetryEvent, KnowledgeTelemetry, QueryTelemetryEvent,
         ReloadTelemetryEvent, reset_telemetry,
     };
-    use orion_error::UvsFrom;
     use orion_error::conversion::ToStructError;
     use orion_variate::EnvDict;
     use std::fs;
@@ -1238,7 +1237,7 @@ connection_uri = "{connection_uri}"
             ProviderKind::SqliteAuthority,
             datasource_id_for(ProviderKind::SqliteAuthority, "reload-failure"),
             |_generation| {
-                Err(Reason::from_logic()
+                Err(KnowReason::from_logic()
                     .to_err()
                     .with_detail("expected reload failure"))
             },
@@ -1325,7 +1324,7 @@ connection_uri = "{connection_uri}"
             ProviderKind::SqliteAuthority,
             datasource_id_for(ProviderKind::SqliteAuthority, "telemetry-failure"),
             |_generation| {
-                Err(Reason::from_logic()
+                Err(KnowReason::from_logic()
                     .to_err()
                     .with_detail("expected telemetry reload failure"))
             },

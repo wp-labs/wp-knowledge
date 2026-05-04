@@ -1,6 +1,6 @@
 [package]
 name = "wp-knowledge"
-version = "0.12.1" # @gxl:set(version)
+version = "0.13.0" # @gxl:set(version)
 edition = "2024"
 license = "Apache-2.0"
 description = "KnowDB loader and SQLite-backed query facade for the Warp Parse stack."
@@ -16,11 +16,11 @@ name = "wp_knowledge"
 
 [dependencies]
 # Keep wp-knowledge on the same error stack as wp-error/orion_conf (0.5.x).
-orion-error = "0.7"
-derive_more = "2.0"
-orion-variate = "0.12"
-orion_conf = { version = "0.6", features = ["yaml", "toml"] }
-wp-log = "0.3"
+orion-error = { version = "0.8", features = ["anyhow"] }
+derive_more = "2.1"
+orion-variate = "0.13"
+orion_conf = { version = "0.7", features = ["yaml", "toml"] }
+wp-log = "0.4"
 wp-model-core = "0.8"
 log = "0.4"
 anyhow = "1.0"

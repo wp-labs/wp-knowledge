@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0]
+
+### Changed
+- Upgrade the error stack to `orion-error 0.8`.  
+  升级错误处理栈到 `orion-error 0.8`。
+- Rename `Reason` to `KnowReason`; keep `Reason` as deprecated alias.  
+  将 `Reason` 重命名为 `KnowReason`，保留 deprecated 别名。
+
 ## [0.12.0]
 
 ### Changed

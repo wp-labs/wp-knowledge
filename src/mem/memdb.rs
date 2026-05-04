@@ -1,15 +1,13 @@
 use crate::DBQuery;
 use crate::cache::CacheAble;
-use crate::error::{KnowledgeResult, Reason};
+use crate::error::{KnowReason, KnowledgeResult};
 use crate::mem::RowData;
 use crate::mem::stub::StubMDB;
 use csv::Reader;
 use enum_dispatch::enum_dispatch;
 use lazy_static::lazy_static;
-use orion_error::ErrorWith;
-use orion_error::UvsFrom;
-use orion_error::compat_traits::ErrorOweBase;
-use orion_error::conversion::ToStructError;
+use orion_error::conversion::ErrorWith;
+use orion_error::conversion::{SourceRawErr, ToStructError};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
 use rusqlite::Params;
@@ -104,7 +102,7 @@ impl DBQuery for MemDB {
         let conn = self
             .conn
             .get()
-            .owe(Reason::from_res())
+            .source_raw_err(KnowReason::from_res(), "source error")
             .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_cached(&conn, sql, [])
@@ -114,7 +112,7 @@ impl DBQuery for MemDB {
         let conn = self
             .conn
             .get()
-            .owe(Reason::from_res())
+            .source_raw_err(KnowReason::from_res(), "source error")
             .doing("get memdb connect")?;
         // Ensure SQLite UDFs are available on this connection (ip4_int/cidr4_* etc.)
         let _ = crate::sqlite_ext::register_builtin(&conn);
@@ -123,7 +121,10 @@ impl DBQuery for MemDB {
 
     fn query_row_params<P: Params>(&self, sql: &str, params: P) -> KnowledgeResult<RowData> {
         debug_kdb!("[memdb] query_row_params: {}", sql);
-        let conn = self.conn.get().owe(Reason::from_res())?;
+        let conn = self
+            .conn
+            .get()
+            .source_raw_err(KnowReason::from_res(), "source error")?;
         // Ensure SQLite UDFs are available on this connection
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_first_row_cached(&conn, sql, params)
@@ -149,7 +150,7 @@ impl MemDB {
         let conn = self
             .conn
             .get()
-            .owe(Reason::from_res())
+            .source_raw_err(KnowReason::from_res(), "source error")
             .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_cached_with_scope(
@@ -169,7 +170,7 @@ impl MemDB {
         let conn = self
             .conn
             .get()
-            .owe(Reason::from_res())
+            .source_raw_err(KnowReason::from_res(), "source error")
             .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         super::query_util::query_first_row_cached_with_scope(
@@ -190,7 +191,7 @@ impl MemDB {
         let conn = self
             .conn
             .get()
-            .owe(Reason::from_res())
+            .source_raw_err(KnowReason::from_res(), "source error")
             .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         let named_params = params
@@ -225,7 +226,7 @@ impl MemDB {
         let conn = self
             .conn
             .get()
-            .owe(Reason::from_res())
+            .source_raw_err(KnowReason::from_res(), "source error")
             .doing("get memdb connect")?;
         let _ = crate::sqlite_ext::register_builtin(&conn);
         let named_params = params
@@ -268,7 +269,7 @@ impl MemDB {
         let pool = r2d2::Pool::builder()
             .max_size(max_size)
             .build(manager)
-            .owe(Reason::from_res())?;
+            .source_raw_err(KnowReason::from_res(), "source error")?;
         Ok(Self { conn: pool })
     }
 
@@ -282,7 +283,7 @@ impl MemDB {
         let pool = r2d2::Pool::builder()
             .max_size(max_size)
             .build(manager)
-            .owe(Reason::from_res())?;
+            .source_raw_err(KnowReason::from_res(), "source error")?;
         Ok(Self { conn: pool })
     }
     // V1 init_load_by_conf removed: use loader::build_authority_from_knowdb for V2
@@ -299,21 +300,33 @@ impl MemDB {
     }
 
     pub fn table_create(&self, sql: &str) -> KnowledgeResult<()> {
-        let conn = self.conn.get().owe(Reason::from_res())?;
-        conn.execute(sql, ()).owe(Reason::from_rule())?;
+        let conn = self
+            .conn
+            .get()
+            .source_raw_err(KnowReason::from_res(), "source error")?;
+        conn.execute(sql, ())
+            .source_raw_err(KnowReason::from_rule(), "source error")?;
         debug_kdb!("crate table: {} ", sql);
         Ok(())
     }
     pub fn execute(&self, sql: &str) -> KnowledgeResult<()> {
-        let conn = self.conn.get().owe(Reason::from_res())?;
-        conn.execute(sql, ()).owe(Reason::from_rule())?;
+        let conn = self
+            .conn
+            .get()
+            .source_raw_err(KnowReason::from_res(), "source error")?;
+        conn.execute(sql, ())
+            .source_raw_err(KnowReason::from_rule(), "source error")?;
         debug_kdb!("execute: {} ", sql);
         Ok(())
     }
 
     pub fn table_clean(&self, sql: &str) -> KnowledgeResult<()> {
-        let conn = self.conn.get().owe(Reason::from_res())?;
-        conn.execute(sql, ()).owe(Reason::from_rule())?;
+        let conn = self
+            .conn
+            .get()
+            .source_raw_err(KnowReason::from_res(), "source error")?;
+        conn.execute(sql, ())
+            .source_raw_err(KnowReason::from_rule(), "source error")?;
         debug_kdb!("clean table: {} ", sql);
         Ok(())
     }
@@ -330,17 +343,23 @@ impl MemDB {
             warn_kdb!("{} not find, load knowdb failed", csv_path.display());
             return Ok(0);
         }
-        let mut rdr = Reader::from_path(&csv_path).owe(Reason::from_res())?;
-        let conn = self.conn.get().owe(Reason::from_res())?;
+        let mut rdr =
+            Reader::from_path(&csv_path).source_raw_err(KnowReason::from_res(), "source error")?;
+        let conn = self
+            .conn
+            .get()
+            .source_raw_err(KnowReason::from_res(), "source error")?;
         let mut load_cnt: usize = 0;
         // Prepare once outside loop for performance
-        let mut stmt = conn.prepare(sql).owe(Reason::from_rule())?;
+        let mut stmt = conn
+            .prepare(sql)
+            .source_raw_err(KnowReason::from_rule(), "source error")?;
         for (idx, result) in rdr.records().enumerate() {
             if load_cnt >= max {
                 break;
             }
             let record = result.map_err(|e| {
-                Reason::from_rule().to_err().with_detail(format!(
+                KnowReason::from_rule().to_err().with_detail(format!(
                     "read csv record failed at line {}: {}",
                     idx + 1,
                     e
@@ -351,7 +370,7 @@ impl MemDB {
             if let Some(max_col) = cols.iter().max()
                 && *max_col >= record.len()
             {
-                return Err(Reason::from_rule().to_err().with_detail(format!(
+                return Err(KnowReason::from_rule().to_err().with_detail(format!(
                     "csv has insufficient columns at line {}: need index {}, got {} columns",
                     idx + 1,
                     *max_col,
@@ -363,7 +382,7 @@ impl MemDB {
             let mut vec: Vec<&str> = Vec::with_capacity(cols.len());
             for &ci in &cols {
                 let v = record.get(ci).ok_or_else(|| {
-                    Reason::from_rule().to_err().with_detail(format!(
+                    KnowReason::from_rule().to_err().with_detail(format!(
                         "line {} col {} missing",
                         idx + 1,
                         ci
@@ -372,7 +391,8 @@ impl MemDB {
                 vec.push(v);
             }
             let params = rusqlite::params_from_iter(vec);
-            stmt.execute(params).owe(Reason::from_rule())?;
+            stmt.execute(params)
+                .source_raw_err(KnowReason::from_rule(), "source error")?;
             load_cnt += 1;
         }
         info_kdb!("from {} load data cnt: {}", csv_path.display(), load_cnt);
@@ -380,15 +400,18 @@ impl MemDB {
     }
 
     pub fn check_data(&self, table: &str, scope: (usize, usize)) -> KnowledgeResult<usize> {
-        let conn = self.conn.get().owe(Reason::from_res())?;
+        let conn = self
+            .conn
+            .get()
+            .source_raw_err(KnowReason::from_res(), "source error")?;
         let count_sql = format!("select count(*) from {}", table);
         let count: usize = conn
             .query_row(count_sql.as_str(), (), |row| row.get(0))
-            .owe(Reason::from_rule())?;
+            .source_raw_err(KnowReason::from_rule(), "source error")?;
         if count >= scope.0 {
             Ok(count)
         } else {
-            Err(Reason::from_conf()
+            Err(KnowReason::from_conf()
                 .to_err()
                 .with_detail("table data less")
                 .with_context(("table", table))
@@ -439,12 +462,11 @@ mod tests {
 
     use super::*;
     // V1 TableConf removed
-    use crate::error::{KnowledgeResult, Reason};
+    use crate::error::{KnowReason, KnowledgeResult};
     use crate::mem::ToSqlParams;
 
     use orion_conf::EnvTomlLoad;
-    use orion_error::UvsFrom;
-    use orion_error::compat_traits::ErrorOweBase;
+    use orion_error::conversion::SourceErr;
     use orion_variate::EnvDict;
     use serde::Serialize;
     use std::fs;
@@ -521,9 +543,10 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push("wp_knowledge_csv_missing_col.csv");
         {
-            let mut f = fs::File::create(&path).owe(Reason::from_res())?;
-            writeln!(f, "name").owe(Reason::from_res())?;
-            writeln!(f, "only_one_col").owe(Reason::from_res())?;
+            let mut f =
+                fs::File::create(&path).source_raw_err(KnowReason::from_res(), "source error")?;
+            writeln!(f, "name").source_raw_err(KnowReason::from_res(), "source error")?;
+            writeln!(f, "only_one_col").source_raw_err(KnowReason::from_res(), "source error")?;
         }
         let res = db.table_load(
             EXAMPLE_INSERT_SQL,
@@ -758,23 +781,27 @@ mod tests {
     #[allow(dead_code)]
     fn load_toml_conf<T: serde::de::DeserializeOwned>(path: &str) -> KnowledgeResult<T> {
         let mut f = File::open(path)
-            .owe(Reason::from_res())
+            .source_raw_err(KnowReason::from_res(), "source error")
             .doing(format!("conf file not found: {}", path))?;
         let mut buffer = Vec::with_capacity(10240);
-        f.read_to_end(&mut buffer).owe(Reason::from_res())?;
-        let conf_data = String::from_utf8(buffer).owe(Reason::from_rule())?;
+        f.read_to_end(&mut buffer)
+            .source_raw_err(KnowReason::from_res(), "source error")?;
+        let conf_data =
+            String::from_utf8(buffer).source_raw_err(KnowReason::from_rule(), "source error")?;
         let dict = EnvDict::new();
-        let conf: T = T::env_parse_toml(conf_data.as_str(), &dict).owe(Reason::from_conf())?;
+        let conf: T = T::env_parse_toml(conf_data.as_str(), &dict)
+            .source_err(KnowReason::from_conf(), "parse toml config")?;
         Ok(conf)
     }
 
     #[allow(dead_code)]
     fn export_toml_local<T: Serialize>(val: &T, path: &str) -> KnowledgeResult<()> {
-        let data = toml::to_string_pretty(val).owe(Reason::from_rule())?;
+        let data =
+            toml::to_string_pretty(val).source_raw_err(KnowReason::from_rule(), "source error")?;
         if let Some(parent) = std::path::Path::new(path).parent() {
-            fs::create_dir_all(parent).owe(Reason::from_res())?;
+            fs::create_dir_all(parent).source_raw_err(KnowReason::from_res(), "source error")?;
         }
-        fs::write(path, data).owe(Reason::from_res())?;
+        fs::write(path, data).source_raw_err(KnowReason::from_res(), "source error")?;
         Ok(())
     }
 }

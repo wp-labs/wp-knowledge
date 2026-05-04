@@ -16,4 +16,5 @@ pub mod runtime;
 pub mod sqlite_ext;
 pub mod telemetry;
 
-pub use error::{KnowledgeError, KnowledgeResult, Reason};
+#[allow(deprecated)]
+pub use error::{KnowReason, KnowledgeError, KnowledgeResult, Reason};
