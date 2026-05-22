@@ -23,7 +23,7 @@ use crate::param::named_params_to_fields;
 use crate::postgres::{PostgresProvider, PostgresProviderConfig};
 use crate::runtime::{
     CachePolicy, DatasourceId, Generation, MetadataCacheScope, ProviderExecutor, QueryRequest,
-    QueryResponse, RuntimeSnapshot, runtime,
+    QueryResponse, RuntimeSnapshot, is_error_null_row, runtime,
 };
 use crate::telemetry::{
     CacheLayer, CacheOutcome, CacheTelemetryEvent, KnowledgeTelemetry, install_telemetry,
@@ -367,7 +367,9 @@ pub fn cache_query_fields_with_scope<const N: usize>(
 
     match runtime().execute_first_row_fields(sql, query_params, CachePolicy::UseGlobal) {
         Ok(row) => {
-            cache.save_scoped(local_cache_scope, c_params, row.clone());
+            if !is_error_null_row(&row) {
+                cache.save_scoped(local_cache_scope, c_params, row.clone());
+            }
             row
         }
         Err(err) => {
@@ -445,7 +447,9 @@ where
         .await
     {
         Ok(row) => {
-            cache.save_scoped(local_cache_scope, c_params, row.clone());
+            if !is_error_null_row(&row) {
+                cache.save_scoped(local_cache_scope, c_params, row.clone());
+            }
             row
         }
         Err(err) => {

@@ -224,10 +224,18 @@ impl Default for ResultCacheConfig {
 }
 
 #[derive(Debug, Clone)]
+enum CachedQueryValue {
+    Response(Arc<QueryResponse>),
+    Error(Arc<String>),
+}
+
+#[derive(Debug, Clone)]
 struct CachedQueryResponse {
-    response: Arc<QueryResponse>,
+    value: CachedQueryValue,
     cached_at: Instant,
 }
+
+pub const ERROR_NULL_FIELD: &str = "__wp_kdb_error";
 
 pub struct KnowledgeRuntime {
     provider: RwLock<Option<Arc<ProviderHandle>>>,
@@ -519,7 +527,7 @@ impl KnowledgeRuntime {
                 handle.kind,
                 handle.generation.0
             );
-            return Ok(hit);
+            return Ok(self.cached_value_to_response(hit, query_mode_tag(&req.mode)));
         }
         if use_global_cache {
             self.record_result_cache_miss();
@@ -589,6 +597,12 @@ impl KnowledgeRuntime {
                         elapsed: started.elapsed(),
                     });
                 }
+                if use_global_cache {
+                    let err_msg = err.to_string();
+                    warn_kdb!("[kdb] query error: {}", err_msg);
+                    self.save_result_cache_error(handle, req, err_msg);
+                    return Ok(null_response(mode_tag));
+                }
                 return Err(err);
             }
         };
@@ -640,7 +654,9 @@ impl KnowledgeRuntime {
                     provider_kind: Some(handle.kind.clone()),
                 });
             }
-            return Ok(hit.into_row());
+            return Ok(self
+                .cached_value_to_response(hit, QueryModeTag::FirstRow)
+                .into_row());
         }
         if use_global_cache {
             self.record_result_cache_miss();
@@ -680,6 +696,15 @@ impl KnowledgeRuntime {
                         elapsed: started.elapsed(),
                     });
                 }
+                if use_global_cache {
+                    let err_msg = err.to_string();
+                    warn_kdb!("[kdb] query error: {}", err_msg);
+                    self.save_result_cache_error_by_key(
+                        result_cache_key_fields(handle, sql, params, QueryModeTag::FirstRow),
+                        err_msg,
+                    );
+                    return Ok(null_row());
+                }
                 return Err(err);
             }
         };
@@ -718,7 +743,7 @@ impl KnowledgeRuntime {
                     provider_kind: Some(handle.kind.clone()),
                 });
             }
-            return Ok(hit);
+            return Ok(self.cached_value_to_response(hit, query_mode_tag(&req.mode)));
         }
         if use_global_cache {
             self.record_result_cache_miss();
@@ -787,6 +812,12 @@ impl KnowledgeRuntime {
                         elapsed: started.elapsed(),
                     });
                 }
+                if use_global_cache {
+                    let err_msg = err.to_string();
+                    warn_kdb!("[kdb] query error: {}", err_msg);
+                    self.save_result_cache_error(&handle, req, err_msg);
+                    return Ok(null_response(mode_tag));
+                }
                 return Err(err);
             }
         };
@@ -837,7 +868,9 @@ impl KnowledgeRuntime {
                     provider_kind: Some(handle.kind.clone()),
                 });
             }
-            return Ok(hit.into_row());
+            return Ok(self
+                .cached_value_to_response(hit, QueryModeTag::FirstRow)
+                .into_row());
         }
         if use_global_cache {
             self.record_result_cache_miss();
@@ -877,6 +910,15 @@ impl KnowledgeRuntime {
                         elapsed: started.elapsed(),
                     });
                 }
+                if use_global_cache {
+                    let err_msg = err.to_string();
+                    warn_kdb!("[kdb] query error: {}", err_msg);
+                    self.save_result_cache_error_by_key(
+                        result_cache_key_fields(&handle, sql, params, QueryModeTag::FirstRow),
+                        err_msg,
+                    );
+                    return Ok(null_row());
+                }
                 return Err(err);
             }
         };
@@ -914,11 +956,11 @@ impl KnowledgeRuntime {
         &self,
         handle: &ProviderHandle,
         req: &QueryRequest,
-    ) -> Option<QueryResponse> {
+    ) -> Option<CachedQueryValue> {
         self.fetch_result_cache_by_key(result_cache_key(handle, req))
     }
 
-    fn fetch_result_cache_by_key(&self, key: ResultCacheKey) -> Option<QueryResponse> {
+    fn fetch_result_cache_by_key(&self, key: ResultCacheKey) -> Option<CachedQueryValue> {
         if !self.result_cache_enabled() {
             return None;
         }
@@ -933,7 +975,21 @@ impl KnowledgeRuntime {
             }
             return None;
         }
-        Some((*cached.response).clone())
+        Some(cached.value)
+    }
+
+    fn cached_value_to_response(
+        &self,
+        value: CachedQueryValue,
+        mode: QueryModeTag,
+    ) -> QueryResponse {
+        match value {
+            CachedQueryValue::Response(response) => (*response).clone(),
+            CachedQueryValue::Error(err) => {
+                warn_kdb!("[kdb] cached query error: {}", err);
+                null_response(mode)
+            }
+        }
     }
 
     fn save_result_cache(
@@ -946,11 +1002,23 @@ impl KnowledgeRuntime {
     }
 
     fn save_result_cache_by_key(&self, key: ResultCacheKey, response: QueryResponse) {
+        self.save_result_cache_value_by_key(key, CachedQueryValue::Response(Arc::new(response)));
+    }
+
+    fn save_result_cache_error(&self, handle: &ProviderHandle, req: &QueryRequest, error: String) {
+        self.save_result_cache_error_by_key(result_cache_key(handle, req), error);
+    }
+
+    fn save_result_cache_error_by_key(&self, key: ResultCacheKey, error: String) {
+        self.save_result_cache_value_by_key(key, CachedQueryValue::Error(Arc::new(error)));
+    }
+
+    fn save_result_cache_value_by_key(&self, key: ResultCacheKey, value: CachedQueryValue) {
         if let Ok(mut cache) = self.result_cache.write() {
             cache.put(
                 key,
                 CachedQueryResponse {
-                    response: Arc::new(response),
+                    value,
                     cached_at: Instant::now(),
                 },
             );
@@ -971,6 +1039,25 @@ impl KnowledgeRuntime {
 pub fn runtime() -> &'static KnowledgeRuntime {
     static RUNTIME: OnceLock<KnowledgeRuntime> = OnceLock::new();
     RUNTIME.get_or_init(|| KnowledgeRuntime::new(1024))
+}
+
+pub fn is_error_null_row(row: &[DataField]) -> bool {
+    matches!(row, [field] if field.get_name() == ERROR_NULL_FIELD && matches!(field.get_value(), Value::Null))
+}
+
+fn null_row() -> RowData {
+    vec![DataField::new(
+        DataType::default(),
+        ERROR_NULL_FIELD,
+        Value::Null,
+    )]
+}
+
+fn null_response(mode: QueryModeTag) -> QueryResponse {
+    match mode {
+        QueryModeTag::Many => QueryResponse::Rows(vec![null_row()]),
+        QueryModeTag::FirstRow => QueryResponse::Row(null_row()),
+    }
 }
 
 #[cfg(test)]
@@ -1188,11 +1275,17 @@ pub fn params_to_fields(params: &[QueryParam]) -> Vec<DataField> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use orion_error::conversion::ToStructError;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use wp_model_core::model::Value;
 
     struct TestProvider {
         value: &'static str,
+    }
+
+    struct FailingProvider {
+        calls: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -1207,6 +1300,35 @@ mod tests {
 
         fn query_row(&self, _sql: &str) -> KnowledgeResult<RowData> {
             Ok(vec![DataField::from_chars("value", self.value)])
+        }
+
+        fn query_named_fields(
+            &self,
+            _sql: &str,
+            _params: &[DataField],
+        ) -> KnowledgeResult<RowData> {
+            self.query_row("")
+        }
+    }
+
+    #[async_trait]
+    impl ProviderExecutor for FailingProvider {
+        fn query(&self, _sql: &str) -> KnowledgeResult<Vec<RowData>> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(KnowReason::from_rule()
+                .to_err()
+                .with_detail("forced query failure"))
+        }
+
+        fn query_fields(&self, _sql: &str, _params: &[DataField]) -> KnowledgeResult<Vec<RowData>> {
+            self.query("")
+        }
+
+        fn query_row(&self, _sql: &str) -> KnowledgeResult<RowData> {
+            self.calls.fetch_add(1, AtomicOrdering::Relaxed);
+            Err(KnowReason::from_rule()
+                .to_err()
+                .with_detail("forced query failure"))
         }
 
         fn query_named_fields(
@@ -1276,5 +1398,37 @@ mod tests {
             .expect("execute old handle")
             .into_row();
         assert_eq!(row[0].to_string(), "chars(old)");
+    }
+
+    #[test]
+    fn global_cache_stores_query_errors_as_null() {
+        let _guard = runtime_test_guard().lock().expect("runtime test guard");
+        runtime().configure_result_cache(true, 16, Duration::from_millis(30_000));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider_calls = calls.clone();
+        runtime()
+            .install_provider(
+                ProviderKind::Postgres,
+                DatasourceId("postgres:error-cache".to_string()),
+                |_generation| {
+                    Ok(Arc::new(FailingProvider {
+                        calls: provider_calls,
+                    }))
+                },
+            )
+            .expect("install failing provider");
+
+        let req = QueryRequest::first_row("SELECT broken", Vec::new(), CachePolicy::UseGlobal);
+        let first = runtime().execute(&req).expect("error cache returns null");
+        assert!(is_error_null_row(&first.into_row()));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+
+        let second = runtime().execute(&req).expect("cached error returns null");
+        assert!(is_error_null_row(&second.into_row()));
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 1);
+
+        let bypass = QueryRequest::first_row("SELECT broken", Vec::new(), CachePolicy::Bypass);
+        assert!(runtime().execute(&bypass).is_err());
+        assert_eq!(calls.load(AtomicOrdering::Relaxed), 2);
     }
 }
