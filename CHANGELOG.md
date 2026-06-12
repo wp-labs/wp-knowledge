@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.14.0]
+
+### Added
+- **Redis Provider**: 新增 Redis 外部数据源支持，适用于弱口令 Bloom filter、威胁情报 IP 查表、白名单排除等高速查表场景。支持 `GET`、`HGET`、`BF.EXISTS`、`SISMEMBER`（P0）以及 `BF.MADD`、`BF.RESERVE`（P1）六种命令。
+- **Redis API**: 新增 `init_redis_provider()`、`redis_exec()`、`redis_exec_async()`、`redis_ping()`、`redis_close()` 公共接口。
+- **Redis Config**: knowdb.toml 新增 `[provider.redis]` 配置段，支持 `connection_uri`、`pool_size`、`connect_timeout_ms`（默认 3000）、`command_timeout_ms`（默认 100）。同一 Redis 实例的多个 provider 自动共享连接。
+
+### Changed
+- **Provider Config**: knowdb.toml 的 `[provider]` 拆分为 `[provider.sqldb]` 和 `[provider.redis]`，各自只包含相关字段。旧平铺格式仍可用，自动转换并输出迁移提示。
 
 ## [0.13.0]
 

@@ -14,7 +14,7 @@ use wp_log::{info_ctrl, warn_kdb};
 use wp_model_core::model::DataField;
 
 use crate::cache::CacheAble;
-use crate::loader::{ProviderKind, parse_knowdb_conf};
+use crate::loader::{ProviderKind, SqlProviderKind, parse_knowdb_conf};
 use crate::mem::RowData;
 use crate::mem::memdb::MemDB;
 use crate::mem::thread_clone::ThreadClonedMDB;
@@ -249,6 +249,58 @@ pub fn init_mysql_provider_with_config(config: MySqlProviderConfig) -> Knowledge
         Ok(Arc::new(provider))
     })
 }
+
+// ---------------------------------------------------------------------------
+// Redis provider API
+// ---------------------------------------------------------------------------
+
+/// Initialize a Redis provider.
+///
+/// `name`: logical provider name (e.g. `"password_check"`).
+/// `url`: Redis connection URL (`redis://127.0.0.1:6379` or `rediss://...`).
+/// `pool_size`: optional hint (default 8); the `ConnectionManager` handles
+/// multiplexing internally.
+///
+/// Multiple names sharing the same URL reuse the same `ConnectionManager`.
+pub fn init_redis_provider(name: &str, url: &str, pool_size: Option<usize>) -> KnowledgeResult<()> {
+    crate::redis::init(name, url, pool_size)
+}
+
+/// Execute a Redis command and return the result as a `String`.
+///
+/// Supported commands: `GET`, `HGET`, `BF.EXISTS`, `SISMEMBER` (P0),
+/// `BF.MADD`, `BF.RESERVE` (P1).
+///
+/// `nil` responses are returned as empty strings.
+pub fn redis_exec(name: &str, cmd: &str, key: &str, args: &[&str]) -> KnowledgeResult<String> {
+    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    crate::redis::exec_blocking(name, cmd, key, &owned)
+}
+
+/// Async variant of [`redis_exec`].
+pub async fn redis_exec_async(
+    name: &str,
+    cmd: &str,
+    key: &str,
+    args: &[String],
+) -> KnowledgeResult<String> {
+    crate::redis::exec_async(name, cmd, key, args).await
+}
+
+/// Ping a Redis provider. Returns `true` if `PONG` is received.
+pub fn redis_ping(name: &str) -> KnowledgeResult<bool> {
+    crate::redis::ping_blocking(name)
+}
+
+/// Close one or all Redis providers.
+///
+/// `None` closes all providers; `Some(name)` closes only the named provider.
+/// If the underlying pool is shared with other names it is kept alive.
+pub fn redis_close(name: Option<&str>) -> KnowledgeResult<()> {
+    crate::redis::close(name)
+}
+
+// ---------------------------------------------------------------------------
 
 pub fn current_generation() -> Option<u64> {
     runtime()
@@ -517,43 +569,56 @@ pub fn init_thread_cloned_from_knowdb(
     dict: &orion_variate::EnvDict,
 ) -> KnowledgeResult<()> {
     let (conf, conf_abs, _) = parse_knowdb_conf(root, knowdb_conf, dict)?;
-    if let Some(provider) = conf.provider {
-        match provider.kind {
-            ProviderKind::Postgres => {
-                info_ctrl!("init postgres knowdb provider({}) ", conf_abs.display(),);
-                init_postgres_provider_with_config(
-                    PostgresProviderConfig::new(provider.connection_uri)
-                        .with_pool_size(provider.pool_size)
-                        .with_min_connections(provider.min_connections)
-                        .with_acquire_timeout_ms(provider.acquire_timeout_ms)
-                        .with_idle_timeout_ms(provider.idle_timeout_ms)
-                        .with_max_lifetime_ms(provider.max_lifetime_ms),
-                )?;
-                runtime().configure_result_cache(
-                    conf.cache.enabled,
-                    conf.cache.capacity,
-                    Duration::from_millis(conf.cache.ttl_ms.max(1)),
-                );
-                return Ok(());
+    if let Some(provider_cfg) = conf.provider() {
+        // New-style [provider.sqldb]
+        if let Some(sqldb) = provider_cfg.sqldb {
+            match sqldb.kind {
+                SqlProviderKind::Postgres => {
+                    info_ctrl!("init postgres knowdb provider({}) ", conf_abs.display(),);
+                    init_postgres_provider_with_config(
+                        PostgresProviderConfig::new(sqldb.connection_uri)
+                            .with_pool_size(sqldb.pool_size)
+                            .with_min_connections(sqldb.min_connections)
+                            .with_acquire_timeout_ms(sqldb.acquire_timeout_ms)
+                            .with_idle_timeout_ms(sqldb.idle_timeout_ms)
+                            .with_max_lifetime_ms(sqldb.max_lifetime_ms),
+                    )?;
+                    runtime().configure_result_cache(
+                        conf.cache.enabled,
+                        conf.cache.capacity,
+                        Duration::from_millis(conf.cache.ttl_ms.max(1)),
+                    );
+                    return Ok(());
+                }
+                SqlProviderKind::Mysql => {
+                    info_ctrl!("init mysql knowdb provider({}) ", conf_abs.display(),);
+                    init_mysql_provider_with_config(
+                        MySqlProviderConfig::new(sqldb.connection_uri)
+                            .with_pool_size(sqldb.pool_size)
+                            .with_min_connections(sqldb.min_connections)
+                            .with_acquire_timeout_ms(sqldb.acquire_timeout_ms)
+                            .with_idle_timeout_ms(sqldb.idle_timeout_ms)
+                            .with_max_lifetime_ms(sqldb.max_lifetime_ms),
+                    )?;
+                    runtime().configure_result_cache(
+                        conf.cache.enabled,
+                        conf.cache.capacity,
+                        Duration::from_millis(conf.cache.ttl_ms.max(1)),
+                    );
+                    return Ok(());
+                }
             }
-            ProviderKind::Mysql => {
-                info_ctrl!("init mysql knowdb provider({}) ", conf_abs.display(),);
-                init_mysql_provider_with_config(
-                    MySqlProviderConfig::new(provider.connection_uri)
-                        .with_pool_size(provider.pool_size)
-                        .with_min_connections(provider.min_connections)
-                        .with_acquire_timeout_ms(provider.acquire_timeout_ms)
-                        .with_idle_timeout_ms(provider.idle_timeout_ms)
-                        .with_max_lifetime_ms(provider.max_lifetime_ms),
-                )?;
-                runtime().configure_result_cache(
-                    conf.cache.enabled,
-                    conf.cache.capacity,
-                    Duration::from_millis(conf.cache.ttl_ms.max(1)),
-                );
-                return Ok(());
-            }
-            ProviderKind::SqliteAuthority => {}
+        }
+        // New-style [provider.redis]
+        if let Some(redis_cfg) = provider_cfg.redis {
+            info_ctrl!("init redis knowdb provider({}) ", conf_abs.display(),);
+            crate::redis::init_with_opts(
+                "knowdb",
+                &redis_cfg.connection_uri,
+                redis_cfg.pool_size,
+                redis_cfg.command_timeout_ms,
+            )?;
+            return Ok(());
         }
     }
 

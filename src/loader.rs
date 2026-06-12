@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use orion_conf::EnvTomlLoad;
 use serde::Deserialize;
-use wp_log::info_ctrl;
+use wp_log::{info_ctrl, warn_kdb};
 
 use crate::error::{KnowReason, KnowledgeResult};
 use crate::mem::memdb::MemDB;
@@ -27,9 +27,20 @@ pub struct KnowDbConf {
     #[serde(default)]
     pub cache: CacheSpec,
     #[serde(default)]
-    pub provider: Option<ProviderSpec>,
-    #[serde(default)]
     pub tables: Vec<TableSpec>,
+
+    /// Raw provider config — accepts both `[provider.sqldb]`/`[provider.redis]`
+    /// (new) and flat `[provider]` (deprecated). Use [`KnowDbConf::into_provider`].
+    #[serde(default, rename = "provider")]
+    provider_raw: Option<ProviderCompat>,
+}
+
+impl KnowDbConf {
+    /// Resolve the provider configuration, converting from the deprecated flat
+    /// `[provider]` format if necessary.
+    pub fn provider(&self) -> Option<ProviderConfig> {
+        self.provider_raw.clone().map(ProviderConfig::from)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -52,14 +63,86 @@ impl Default for CacheSpec {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Provider configuration (new format: [provider.sqldb] / [provider.redis])
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ProviderConfig {
+    #[serde(default)]
+    pub sqldb: Option<SqlProviderSpec>,
+    #[serde(default)]
+    pub redis: Option<RedisProviderSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SqlProviderSpec {
+    #[serde(rename = "kind")]
+    pub kind: SqlProviderKind,
+    pub connection_uri: String,
+    #[serde(default)]
+    pub pool_size: Option<u32>,
+    #[serde(default)]
+    pub min_connections: Option<u32>,
+    #[serde(default)]
+    pub acquire_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub max_lifetime_ms: Option<u64>,
+}
+
+/// Config-level SQL provider kind — Postgres and Mysql only.
+/// The runtime-level [`ProviderKind`] additionally includes `SqliteAuthority`
+/// and `Redis` for the internal provider registry.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlProviderKind {
+    Postgres,
+    Mysql,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RedisProviderSpec {
+    pub connection_uri: String,
+    #[serde(default)]
+    pub pool_size: Option<usize>,
+    #[serde(default = "default_connect_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    #[serde(default = "default_command_timeout_ms")]
+    pub command_timeout_ms: u64,
+}
+
+fn default_connect_timeout_ms() -> u64 {
+    3_000
+}
+
+fn default_command_timeout_ms() -> u64 {
+    100
+}
+
+// ---------------------------------------------------------------------------
+// Deprecated flat [provider] format (kept for backward compatibility)
+// ---------------------------------------------------------------------------
+
+/// Runtime-level provider kind — used by the internal registry to identify
+/// the active provider. Includes built-in types (SqliteAuthority) and all
+/// external types (Postgres, Mysql, Redis).
+///
+/// For config-level SQL providers, see [`SqlProviderKind`].
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     SqliteAuthority,
     Postgres,
     Mysql,
+    Redis,
 }
 
+#[deprecated(
+    since = "0.14.0",
+    note = "use [provider.sqldb] or [provider.redis] instead"
+)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderSpec {
     pub kind: ProviderKind,
@@ -74,6 +157,70 @@ pub struct ProviderSpec {
     pub idle_timeout_ms: Option<u64>,
     #[serde(default)]
     pub max_lifetime_ms: Option<u64>,
+}
+
+// Serde helper: accept both old flat [provider] and new [provider.sqldb/redis].
+//
+// IMPORTANT: Old must come first. The new format has all fields optional, so an
+// old-format TOML would silently deserialize as ProviderConfig { sqldb: None,
+// redis: None } if New were tried first (serde ignores unknown keys by default).
+// Old fails on the new format because `kind` is required and absent.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+#[allow(deprecated)]
+enum ProviderCompat {
+    Old(ProviderSpec),
+    New(ProviderConfig),
+}
+
+#[allow(deprecated)]
+impl From<ProviderCompat> for ProviderConfig {
+    fn from(compat: ProviderCompat) -> Self {
+        match compat {
+            ProviderCompat::New(cfg) => cfg,
+            ProviderCompat::Old(old) => {
+                warn_kdb!(
+                    "[knowdb] flat [provider] format is deprecated; use [provider.sqldb] or [provider.redis]"
+                );
+                match old.kind {
+                    ProviderKind::Postgres => ProviderConfig {
+                        sqldb: Some(SqlProviderSpec {
+                            kind: SqlProviderKind::Postgres,
+                            connection_uri: old.connection_uri,
+                            pool_size: old.pool_size,
+                            min_connections: old.min_connections,
+                            acquire_timeout_ms: old.acquire_timeout_ms,
+                            idle_timeout_ms: old.idle_timeout_ms,
+                            max_lifetime_ms: old.max_lifetime_ms,
+                        }),
+                        redis: None,
+                    },
+                    ProviderKind::Mysql => ProviderConfig {
+                        sqldb: Some(SqlProviderSpec {
+                            kind: SqlProviderKind::Mysql,
+                            connection_uri: old.connection_uri,
+                            pool_size: old.pool_size,
+                            min_connections: old.min_connections,
+                            acquire_timeout_ms: old.acquire_timeout_ms,
+                            idle_timeout_ms: old.idle_timeout_ms,
+                            max_lifetime_ms: old.max_lifetime_ms,
+                        }),
+                        redis: None,
+                    },
+                    ProviderKind::Redis => ProviderConfig {
+                        sqldb: None,
+                        redis: Some(RedisProviderSpec {
+                            connection_uri: old.connection_uri,
+                            pool_size: old.pool_size.map(|s| s as usize),
+                            connect_timeout_ms: 3_000,
+                            command_timeout_ms: 100,
+                        }),
+                    },
+                    ProviderKind::SqliteAuthority => ProviderConfig::default(),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -493,16 +640,17 @@ max_lifetime_ms = 60000
         .expect("parse knowdb with provider");
 
         assert!(conf.tables.is_empty());
-        let provider = conf.provider.expect("provider");
-        assert!(matches!(provider.kind, ProviderKind::Postgres));
-        assert_eq!(
-            provider.connection_uri,
-            "postgres://demo:demo@127.0.0.1/demo"
-        );
-        assert_eq!(provider.min_connections, Some(2));
-        assert_eq!(provider.acquire_timeout_ms, Some(1500));
-        assert_eq!(provider.idle_timeout_ms, Some(30000));
-        assert_eq!(provider.max_lifetime_ms, Some(60000));
+        let sqldb = conf
+            .provider()
+            .expect("provider")
+            .sqldb
+            .expect("sqldb provider");
+        assert!(matches!(sqldb.kind, SqlProviderKind::Postgres));
+        assert_eq!(sqldb.connection_uri, "postgres://demo:demo@127.0.0.1/demo");
+        assert_eq!(sqldb.min_connections, Some(2));
+        assert_eq!(sqldb.acquire_timeout_ms, Some(1500));
+        assert_eq!(sqldb.idle_timeout_ms, Some(30000));
+        assert_eq!(sqldb.max_lifetime_ms, Some(60000));
     }
 
     #[test]
@@ -525,17 +673,215 @@ max_lifetime_ms = 120000
         )
         .expect("parse knowdb with mysql provider");
 
-        let provider = conf.provider.expect("provider");
-        assert!(matches!(provider.kind, ProviderKind::Mysql));
+        let sqldb = conf
+            .provider()
+            .expect("provider")
+            .sqldb
+            .expect("sqldb provider");
+        assert!(matches!(sqldb.kind, SqlProviderKind::Mysql));
         assert_eq!(
-            provider.connection_uri,
+            sqldb.connection_uri,
             "mysql://demo:demo@127.0.0.1:3306/demo"
         );
-        assert_eq!(provider.pool_size, Some(12));
-        assert_eq!(provider.min_connections, Some(3));
-        assert_eq!(provider.acquire_timeout_ms, Some(2500));
-        assert_eq!(provider.idle_timeout_ms, Some(45000));
-        assert_eq!(provider.max_lifetime_ms, Some(120000));
+        assert_eq!(sqldb.pool_size, Some(12));
+        assert_eq!(sqldb.min_connections, Some(3));
+        assert_eq!(sqldb.acquire_timeout_ms, Some(2500));
+        assert_eq!(sqldb.idle_timeout_ms, Some(45000));
+        assert_eq!(sqldb.max_lifetime_ms, Some(120000));
+    }
+
+    #[test]
+    fn parse_new_style_sqldb_provider() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.sqldb]
+kind = "postgres"
+connection_uri = "postgres://demo:demo@127.0.0.1/demo"
+pool_size = 12
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with sqldb provider");
+
+        let sqldb = conf
+            .provider()
+            .expect("provider")
+            .sqldb
+            .expect("sqldb provider");
+        assert!(matches!(sqldb.kind, SqlProviderKind::Postgres));
+        assert_eq!(sqldb.pool_size, Some(12));
+    }
+
+    #[test]
+    fn parse_new_style_redis_provider() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.redis]
+connection_uri = "redis://127.0.0.1:6379"
+pool_size = 16
+connect_timeout_ms = 5000
+command_timeout_ms = 200
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with redis provider");
+
+        let redis_cfg = conf
+            .provider()
+            .expect("provider")
+            .redis
+            .expect("redis provider");
+        assert_eq!(redis_cfg.connection_uri, "redis://127.0.0.1:6379");
+        assert_eq!(redis_cfg.pool_size, Some(16));
+        assert_eq!(redis_cfg.connect_timeout_ms, 5000);
+        assert_eq!(redis_cfg.command_timeout_ms, 200);
+    }
+
+    #[test]
+    fn parse_redis_provider_with_default_timeouts() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.redis]
+connection_uri = "redis://127.0.0.1:6379"
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with redis provider (no timeout fields)");
+
+        let redis_cfg = conf.provider().expect("provider").redis.expect("redis");
+        assert_eq!(redis_cfg.connect_timeout_ms, 3000);
+        assert_eq!(redis_cfg.command_timeout_ms, 100);
+    }
+
+    #[test]
+    fn parse_both_sqldb_and_redis_providers() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.sqldb]
+kind = "postgres"
+connection_uri = "postgres://demo:demo@127.0.0.1/demo"
+
+[provider.redis]
+connection_uri = "redis://10.0.0.1:6379"
+pool_size = 4
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with both sqldb and redis");
+
+        let provider_cfg = conf.provider().expect("provider");
+        let sqldb = provider_cfg.sqldb.expect("sqldb");
+        let redis_cfg = provider_cfg.redis.expect("redis");
+        assert!(matches!(sqldb.kind, SqlProviderKind::Postgres));
+        assert_eq!(redis_cfg.connection_uri, "redis://10.0.0.1:6379");
+        assert_eq!(redis_cfg.pool_size, Some(4));
+    }
+
+    #[test]
+    fn parse_redis_only_without_sqldb() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.redis]
+connection_uri = "redis://127.0.0.1:6379"
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with redis only");
+
+        let provider_cfg = conf.provider().expect("provider");
+        assert!(provider_cfg.sqldb.is_none());
+        assert!(provider_cfg.redis.is_some());
+    }
+
+    #[test]
+    fn parse_no_provider_section() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+"#,
+            &dict,
+        )
+        .expect("parse knowdb without provider");
+
+        assert!(conf.provider().is_none());
+    }
+
+    #[test]
+    fn old_format_redis_backward_compat() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider]
+kind = "redis"
+connection_uri = "redis://old-format:6379"
+pool_size = 32
+"#,
+            &dict,
+        )
+        .expect("parse old-format redis provider");
+
+        let redis_cfg = conf.provider().expect("provider").redis.expect("redis");
+        assert_eq!(redis_cfg.connection_uri, "redis://old-format:6379");
+        assert_eq!(redis_cfg.pool_size, Some(32));
+    }
+
+    #[test]
+    fn old_format_sqlite_authority_produces_empty_provider() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider]
+kind = "sqlite_authority"
+connection_uri = "file:authority.sqlite"
+"#,
+            &dict,
+        )
+        .expect("parse old-format sqlite_authority provider");
+
+        let provider_cfg = conf.provider().expect("provider");
+        assert!(provider_cfg.sqldb.is_none());
+        assert!(provider_cfg.redis.is_none());
+    }
+
+    #[test]
+    fn new_style_sqldb_mysql_variant() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.sqldb]
+kind = "mysql"
+connection_uri = "mysql://user:pass@127.0.0.1:3306/db"
+pool_size = 8
+"#,
+            &dict,
+        )
+        .expect("parse new-style mysql sqldb");
+
+        let sqldb = conf.provider().expect("provider").sqldb.expect("sqldb");
+        assert!(matches!(sqldb.kind, SqlProviderKind::Mysql));
+        assert_eq!(sqldb.pool_size, Some(8));
     }
 
     #[test]

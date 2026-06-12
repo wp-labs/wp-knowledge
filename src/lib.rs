@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod mem;
+mod redis;
 pub use crate::mem::DBQuery;
 pub use crate::mem::memdb::MDBEnum;
 pub mod cache_util;

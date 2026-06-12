@@ -31,6 +31,7 @@ impl DatasourceId {
             ProviderKind::SqliteAuthority => "sqlite",
             ProviderKind::Postgres => "postgres",
             ProviderKind::Mysql => "mysql",
+            ProviderKind::Redis => "redis",
         };
         Self(format!("{kind_str}:{:016x}", hasher.finish()))
     }
