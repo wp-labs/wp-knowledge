@@ -37,7 +37,7 @@ lru = "0.16"
 async-trait = "0.1"
 futures = "0.3"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio-rustls", "mysql", "postgres", "chrono", "json", "bigdecimal", "uuid", "ipnet"] }
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 
 [dev-dependencies]
