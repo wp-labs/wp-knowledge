@@ -22,8 +22,8 @@ use crate::mysql::{MySqlProvider, MySqlProviderConfig};
 use crate::param::named_params_to_fields;
 use crate::postgres::{PostgresProvider, PostgresProviderConfig};
 use crate::runtime::{
-    CachePolicy, DatasourceId, Generation, MetadataCacheScope, ProviderExecutor, QueryRequest,
-    QueryResponse, RuntimeSnapshot, runtime,
+    CachePolicy, CachedRedisValue, DatasourceId, Generation, MetadataCacheScope, ProviderExecutor,
+    QueryRequest, QueryResponse, RedisCacheKey, RedisCmdTag, RuntimeSnapshot, runtime,
 };
 use crate::telemetry::{
     CacheLayer, CacheOutcome, CacheTelemetryEvent, KnowledgeTelemetry, install_telemetry,
@@ -254,50 +254,114 @@ pub fn init_mysql_provider_with_config(config: MySqlProviderConfig) -> Knowledge
 // Redis provider API
 // ---------------------------------------------------------------------------
 
-/// Initialize a Redis provider.
+/// Check whether an item exists in a Bloom filter.
 ///
-/// `name`: logical provider name (e.g. `"password_check"`).
-/// `url`: Redis connection URL (`redis://127.0.0.1:6379` or `rediss://...`).
-/// `pool_size`: optional hint (default 8); the `ConnectionManager` handles
-/// multiplexing internally.
-///
-/// Multiple names sharing the same URL reuse the same `ConnectionManager`.
-pub fn init_redis_provider(name: &str, url: &str, pool_size: Option<usize>) -> KnowledgeResult<()> {
-    crate::redis::init(name, url, pool_size)
+/// Returns `true` if the item *may* exist, `false` if it definitely does not.
+/// Requires the RedisBloom module.
+pub fn redis_bf_exists(key: &str, item: &str) -> KnowledgeResult<bool> {
+    if let Some(generation) = current_generation() {
+        let ck = redis_cache_key(RedisCmdTag::BfExists, generation, key, &[item]);
+        if let Some(CachedRedisValue::Bool(v)) = runtime().redis_cache_get(&ck, key) {
+            return Ok(v);
+        }
+        let result = crate::redis::bf_exists("knowdb", key, item)?;
+        runtime().redis_cache_put(ck, key, CachedRedisValue::Bool(result));
+        return Ok(result);
+    }
+    crate::redis::bf_exists("knowdb", key, item)
 }
 
-/// Execute a Redis command and return the result as a `String`.
+/// Get the value of a hash field.
 ///
-/// Supported commands: `GET`, `HGET`, `BF.EXISTS`, `SISMEMBER` (P0),
-/// `BF.MADD`, `BF.RESERVE` (P1).
-///
-/// `nil` responses are returned as empty strings.
-pub fn redis_exec(name: &str, cmd: &str, key: &str, args: &[&str]) -> KnowledgeResult<String> {
-    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    crate::redis::exec_blocking(name, cmd, key, &owned)
+/// Returns `None` when the key or field does not exist.
+pub fn redis_hget(key: &str, field: &str) -> KnowledgeResult<Option<String>> {
+    if let Some(generation) = current_generation() {
+        let ck = redis_cache_key(RedisCmdTag::HGet, generation, key, &[field]);
+        if let Some(CachedRedisValue::OptString(ref v)) = runtime().redis_cache_get(&ck, key) {
+            return Ok(v.clone());
+        }
+        let result = crate::redis::hget("knowdb", key, field)?;
+        runtime().redis_cache_put(ck, key, CachedRedisValue::OptString(result.clone()));
+        return Ok(result);
+    }
+    crate::redis::hget("knowdb", key, field)
 }
 
-/// Async variant of [`redis_exec`].
-pub async fn redis_exec_async(
-    name: &str,
-    cmd: &str,
-    key: &str,
-    args: &[String],
-) -> KnowledgeResult<String> {
-    crate::redis::exec_async(name, cmd, key, args).await
-}
-
-/// Ping a Redis provider. Returns `true` if `PONG` is received.
-pub fn redis_ping(name: &str) -> KnowledgeResult<bool> {
-    crate::redis::ping_blocking(name)
-}
-
-/// Close one or all Redis providers.
+/// Get the value of a key.
 ///
-/// `None` closes all providers; `Some(name)` closes only the named provider.
-/// If the underlying pool is shared with other names it is kept alive.
-pub fn redis_close(name: Option<&str>) -> KnowledgeResult<()> {
-    crate::redis::close(name)
+/// Returns `None` when the key does not exist.
+pub fn redis_get(key: &str) -> KnowledgeResult<Option<String>> {
+    if let Some(generation) = current_generation() {
+        let ck = redis_cache_key(RedisCmdTag::Get, generation, key, &[]);
+        if let Some(CachedRedisValue::OptString(ref v)) = runtime().redis_cache_get(&ck, key) {
+            return Ok(v.clone());
+        }
+        let result = crate::redis::get("knowdb", key)?;
+        runtime().redis_cache_put(ck, key, CachedRedisValue::OptString(result.clone()));
+        return Ok(result);
+    }
+    crate::redis::get("knowdb", key)
+}
+
+/// Check whether a member exists in a set.
+pub fn redis_set_exists(key: &str, member: &str) -> KnowledgeResult<bool> {
+    if let Some(generation) = current_generation() {
+        let ck = redis_cache_key(RedisCmdTag::SetExists, generation, key, &[member]);
+        if let Some(CachedRedisValue::Bool(v)) = runtime().redis_cache_get(&ck, key) {
+            return Ok(v);
+        }
+        let result = crate::redis::set_exists("knowdb", key, member)?;
+        runtime().redis_cache_put(ck, key, CachedRedisValue::Bool(result));
+        return Ok(result);
+    }
+    crate::redis::set_exists("knowdb", key, member)
+}
+
+/// Add items to a Bloom filter.
+///
+/// Returns a `Vec<bool>` indicating whether each item was *new* to the filter.
+/// Requires the RedisBloom module.
+pub fn redis_bf_add(key: &str, items: &[&str]) -> KnowledgeResult<Vec<bool>> {
+    let owned: Vec<String> = items.iter().map(|s| s.to_string()).collect();
+    crate::redis::bf_madd("knowdb", key, &owned)
+}
+
+/// Create a new Bloom filter.
+///
+/// `error_rate`: desired false positive rate (e.g. `0.01` for 1%).
+/// `capacity`: expected number of items to add.
+/// Requires the RedisBloom module.
+pub fn redis_bf_create(key: &str, error_rate: f64, capacity: i64) -> KnowledgeResult<()> {
+    crate::redis::bf_reserve("knowdb", key, error_rate, capacity)
+}
+
+#[allow(dead_code)]
+pub(crate) fn redis_ping() -> KnowledgeResult<bool> {
+    crate::redis::ping_blocking("knowdb")
+}
+
+#[allow(dead_code)]
+pub(crate) fn redis_close() -> KnowledgeResult<()> {
+    crate::redis::close(Some("knowdb"))
+}
+
+fn redis_cache_key(cmd: RedisCmdTag, generation: u64, key: &str, args: &[&str]) -> RedisCacheKey {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    let key_hash = hasher.finish();
+    let mut hasher = DefaultHasher::new();
+    for arg in args {
+        arg.hash(&mut hasher);
+    }
+    let args_hash = hasher.finish();
+    RedisCacheKey {
+        generation,
+        cmd_tag: cmd,
+        key_hash,
+        args_hash,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +682,11 @@ pub fn init_thread_cloned_from_knowdb(
                 redis_cfg.pool_size,
                 redis_cfg.command_timeout_ms,
             )?;
+            runtime().configure_redis_cache(
+                conf.cache.enabled,
+                conf.cache.capacity,
+                conf.cache.redis_key_map(),
+            );
             return Ok(());
         }
     }
@@ -996,7 +1065,7 @@ enabled = {enabled}
 capacity = {capacity}
 ttl_ms = {ttl_ms}
 
-[provider]
+[provider.sqldb]
 kind = "{provider_kind}"
 connection_uri = "{connection_uri}"
 "#

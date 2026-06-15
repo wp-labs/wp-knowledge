@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
@@ -230,6 +231,32 @@ struct CachedQueryResponse {
     cached_at: Instant,
 }
 
+// ---------------------------------------------------------------------------
+// Redis result cache types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RedisCmdTag {
+    BfExists,
+    HGet,
+    Get,
+    SetExists,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RedisCacheKey {
+    pub generation: u64,
+    pub cmd_tag: RedisCmdTag,
+    pub key_hash: u64,
+    pub args_hash: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum CachedRedisValue {
+    Bool(bool),
+    OptString(Option<String>),
+}
+
 pub struct KnowledgeRuntime {
     provider: RwLock<Option<Arc<ProviderHandle>>>,
     next_generation: AtomicU64,
@@ -247,6 +274,11 @@ pub struct KnowledgeRuntime {
     local_cache_misses: AtomicU64,
     reload_successes: AtomicU64,
     reload_failures: AtomicU64,
+    redis_cache: RwLock<LruCache<RedisCacheKey, CachedRedisValue>>,
+    redis_cache_hits: AtomicU64,
+    redis_cache_misses: AtomicU64,
+    redis_global_enabled: AtomicBool,
+    redis_enabled_map: RwLock<HashMap<String, bool>>,
 }
 
 impl KnowledgeRuntime {
@@ -273,6 +305,11 @@ impl KnowledgeRuntime {
             local_cache_misses: AtomicU64::new(0),
             reload_successes: AtomicU64::new(0),
             reload_failures: AtomicU64::new(0),
+            redis_cache: RwLock::new(LruCache::new(capacity)),
+            redis_cache_hits: AtomicU64::new(0),
+            redis_cache_misses: AtomicU64::new(0),
+            redis_global_enabled: AtomicBool::new(true),
+            redis_enabled_map: RwLock::new(HashMap::new()),
         }
     }
 
@@ -391,6 +428,25 @@ impl KnowledgeRuntime {
                 NonZeroUsize::new(new_config.capacity).expect("non-zero result cache capacity"),
             );
         }
+    }
+
+    pub fn configure_redis_cache(
+        &self,
+        global_enabled: bool,
+        capacity: usize,
+        key_enabled_map: HashMap<String, bool>,
+    ) {
+        let new_capacity =
+            NonZeroUsize::new(capacity.max(1)).expect("non-zero redis cache capacity");
+        if let Ok(mut cache) = self.redis_cache.write() {
+            *cache = LruCache::new(new_capacity);
+        }
+        *self
+            .redis_enabled_map
+            .write()
+            .expect("redis enabled map lock poisoned") = key_enabled_map;
+        self.redis_global_enabled
+            .store(global_enabled, Ordering::Relaxed);
     }
 
     pub fn current_generation(&self) -> Option<Generation> {
@@ -958,6 +1014,87 @@ impl KnowledgeRuntime {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Redis result cache
+    // -----------------------------------------------------------------------
+
+    fn redis_cache_enabled(&self) -> bool {
+        self.result_cache_enabled.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    fn redis_cache_ttl(&self) -> Duration {
+        Duration::from_millis(self.result_cache_ttl_ms.load(Ordering::Acquire))
+    }
+
+    fn fetch_redis_cache(&self, key: &RedisCacheKey) -> Option<CachedRedisValue> {
+        if !self.redis_cache_enabled() {
+            return None;
+        }
+        let cached = self
+            .redis_cache
+            .read()
+            .ok()
+            .and_then(|cache| cache.peek(key).cloned())?;
+        Some(cached)
+    }
+
+    fn save_redis_cache(&self, key: RedisCacheKey, value: CachedRedisValue) {
+        if !self.redis_cache_enabled() {
+            return;
+        }
+        if let Ok(mut cache) = self.redis_cache.write() {
+            cache.put(key, value);
+        }
+    }
+
+    pub(crate) fn redis_cache_get(
+        &self,
+        ck: &RedisCacheKey,
+        redis_key: &str,
+    ) -> Option<CachedRedisValue> {
+        // Check per-key enabled flag
+        let enabled = self
+            .redis_enabled_map
+            .read()
+            .ok()
+            .and_then(|map| map.get(redis_key).copied())
+            .unwrap_or(self.redis_global_enabled.load(Ordering::Relaxed));
+        if !enabled {
+            return None;
+        }
+        let value = self.fetch_redis_cache(ck)?;
+        self.redis_cache_hits.fetch_add(1, Ordering::Relaxed);
+        Some(value)
+    }
+
+    pub(crate) fn redis_cache_put(
+        &self,
+        ck: RedisCacheKey,
+        redis_key: &str,
+        value: CachedRedisValue,
+    ) {
+        // Don't store entries for disabled keys
+        let enabled = self
+            .redis_enabled_map
+            .read()
+            .ok()
+            .and_then(|map| map.get(redis_key).copied())
+            .unwrap_or(self.redis_global_enabled.load(Ordering::Relaxed));
+        if !enabled {
+            return;
+        }
+        self.redis_cache_misses.fetch_add(1, Ordering::Relaxed);
+        self.save_redis_cache(ck, value);
+    }
+
+    #[allow(dead_code)]
+    fn clear_redis_cache(&self) {
+        if let Ok(mut cache) = self.redis_cache.write() {
+            cache.clear();
+        }
+    }
+
     #[inline]
     fn result_cache_enabled(&self) -> bool {
         self.result_cache_enabled.load(Ordering::Relaxed)
@@ -1277,5 +1414,131 @@ mod tests {
             .expect("execute old handle")
             .into_row();
         assert_eq!(row[0].to_string(), "chars(old)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Redis cache unit tests
+    // -----------------------------------------------------------------------
+
+    fn redis_ck(cmd: RedisCmdTag, generation: u64, key: &str, args: &[&str]) -> RedisCacheKey {
+        let mut hasher = DefaultHasher::new();
+        key.hash(&mut hasher);
+        let key_hash = hasher.finish();
+        let mut hasher = DefaultHasher::new();
+        for arg in args {
+            arg.hash(&mut hasher);
+        }
+        let args_hash = hasher.finish();
+        RedisCacheKey {
+            generation,
+            cmd_tag: cmd,
+            key_hash,
+            args_hash,
+        }
+    }
+
+    #[test]
+    fn redis_cache_hit_and_miss() {
+        let rt = KnowledgeRuntime::new(64);
+        rt.configure_redis_cache(true, 64, HashMap::new());
+
+        let ck = redis_ck(RedisCmdTag::Get, 1, "user:1", &[]);
+        // First access — miss
+        assert!(rt.redis_cache_get(&ck, "user:1").is_none());
+        // Store
+        rt.redis_cache_put(ck.clone(), "user:1", CachedRedisValue::Bool(true));
+        // Second access — hit
+        let val = rt.redis_cache_get(&ck, "user:1").expect("should hit cache");
+        assert!(matches!(val, CachedRedisValue::Bool(true)));
+    }
+
+    #[test]
+    fn redis_cache_disabled_key_is_not_read() {
+        let rt = KnowledgeRuntime::new(64);
+        let mut key_map = HashMap::new();
+        key_map.insert("volatile".to_string(), false);
+        rt.configure_redis_cache(true, 64, key_map);
+
+        let ck = redis_ck(RedisCmdTag::Get, 1, "volatile", &[]);
+        // Store a value
+        rt.redis_cache_put(ck.clone(), "volatile", CachedRedisValue::Bool(true));
+        // But disabled key should never return it
+        assert!(rt.redis_cache_get(&ck, "volatile").is_none());
+    }
+
+    #[test]
+    fn redis_cache_disabled_key_is_not_stored() {
+        let rt = KnowledgeRuntime::new(64);
+        let mut key_map = HashMap::new();
+        key_map.insert("volatile".to_string(), false);
+        rt.configure_redis_cache(true, 64, key_map);
+
+        let ck = redis_ck(RedisCmdTag::Get, 1, "volatile", &[]);
+        // put for disabled key should be a no-op
+        rt.redis_cache_put(ck.clone(), "volatile", CachedRedisValue::Bool(true));
+        // Even after enabling the key, nothing was stored
+        let mut key_map = HashMap::new();
+        key_map.insert("volatile".to_string(), true);
+        rt.configure_redis_cache(true, 64, key_map);
+        assert!(rt.redis_cache_get(&ck, "volatile").is_none());
+    }
+
+    #[test]
+    fn redis_cache_per_key_override_works_independently() {
+        let rt = KnowledgeRuntime::new(64);
+        let mut key_map = HashMap::new();
+        key_map.insert("disabled_key".to_string(), false);
+        rt.configure_redis_cache(true, 64, key_map);
+
+        let ck_disabled = redis_ck(RedisCmdTag::HGet, 1, "disabled_key", &["f"]);
+        let ck_enabled = redis_ck(RedisCmdTag::HGet, 1, "enabled_key", &["f"]);
+
+        // Store both
+        rt.redis_cache_put(
+            ck_disabled.clone(),
+            "disabled_key",
+            CachedRedisValue::OptString(Some("x".to_string())),
+        );
+        rt.redis_cache_put(
+            ck_enabled.clone(),
+            "enabled_key",
+            CachedRedisValue::OptString(Some("y".to_string())),
+        );
+
+        // Disabled key returns None
+        assert!(rt.redis_cache_get(&ck_disabled, "disabled_key").is_none());
+        // Enabled key returns cached value
+        let val = rt
+            .redis_cache_get(&ck_enabled, "enabled_key")
+            .expect("should hit");
+        assert!(matches!(val, CachedRedisValue::OptString(Some(ref s)) if s == "y"));
+    }
+
+    #[test]
+    fn redis_cache_global_disabled_blocks_all() {
+        let rt = KnowledgeRuntime::new(64);
+        rt.configure_redis_cache(false, 64, HashMap::new());
+
+        let ck = redis_ck(RedisCmdTag::BfExists, 1, "any_key", &["item"]);
+        rt.redis_cache_put(ck.clone(), "any_key", CachedRedisValue::Bool(true));
+        // Global disabled — no reads
+        assert!(rt.redis_cache_get(&ck, "any_key").is_none());
+    }
+
+    #[test]
+    fn redis_cache_generation_isolation() {
+        let rt = KnowledgeRuntime::new(64);
+        rt.configure_redis_cache(true, 64, HashMap::new());
+
+        let ck_gen1 = redis_ck(RedisCmdTag::BfExists, 1, "key", &["item"]);
+        let ck_gen2 = redis_ck(RedisCmdTag::BfExists, 2, "key", &["item"]);
+
+        // Store with generation 1
+        rt.redis_cache_put(ck_gen1.clone(), "key", CachedRedisValue::Bool(false));
+
+        // Same key but generation 2 — miss
+        assert!(rt.redis_cache_get(&ck_gen2, "key").is_none());
+        // Generation 1 — hit
+        assert!(rt.redis_cache_get(&ck_gen1, "key").is_some());
     }
 }

@@ -5,15 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.1]
+
+### Added
+- **Redis 类型化 API**: `redis_bf_exists` / `redis_hget` / `redis_get` / `redis_set_exists` / `redis_bf_add` / `redis_bf_create` 六个语义明确的公开函数，返回值类型化（`bool`、`Option<String>`、`Vec<bool>`），无需手动解析字符串。
+- **Redis 结果缓存**: 四个读函数自动使用进程内 LRU 缓存，复用 `[cache]` 配置，generation 机制自然失效。
+- **Per-key 缓存控制**: `[[cache.redis_key]]` 支持按 Redis key 开关缓存，读写路径均检查。
+- **缓存单元测试**: 6 个 CI-safe 缓存行为测试（hit/miss、disabled key、per-key 隔离、generation 隔离）。
+
+### Changed
+- **Redis API 简化**: 移除 name 参数、魔法命令字符串、通用 `redis_exec`。Provider 名称由内部管理，wfusion 无需感知。
+- **Provider Config 简化**: knowdb.toml 的 `[provider]` 拆分为 `[provider.sqldb]` 和 `[provider.redis]`，旧平铺格式已移除。
+
 ## [0.14.0]
 
 ### Added
 - **Redis Provider**: 新增 Redis 外部数据源支持，适用于弱口令 Bloom filter、威胁情报 IP 查表、白名单排除等高速查表场景。支持 `GET`、`HGET`、`BF.EXISTS`、`SISMEMBER`（P0）以及 `BF.MADD`、`BF.RESERVE`（P1）六种命令。
-- **Redis API**: 新增 `init_redis_provider()`、`redis_exec()`、`redis_exec_async()`、`redis_ping()`、`redis_close()` 公共接口。
 - **Redis Config**: knowdb.toml 新增 `[provider.redis]` 配置段，支持 `connection_uri`、`pool_size`、`connect_timeout_ms`（默认 3000）、`command_timeout_ms`（默认 100）。同一 Redis 实例的多个 provider 自动共享连接。
-
-### Changed
-- **Provider Config**: knowdb.toml 的 `[provider]` 拆分为 `[provider.sqldb]` 和 `[provider.redis]`，各自只包含相关字段。旧平铺格式仍可用，自动转换并输出迁移提示。
 
 ## [0.13.0]
 

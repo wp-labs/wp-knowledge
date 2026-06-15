@@ -10,9 +10,10 @@ use redis::aio::ConnectionManager;
 // Constants
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 100;
 
-/// Supported Redis commands (uppercase).
+#[allow(dead_code)]
 const SUPPORTED_COMMANDS: &[&str] = &[
     "BF.EXISTS",  // P0
     "HGET",       // P0
@@ -81,6 +82,7 @@ impl RedisRegistry {
         })
     }
 
+    #[allow(dead_code)]
     fn remove(&mut self, name: &str) {
         let url = match self.names.remove(name) {
             Some(u) => u,
@@ -92,6 +94,7 @@ impl RedisRegistry {
         }
     }
 
+    #[allow(dead_code)]
     fn remove_all(&mut self) {
         self.names.clear();
         self.pools.clear();
@@ -104,9 +107,38 @@ fn registry() -> &'static Mutex<RedisRegistry> {
 }
 
 // ---------------------------------------------------------------------------
-// Public (crate-internal) API
+// Helpers
 // ---------------------------------------------------------------------------
 
+fn cmd_err(cmd: &str, name: &str, err: redis::RedisError) -> crate::error::KnowledgeError {
+    KnowReason::from_logic()
+        .to_err()
+        .with_detail(format!("redis command '{cmd}' on '{name}' failed: {err}"))
+}
+
+fn timeout_err(cmd: &str, name: &str, timeout: Duration) -> crate::error::KnowledgeError {
+    KnowReason::from_logic().to_err().with_detail(format!(
+        "redis command '{cmd}' on '{name}' timed out after {}ms",
+        timeout.as_millis()
+    ))
+}
+
+/// Resolve pool and clone a ConnectionManager (lock held only briefly).
+fn resolve_pool(name: &str) -> KnowledgeResult<(Duration, ConnectionManager)> {
+    let pool = registry()
+        .lock()
+        .expect("redis registry lock poisoned")
+        .resolve(name)?;
+    let timeout = pool.timeout();
+    let conn = pool.conn.clone();
+    Ok((timeout, conn))
+}
+
+// ---------------------------------------------------------------------------
+// Init
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
 pub(crate) fn init(name: &str, url: &str, pool_size: Option<usize>) -> KnowledgeResult<()> {
     init_with_opts(name, url, pool_size, DEFAULT_COMMAND_TIMEOUT_MS)
 }
@@ -128,7 +160,7 @@ pub(crate) fn init_with_opts(
     // connection pool internally.
     let _ = pool_size;
 
-    // If a pool for this URL already exists, reuse it
+    // Fast path: pool already exists for this URL
     {
         let reg = registry().lock().expect("redis registry lock poisoned");
         if let Some(existing) = reg.pools.get(url) {
@@ -162,9 +194,174 @@ pub(crate) fn init_with_opts(
     });
 
     let mut reg = registry().lock().expect("redis registry lock poisoned");
+    // Re-check: another thread may have registered a pool for this URL while
+    // we were connecting. Use the existing pool if so.
+    let existing = reg.pools.get(url).cloned();
+    if let Some(existing) = existing {
+        return reg.register(name, url, existing);
+    }
     reg.register(name, url, pool)
 }
 
+// ---------------------------------------------------------------------------
+// Typed async commands — facade calls these directly (no String round-trip)
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn bf_exists_async(name: &str, key: &str, item: &str) -> KnowledgeResult<bool> {
+    let (timeout, mut conn) = resolve_pool(name)?;
+    let fut = async {
+        let exists: bool = redis::cmd("BF.EXISTS")
+            .arg(key)
+            .arg(item)
+            .query_async(&mut conn)
+            .await?;
+        Ok::<bool, redis::RedisError>(exists)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(cmd_err("BF.EXISTS", name, e)),
+        Err(_) => Err(timeout_err("BF.EXISTS", name, timeout)),
+    }
+}
+
+pub(crate) async fn hget_async(
+    name: &str,
+    key: &str,
+    field: &str,
+) -> KnowledgeResult<Option<String>> {
+    let (timeout, mut conn) = resolve_pool(name)?;
+    let fut = async {
+        let value: Option<String> = redis::cmd("HGET")
+            .arg(key)
+            .arg(field)
+            .query_async(&mut conn)
+            .await?;
+        Ok::<Option<String>, redis::RedisError>(value)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(cmd_err("HGET", name, e)),
+        Err(_) => Err(timeout_err("HGET", name, timeout)),
+    }
+}
+
+pub(crate) async fn get_async(name: &str, key: &str) -> KnowledgeResult<Option<String>> {
+    let (timeout, mut conn) = resolve_pool(name)?;
+    let fut = async {
+        let value: Option<String> = redis::cmd("GET").arg(key).query_async(&mut conn).await?;
+        Ok::<Option<String>, redis::RedisError>(value)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(cmd_err("GET", name, e)),
+        Err(_) => Err(timeout_err("GET", name, timeout)),
+    }
+}
+
+pub(crate) async fn set_exists_async(name: &str, key: &str, member: &str) -> KnowledgeResult<bool> {
+    let (timeout, mut conn) = resolve_pool(name)?;
+    let fut = async {
+        let is_member: bool = redis::cmd("SISMEMBER")
+            .arg(key)
+            .arg(member)
+            .query_async(&mut conn)
+            .await?;
+        Ok::<bool, redis::RedisError>(is_member)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(cmd_err("SISMEMBER", name, e)),
+        Err(_) => Err(timeout_err("SISMEMBER", name, timeout)),
+    }
+}
+
+pub(crate) async fn bf_madd_async(
+    name: &str,
+    key: &str,
+    items: &[String],
+) -> KnowledgeResult<Vec<bool>> {
+    let (timeout, mut conn) = resolve_pool(name)?;
+    let fut = async {
+        let mut bloom_cmd = redis::cmd("BF.MADD");
+        bloom_cmd.arg(key);
+        for item in items {
+            bloom_cmd.arg(item);
+        }
+        let results: Vec<bool> = bloom_cmd.query_async(&mut conn).await?;
+        Ok::<Vec<bool>, redis::RedisError>(results)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(cmd_err("BF.MADD", name, e)),
+        Err(_) => Err(timeout_err("BF.MADD", name, timeout)),
+    }
+}
+
+pub(crate) async fn bf_reserve_async(
+    name: &str,
+    key: &str,
+    error_rate: f64,
+    capacity: i64,
+) -> KnowledgeResult<()> {
+    let (timeout, mut conn) = resolve_pool(name)?;
+    let fut = async {
+        let _ok: String = redis::cmd("BF.RESERVE")
+            .arg(key)
+            .arg(error_rate)
+            .arg(capacity)
+            .query_async(&mut conn)
+            .await?;
+        Ok::<(), redis::RedisError>(())
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(cmd_err("BF.RESERVE", name, e)),
+        Err(_) => Err(timeout_err("BF.RESERVE", name, timeout)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed blocking wrappers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn bf_exists(name: &str, key: &str, item: &str) -> KnowledgeResult<bool> {
+    block_on(bf_exists_async(name, key, item))
+}
+
+pub(crate) fn hget(name: &str, key: &str, field: &str) -> KnowledgeResult<Option<String>> {
+    block_on(hget_async(name, key, field))
+}
+
+pub(crate) fn get(name: &str, key: &str) -> KnowledgeResult<Option<String>> {
+    block_on(get_async(name, key))
+}
+
+pub(crate) fn set_exists(name: &str, key: &str, member: &str) -> KnowledgeResult<bool> {
+    block_on(set_exists_async(name, key, member))
+}
+
+pub(crate) fn bf_madd(name: &str, key: &str, items: &[String]) -> KnowledgeResult<Vec<bool>> {
+    block_on(bf_madd_async(name, key, items))
+}
+
+pub(crate) fn bf_reserve(
+    name: &str,
+    key: &str,
+    error_rate: f64,
+    capacity: i64,
+) -> KnowledgeResult<()> {
+    block_on(bf_reserve_async(name, key, error_rate, capacity))
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+}
+
+// ---------------------------------------------------------------------------
+// Generic exec (kept for tests; pub(crate))
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
 pub(crate) async fn exec_async(
     name: &str,
     cmd: &str,
@@ -192,23 +389,7 @@ pub(crate) async fn exec_async(
             .with_detail(format!("{cmd} requires at least {min_args} argument(s)")));
     }
 
-    fn redis_err(cmd: &str, name: &str, err: redis::RedisError) -> crate::error::KnowledgeError {
-        KnowReason::from_logic()
-            .to_err()
-            .with_detail(format!("redis command '{cmd}' on '{name}' failed: {err}"))
-    }
-
-    let (timeout, mut conn) = {
-        let pool = registry()
-            .lock()
-            .expect("redis registry lock poisoned")
-            .resolve(name)?;
-        let timeout = pool.timeout();
-        // Clone ConnectionManager before dropping the registry lock (lock is
-        // never held across an await point).
-        let conn = pool.conn.clone();
-        (timeout, conn)
-    };
+    let (timeout, mut conn) = resolve_pool(name)?;
 
     // Wrap the Redis command in a timeout. The async block ensures tokio can
     // cancel the in-flight command when the timeout fires.
@@ -261,15 +442,30 @@ pub(crate) async fn exec_async(
                     bloom_cmd.arg(item);
                 }
                 let results: Vec<bool> = bloom_cmd.query_async(&mut conn).await?;
-                Ok(results
-                    .iter()
-                    .map(|b| if *b { "1" } else { "0" })
-                    .collect::<Vec<_>>()
-                    .join(","))
+                if results.is_empty() {
+                    Ok(String::new())
+                } else {
+                    Ok(results
+                        .iter()
+                        .map(|b| if *b { "1" } else { "0" })
+                        .collect::<Vec<_>>()
+                        .join(","))
+                }
             }
             "BF.RESERVE" => {
-                let error_rate: f64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(0.01);
-                let capacity: i64 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
+                let error_rate: f64 =
+                    args.first().and_then(|s| s.parse().ok()).ok_or_else(|| {
+                        redis::RedisError::from((
+                            redis::ErrorKind::TypeError,
+                            "BF.RESERVE: invalid error_rate",
+                        ))
+                    })?;
+                let capacity: i64 = args.get(1).and_then(|s| s.parse().ok()).ok_or_else(|| {
+                    redis::RedisError::from((
+                        redis::ErrorKind::TypeError,
+                        "BF.RESERVE: invalid capacity",
+                    ))
+                })?;
                 let ok: String = redis::cmd("BF.RESERVE")
                     .arg(key)
                     .arg(error_rate)
@@ -284,56 +480,48 @@ pub(crate) async fn exec_async(
 
     match tokio::time::timeout(timeout, exec_future).await {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => Err(redis_err(cmd, name, e)),
-        Err(_elapsed) => Err(KnowReason::from_logic().to_err().with_detail(format!(
-            "redis command '{cmd}' on '{name}' timed out after {}ms",
-            timeout.as_millis()
-        ))),
+        Ok(Err(e)) => Err(cmd_err(cmd, name, e)),
+        Err(_) => Err(timeout_err(cmd, name, timeout)),
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn exec_blocking(
     name: &str,
     cmd: &str,
     key: &str,
     args: &[String],
 ) -> KnowledgeResult<String> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(exec_async(name, cmd, key, args))
-    })
+    block_on(exec_async(name, cmd, key, args))
 }
 
+// ---------------------------------------------------------------------------
+// Ping / Close (pub(crate))
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
 pub(crate) fn ping_blocking(name: &str) -> KnowledgeResult<bool> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let (timeout, mut conn) = {
-                let pool = registry()
-                    .lock()
-                    .expect("redis registry lock poisoned")
-                    .resolve(name)?;
-                let timeout = pool.timeout();
-                let conn = pool.conn.clone();
-                (timeout, conn)
-            };
+    block_on(async {
+        let (timeout, mut conn) = resolve_pool(name)?;
 
-            let ping_future = async {
-                let result: String = redis::cmd("PING").query_async(&mut conn).await?;
-                Ok::<_, redis::RedisError>(result == "PONG")
-            };
+        let ping_future = async {
+            let result: String = redis::cmd("PING").query_async(&mut conn).await?;
+            Ok::<_, redis::RedisError>(result == "PONG")
+        };
 
-            match tokio::time::timeout(timeout, ping_future).await {
-                Ok(Ok(pong)) => Ok(pong),
-                Ok(Err(e)) => Err(KnowReason::from_logic()
-                    .to_err()
-                    .with_detail(format!("redis ping failed for '{name}': {e}"))),
-                Err(_elapsed) => Err(KnowReason::from_logic()
-                    .to_err()
-                    .with_detail(format!("redis ping timed out for '{name}'"))),
-            }
-        })
+        match tokio::time::timeout(timeout, ping_future).await {
+            Ok(Ok(pong)) => Ok(pong),
+            Ok(Err(e)) => Err(KnowReason::from_logic()
+                .to_err()
+                .with_detail(format!("redis ping failed for '{name}': {e}"))),
+            Err(_elapsed) => Err(KnowReason::from_logic()
+                .to_err()
+                .with_detail(format!("redis ping timed out for '{name}'"))),
+        }
     })
 }
 
+#[allow(dead_code)]
 pub(crate) fn close(name: Option<&str>) -> KnowledgeResult<()> {
     let mut reg = registry().lock().expect("redis registry lock poisoned");
     match name {
@@ -558,6 +746,275 @@ mod tests {
                 "{desc}: expected 'invalid redis url', got: {err}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed blocking API tests (require Redis + WP_REDIS_URL)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_bf_exists_returns_bool() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        // Non-existent key → false
+        let ok = bf_exists(&name, "_wpk_typed_bf_nonexistent", "item1").expect("bf_exists");
+        assert!(!ok);
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_hget_returns_option() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        // Non-existent hash key → None
+        let val = hget(&name, "_wpk_typed_hash_nonexistent", "f1").expect("hget");
+        assert!(val.is_none());
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_get_returns_option() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        // Non-existent key → None
+        let val = get(&name, "_wpk_typed_str_nonexistent").expect("get");
+        assert!(val.is_none());
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_set_exists_returns_bool() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        // Non-existent set key → false
+        let ok = set_exists(&name, "_wpk_typed_set_nonexistent", "m1").expect("set_exists");
+        assert!(!ok);
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_bf_madd_and_exists_roundtrip() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+
+        // First create a Bloom filter
+        bf_reserve(&name, "_wpk_typed_bf_roundtrip", 0.01, 1000).expect("bf_reserve");
+        // Add items
+        let results = bf_madd(
+            &name,
+            "_wpk_typed_bf_roundtrip",
+            &["a".to_string(), "b".to_string()],
+        )
+        .expect("bf_madd");
+        assert_eq!(results.len(), 2);
+        assert!(results[0]); // "a" is new
+        assert!(results[1]); // "b" is new
+        // Check existence
+        assert!(bf_exists(&name, "_wpk_typed_bf_roundtrip", "a").expect("bf_exists a"));
+        assert!(bf_exists(&name, "_wpk_typed_bf_roundtrip", "b").expect("bf_exists b"));
+        assert!(!bf_exists(&name, "_wpk_typed_bf_roundtrip", "c").expect("bf_exists c"));
+
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_bf_add_empty_slice_returns_empty_vec() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        bf_reserve(&name, "_wpk_typed_bf_empty", 0.01, 100).expect("bf_reserve");
+        let results = bf_madd(&name, "_wpk_typed_bf_empty", &[]).expect("bf_madd empty");
+        assert!(results.is_empty());
+        close(Some(&name)).expect("close");
+    }
+
+    // -----------------------------------------------------------------------
+    // Typed async API tests (require Redis + WP_REDIS_URL)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_async_get_returns_option() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        let val = get_async(&name, "_wpk_typed_async_nonexistent")
+            .await
+            .expect("get_async");
+        assert!(val.is_none());
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_async_bf_exists_hits_pool() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        let ok = bf_exists_async(&name, "_wpk_typed_async_bf", "x")
+            .await
+            .expect("bf_exists_async");
+        assert!(!ok);
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_async_hget_hits_pool() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        let val = hget_async(&name, "_wpk_typed_async_h", "f")
+            .await
+            .expect("hget_async");
+        assert!(val.is_none());
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_async_set_exists_hits_pool() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        let ok = set_exists_async(&name, "_wpk_typed_async_s", "m")
+            .await
+            .expect("set_exists_async");
+        assert!(!ok);
+        close(Some(&name)).expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn typed_async_bf_madd_and_reserve() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        bf_reserve_async(&name, "_wpk_async_full", 0.01, 100)
+            .await
+            .expect("bf_reserve_async");
+        let results = bf_madd_async(
+            &name,
+            "_wpk_async_full",
+            &["x".to_string(), "y".to_string()],
+        )
+        .await
+        .expect("bf_madd_async");
+        assert_eq!(results.len(), 2);
+        assert!(results[0]);
+        assert!(results[1]);
+        close(Some(&name)).expect("close");
+    }
+
+    // -----------------------------------------------------------------------
+    // CI-safe tests for typed functions (no Redis needed)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_get_nonexistent_provider_returns_error() {
+        let err = get_async("_nonexistent_typed_", "any_key")
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_bf_exists_nonexistent_provider_returns_error() {
+        let err = bf_exists_async("_nonexistent_typed_", "any_key", "item")
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_hget_nonexistent_provider_returns_error() {
+        let err = hget_async("_nonexistent_typed_", "any_key", "f")
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_set_exists_nonexistent_provider_returns_error() {
+        let err = set_exists_async("_nonexistent_typed_", "any_key", "m")
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_bf_madd_nonexistent_provider_returns_error() {
+        let err = bf_madd_async("_nonexistent_typed_", "any_key", &["item".to_string()])
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_bf_reserve_nonexistent_provider_returns_error() {
+        let err = bf_reserve_async("_nonexistent_typed_", "any_key", 0.01, 100)
+            .await
+            .expect_err("should fail");
+        assert!(err.to_string().contains("not found"));
+    }
+
+    // exec_async BF.RESERVE with non-numeric args tests that the silent
+    // fallback (unwrap_or(0.01)) has been replaced with a proper error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bf_reserve_non_numeric_args_via_exec_async_fails() {
+        let url = match redis_url() {
+            Some(u) => u,
+            None => return,
+        };
+        let name = test_name();
+        init(&name, &url, None).expect("init");
+        let err = exec_async(
+            &name,
+            "BF.RESERVE",
+            "k",
+            &["not_a_number".to_string(), "1000".to_string()],
+        )
+        .await
+        .expect_err("BF.RESERVE with non-numeric error_rate should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid error_rate") || msg.contains("BF.RESERVE"),
+            "expected parse error, got: {msg}"
+        );
+        close(Some(&name)).expect("close");
     }
 
     /// Redis integration tests are opt-in. Set `WP_REDIS_URL` to enable:
