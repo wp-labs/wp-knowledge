@@ -41,76 +41,90 @@ command_timeout_ms = 200
 
 ## API Reference
 
+The `[fun]` section wraps Redis commands as named queries — wfusion only passes service name + arg, without knowing the underlying data structure.
+
+### Configuration
+
+```toml
+[fun.password_check]
+call = "bf_exists"
+key = "weak_passwords"
+
+[fun.threat_actor]
+call = "hget"
+key = "threat_actors"
+
+[fun.ip_whitelist]
+call = "sismember"
+key = "allowed_ips"
+
+[fun.app_config]
+call = "get"
+key = "app_config"
+
+[fun.user_tag]
+call = "get"
+# No key — arg "user:123" → GET user:123
+```
+
+| Field | Required | Default | Description |
+|-------|:---:|:---:|------|
+| `call` | Yes | — | `bf_exists` / `sismember` / `hget` / `get` |
+| `key` | No | — | Redis key. Can be omitted when `call = "get"`, then arg becomes the key |
+| `cache` | No | `true` | `false` bypasses cache for this service |
+| `ttl_ms` | No | none | Cache expiry in milliseconds. When unset, uses generation-based eviction only |
+
+### Invocation
+
 ```rust
-use wp_knowledge::facade::{redis_bf_exists, redis_hget, redis_get, redis_set_exists};
+use wp_knowledge::facade::{external_exists, external_value};
 
-// Bloom filter existence check
-let exists: bool = redis_bf_exists("weak_passwords", "hash_value")?;
+// call = "bf_exists" | "sismember" → bool
+let ok: bool = external_exists("password_check", "abc123")?;
 
-// Hash field query
-let label: Option<String> = redis_hget("ip:1.2.3.4", "label")?;
-match label {
-    Some(v) => { /* hit */ }
-    None => { /* miss */ }
-}
-
-// Simple KV query
-let tag: Option<String> = redis_get("user:123")?;
-
-// Set membership check
-let ok: bool = redis_set_exists("allowed_ips", "10.0.0.1")?;
+// call = "hget" | "get" → Option<String>
+let label: Option<String> = external_value("threat_actor", "1.2.3.4")?;
 ```
 
 | Function | Signature | Returns |
 |----------|-----------|:------:|
-| `redis_bf_exists` | `(key, item)` | `bool` |
-| `redis_hget` | `(key, field)` | `Option<String>` |
-| `redis_get` | `(key)` | `Option<String>` |
-| `redis_set_exists` | `(key, member)` | `bool` |
-| `redis_bf_add` | `(key, items)` | `Vec<bool>` |
-| `redis_bf_create` | `(key, error_rate, capacity)` | `()` |
-
-## Supported Commands
-
-| Function | Underlying Command | Purpose | Returns |
-|----------|-------------------|---------|:------:|
-| `redis_bf_exists` | `BF.EXISTS` | Bloom filter existence check | `bool` |
-| `redis_hget` | `HGET` | Hash field query | `Option<String>` |
-| `redis_get` | `GET` | Simple KV query | `Option<String>` |
-| `redis_set_exists` | `SISMEMBER` | Set membership check | `bool` |
-| `redis_bf_add` | `BF.MADD` | Bloom filter batch add | `Vec<bool>` |
-| `redis_bf_create` | `BF.RESERVE` | Bloom filter creation | `()` |
+| `external_exists` | `(service, arg)` | `bool` |
+| `external_value` | `(service, arg)` | `Option<String>` |
 
 ## Result Cache
 
-The four read functions (`redis_bf_exists`, `redis_hget`, `redis_get`, `redis_set_exists`) automatically use an in-process LRU cache to reduce Redis round-trips.
+`external_exists` and `external_value` reuse the LRU cache built into the underlying Redis read functions.
 
-SQL and Redis share the same `[cache]` configuration:
+### Global Config
+
+SQL and Redis share the same `[cache]`:
 
 ```toml
-[cache]                # shared by SQL + Redis
-enabled = true
-capacity = 1024
-ttl_ms = 30000
-
-[[cache.redis_key]]    # disable cache for specific keys
-key = "volatile_tags"
-enabled = false
+[cache]
+enabled = true        # global toggle (SQL + Redis)
+capacity = 1024       # LRU capacity
+ttl_ms = 30000        # TTL (milliseconds)
 ```
 
-> Keys not listed in `[[cache.redis_key]]` use `[cache].enabled`. No config needed for keys that don't need special treatment.
+### Per Service
 
-| Feature | Description |
-|---------|-------------|
-| Cache Key | `(generation, cmd_tag, key_hash, args_hash)` |
-| Scope | Four read functions |
-| Invalidation | Provider reload increments generation, old entries naturally expire |
-| Per-key control | `[[cache.redis_key]]` overrides; checked in both `redis_cache_get` and `redis_cache_put` |
-| Write bypass | `redis_bf_add`, `redis_bf_create` write directly to Redis |
+Override in `[fun.<name>]`:
+
+```toml
+[fun.password_check]
+call = "bf_exists"
+key = "weak_passwords"
+cache = false          # disable cache for this service
+
+[fun.threat_actor]
+call = "hget"
+key = "threat_actors"
+ttl_ms = 60000         # custom TTL for this service
+```
+
+When not set in `[fun.<name>]`, falls back to `[cache]` defaults.
 
 ## Timeout Control
-
-Two-layer timeout mechanism:
 
 | Timeout Type | Default | Config Field |
 |-------------|:-------:|--------------|
@@ -123,18 +137,11 @@ Command timeout is enforced via `tokio::time::timeout` on each execution.
 
 | Scenario | Error Message Example |
 |----------|----------------------|
-| Provider not found | `redis provider 'xxx' not found` |
-| Invalid URL | `invalid redis url: 'http://...'` |
+| Service not found | `external service 'xxx' not found` |
+| Type mismatch | `external service 'xxx' returns value, not bool` |
+| No [fun] registered | `external: no [fun] definitions registered` |
 | Connection failure | `redis connect failed for 'redis://...'` |
 | Command timeout | `redis command 'HGET' on 'xxx' timed out after 100ms` |
-| Command execution failure | `redis command 'GET' on 'xxx' failed: ...` |
-
-## Dependencies
-
-```toml
-[dependencies]
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
-```
 
 ## Testing
 
@@ -148,29 +155,26 @@ WP_REDIS_URL=redis://127.0.0.1:6379 cargo test -p wp-knowledge -- redis
 
 ### CI-Safe Tests
 
-**Redis integration tests:**
+**fun registry tests:**
 
 | Test | What It Verifies |
 |------|-----------------|
-| `typed_bf_exists_returns_bool` | Typed BF.EXISTS |
-| `typed_hget_returns_option` | Typed HGET |
-| `typed_get_returns_option` | Typed GET |
-| `typed_set_exists_returns_bool` | Typed SISMEMBER |
-| `typed_bf_madd_and_exists_roundtrip` | reserve → madd → exists round-trip |
-| `typed_bf_add_empty_slice_returns_empty_vec` | Empty slice returns `[]` |
-| `typed_async_*` series | Async API verification |
-| `bf_reserve_non_numeric_args_via_exec_async_fails` | Non-numeric args return error |
+| `resolve_service_not_found` | Undefined service error |
+| `resolve_type_mismatch` | Call type mismatch error |
+| `resolve_bool_services` | bf_exists / sismember resolution |
+| `resolve_value_services` | hget / get resolution |
+| `no_key_uses_arg` | Missing key falls back to arg |
 
 **Cache unit tests (no Redis needed):**
 
 | Test | What It Verifies |
 |------|-----------------|
 | `redis_cache_hit_and_miss` | Normal get/put |
-| `redis_cache_disabled_key_is_not_read` | Disabled key returns None |
-| `redis_cache_disabled_key_is_not_stored` | Disabled key is not written |
-| `redis_cache_per_key_override_works_independently` | Per-key isolation |
-| `redis_cache_global_disabled_blocks_all` | Global disable |
+| `redis_cache_global_enabled_access` | Global enable |
+| `redis_cache_global_disabled_blocks_all` | Global disable blocks all reads/writes |
 | `redis_cache_generation_isolation` | Generation isolation |
+| `redis_cache_ttl_expiry` | TTL expiry evicts cache |
+| `redis_cache_no_ttl_never_expires` | Zero TTL means no expiry |
 
 ## wfusion Integration
 
@@ -181,9 +185,9 @@ wf-runtime bootstrap
 
 wf-engine eval
   │
-  └── ExternalCall { service, args }
-        └── wp_knowledge::facade::redis_bf_exists / redis_hget / ...
-             → wfusion side uses Rust native types directly
+  └── external("password_check", hash)
+        └── wp_knowledge::facade::external_exists("password_check", hash)
+             → bool
 ```
 
 wfusion does not directly depend on the `redis` crate; all access goes through `wp_knowledge::facade`.
@@ -191,29 +195,30 @@ wfusion does not directly depend on the `redis` crate; all access goes through `
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│              facade (Public API)                  │
-│  redis_bf_exists / redis_hget / redis_get / ...  │
-│  ├─ cache check (redis_cache_get / redis_cache_put) │
-│  └─ call redis.rs typed functions                 │
-└───────────┬──────────────────────────┬───────────┘
-            │                          │
-    ┌───────▼───────┐          ┌───────▼───────────┐
-    │  runtime.rs   │          │   redis.rs         │
-    │  RedisCache    │          │  RedisRegistry     │
-    │  ├─ get/put    │          │  ├─ names          │
-    │  ├─ per-key    │          │  ├─ pools          │
-    │  ├─ generation │          │  └─ resolve_pool   │
-    │  └─ LruCache   │          └─────────┬──────────┘
-    └───────────────┘                     │
-                              ┌──────────▼──────────┐
-                              │  redis crate (0.25)  │
-                              │  ConnectionManager    │
-                              └──────────────────────┘
+┌─────────────────────────────────────────┐
+│              facade (Public API)         │
+│  external_exists / external_value       │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│           fun.rs (Named Query Registry)  │
+│  FUN_MAP: resolve → bf_exists / hget   │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│           redis.rs (Internal)            │
+│  RedisRegistry / ConnectionManager      │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│         redis crate (0.25)              │
+│    ConnectionManager (multiplexing)      │
+└─────────────────────────────────────────┘
 ```
 
 ## Version History
 
 | Version | Changes |
 |---------|---------|
-| 0.14.0 | Initial release: 6 typed APIs, pool dedup, two-layer timeout, result cache, per-key control |
+| 0.14.1 | Added `[fun]` named queries, `external_exists` / `external_value`, per-service cache + TTL |
+| 0.14.0 | Initial release: pool dedup, two-layer timeout, result cache |

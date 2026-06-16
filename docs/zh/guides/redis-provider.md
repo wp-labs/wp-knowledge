@@ -41,78 +41,90 @@ command_timeout_ms = 200
 
 ## API 参考
 
-配置完成后，通过以下 API 访问 Redis 数据：
+通过 `[fun]` 配置段将 Redis 命令封装为命名查询，wfusion 只需传 service name + arg，不感知底层数据结构。
+
+### 配置
+
+```toml
+[fun.password_check]
+call = "bf_exists"
+key = "weak_passwords"
+
+[fun.threat_actor]
+call = "hget"
+key = "threat_actors"
+
+[fun.ip_whitelist]
+call = "sismember"
+key = "allowed_ips"
+
+[fun.app_config]
+call = "get"
+key = "app_config"
+
+[fun.user_tag]
+call = "get"
+# 无 key，arg = "user:123" → GET user:123
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+|------|:---:|:---:|------|
+| `call` | ✅ | — | `bf_exists` / `sismember` / `hget` / `get` |
+| `key` | ❌ | — | Redis key。`get` 时可省略，arg 作为 key |
+| `cache` | ❌ | `true` | `false` 时该 service 不走缓存 |
+| `ttl_ms` | ❌ | 无 | 缓存过期时间（毫秒）。不设时仅用 generation 失效 |
+
+### 调用
 
 ```rust
-use wp_knowledge::facade::{redis_bf_exists, redis_hget, redis_get, redis_set_exists};
+use wp_knowledge::facade::{external_exists, external_value};
 
-// Bloom filter 存在性检查
-let exists: bool = redis_bf_exists("weak_passwords", "hash_value")?;
+// call = "bf_exists" | "sismember" → bool
+let ok: bool = external_exists("password_check", "abc123")?;
 
-// Hash 字段查询
-let label: Option<String> = redis_hget("ip:1.2.3.4", "label")?;
-match label {
-    Some(v) => { /* 命中 */ }
-    None => { /* 未命中 */ }
-}
-
-// 简单 KV 查询
-let tag: Option<String> = redis_get("user:123")?;
-
-// Set 成员判定
-let ok: bool = redis_set_exists("allowed_ips", "10.0.0.1")?;
+// call = "hget" | "get" → Option<String>
+let label: Option<String> = external_value("threat_actor", "1.2.3.4")?;
 ```
 
 | 函数 | 签名 | 返回值 |
 |------|------|:------:|
-| `redis_bf_exists` | `(key, item)` | `bool` |
-| `redis_hget` | `(key, field)` | `Option<String>` |
-| `redis_get` | `(key)` | `Option<String>` |
-| `redis_set_exists` | `(key, member)` | `bool` |
-| `redis_bf_add` | `(key, items)` | `Vec<bool>` |
-| `redis_bf_create` | `(key, error_rate, capacity)` | `()` |
-
-## 支持的命令
-
-| 函数 | 底层命令 | 用途 | 返回值 |
-|------|----------|------|:------:|
-| `redis_bf_exists` | `BF.EXISTS` | Bloom filter 存在性检查 | `bool` |
-| `redis_hget` | `HGET` | Hash 字段查询 | `Option<String>` |
-| `redis_get` | `GET` | 简单 KV 查询 | `Option<String>` |
-| `redis_set_exists` | `SISMEMBER` | Set 成员判定 | `bool` |
-| `redis_bf_add` | `BF.MADD` | Bloom filter 批量添加 | `Vec<bool>` |
-| `redis_bf_create` | `BF.RESERVE` | Bloom filter 创建 | `()` |
+| `external_exists` | `(service, arg)` | `bool` |
+| `external_value` | `(service, arg)` | `Option<String>` |
 
 ## 结果缓存
 
-四个读函数（`redis_bf_exists`、`redis_hget`、`redis_get`、`redis_set_exists`）自动使用进程内 LRU 缓存，减少 Redis 往返。
+`external_exists` 和 `external_value` 底层复用 Redis 读函数的 LRU 缓存。
 
-SQL 和 Redis 共用 `[cache]` 配置：
+### 全局配置
+
+SQL 和 Redis 共用 `[cache]`：
 
 ```toml
-[cache]                # SQL + Redis 共用
-enabled = true
-capacity = 1024
-ttl_ms = 30000
-
-[[cache.redis_key]]    # 按 key 关闭缓存
-key = "volatile_tags"
-enabled = false
+[cache]
+enabled = true        # 全局开关（SQL + Redis）
+capacity = 1024       # LRU 容量
+ttl_ms = 30000        # TTL（毫秒）
 ```
 
-> `[[cache.redis_key]]` 中未列出的 key 使用 `[cache].enabled`。不需要单独关闭的 key 不用配置。
+### 按 service 控制
 
-| 特性 | 说明 |
-|------|------|
-| 缓存 Key | `(generation, cmd_tag, key_hash, args_hash)` |
-| 生效范围 | 四个读函数 |
-| 失效机制 | provider reload 时 generation 递增，旧 key 自然淘汰 |
-| 按 key 开关 | `[[cache.redis_key]]` 覆盖，`redis_cache_get` / `redis_cache_put` 均检查 |
-| 写函数不缓存 | `redis_bf_add`、`redis_bf_create` 直接写 Redis |
+在 `[fun.<name>]` 中覆盖：
+
+```toml
+[fun.password_check]
+call = "bf_exists"
+key = "weak_passwords"
+cache = false          # 关闭该 service 的缓存
+
+[fun.threat_actor]
+call = "hget"
+key = "threat_actors"
+ttl_ms = 60000         # 该 service 独立 TTL
+```
+
+`[fun.<name>]` 中未配置时使用 `[cache]` 全局默认。
 
 ## 超时控制
-
-双层超时机制：
 
 | 超时类型 | 默认值 | 配置字段 |
 |----------|:------:|----------|
@@ -125,18 +137,11 @@ enabled = false
 
 | 场景 | 错误信息示例 |
 |------|-------------|
-| Provider 未找到 | `redis provider 'xxx' not found` |
-| 无效 URL | `invalid redis url: 'http://...'` |
+| Service 未定义 | `external service 'xxx' not found` |
+| Call 类型不匹配 | `external service 'xxx' returns value, not bool` |
+| 未注册 [fun] | `external: no [fun] definitions registered` |
 | 连接失败 | `redis connect failed for 'redis://...'` |
 | 命令超时 | `redis command 'HGET' on 'xxx' timed out after 100ms` |
-| 命令执行失败 | `redis command 'GET' on 'xxx' failed: ...` |
-
-## 依赖
-
-```toml
-[dependencies]
-redis = { version = "0.25", features = ["tokio-comp", "connection-manager"] }
-```
 
 ## 测试
 
@@ -150,29 +155,26 @@ WP_REDIS_URL=redis://127.0.0.1:6379 cargo test -p wp-knowledge -- redis
 
 ### CI 安全测试
 
-**Redis 集成测试：**
+**fun 注册表测试：**
 
 | 测试 | 验证内容 |
 |------|---------|
-| `typed_bf_exists_returns_bool` | 类型化 BF.EXISTS |
-| `typed_hget_returns_option` | 类型化 HGET |
-| `typed_get_returns_option` | 类型化 GET |
-| `typed_set_exists_returns_bool` | 类型化 SISMEMBER |
-| `typed_bf_madd_and_exists_roundtrip` | reserve → madd → exists 全链路 |
-| `typed_bf_add_empty_slice_returns_empty_vec` | 空 slice 返回 `[]` |
-| `typed_async_*` 系列 | 异步 API 验证 |
-| `bf_reserve_non_numeric_args_via_exec_async_fails` | 非数值参数报错 |
+| `resolve_service_not_found` | 未定义 service 报错 |
+| `resolve_type_mismatch` | call 类型不匹配报错 |
+| `resolve_bool_services` | bf_exists / sismember 解析 |
+| `resolve_value_services` | hget / get 解析 |
+| `no_key_uses_arg` | 无 key 时 arg 作为 key |
 
 **缓存单元测试（无需 Redis）：**
 
 | 测试 | 验证内容 |
 |------|---------|
 | `redis_cache_hit_and_miss` | 正常存取 |
-| `redis_cache_disabled_key_is_not_read` | disabled key 不返回缓存 |
-| `redis_cache_disabled_key_is_not_stored` | disabled key 不写入缓存 |
-| `redis_cache_per_key_override_works_independently` | 按 key 控制互不影响 |
-| `redis_cache_global_disabled_blocks_all` | 全局关闭 |
+| `redis_cache_global_enabled_access` | 全局开关启用 |
+| `redis_cache_global_disabled_blocks_all` | 全局关闭阻止所有读写 |
 | `redis_cache_generation_isolation` | generation 隔离 |
+| `redis_cache_ttl_expiry` | TTL 过期后缓存失效 |
+| `redis_cache_no_ttl_never_expires` | ttl=0 永不过期 |
 
 ## 与 wfusion 集成
 
@@ -183,9 +185,9 @@ wf-runtime bootstrap
 
 wf-engine eval
   │
-  └── ExternalCall { service, args }
-        └── wp_knowledge::facade::redis_bf_exists / redis_hget / ...
-             → wfusion 侧直接使用 Rust 原生类型
+  └── external("password_check", hash)
+        └── wp_knowledge::facade::external_exists("password_check", hash)
+             → bool
 ```
 
 wfusion 不直接依赖 `redis` crate，全部通过 `wp_knowledge::facade` 访问。
@@ -193,29 +195,30 @@ wfusion 不直接依赖 `redis` crate，全部通过 `wp_knowledge::facade` 访�
 ## 架构设计
 
 ```
-┌──────────────────────────────────────────────────┐
-│              facade (公共 API)                    │
-│  redis_bf_exists / redis_hget / redis_get / ...  │
-│  ├─ 缓存检查 (redis_cache_get / redis_cache_put) │
-│  └─ 调用 redis.rs 类型化函数                      │
-└───────────┬──────────────────────────┬───────────┘
-            │                          │
-    ┌───────▼───────┐          ┌───────▼───────────┐
-    │  runtime.rs   │          │   redis.rs         │
-    │  RedisCache    │          │  RedisRegistry     │
-    │  ├─ get/put    │          │  ├─ names          │
-    │  ├─ per-key    │          │  ├─ pools          │
-    │  ├─ generation │          │  └─ resolve_pool   │
-    │  └─ LruCache   │          └─────────┬──────────┘
-    └───────────────┘                     │
-                              ┌──────────▼──────────┐
-                              │  redis crate (0.25)  │
-                              │  ConnectionManager    │
-                              └──────────────────────┘
+┌─────────────────────────────────────────┐
+│              facade (公共 API)           │
+│  external_exists / external_value       │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│           fun.rs (命名查询注册表)        │
+│  FUN_MAP: resolve → bf_exists / hget   │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│           redis.rs (内部实现)            │
+│  RedisRegistry / ConnectionManager      │
+└──────────────────┬──────────────────────┘
+                   │
+┌──────────────────▼──────────────────────┐
+│         redis crate (0.25)              │
+│    ConnectionManager (多路复用)          │
+└─────────────────────────────────────────┘
 ```
 
 ## 版本历史
 
 | 版本 | 变更 |
 |------|------|
-| 0.14.0 | 首次发布：6 种类型化 API、连接池去重、双层超时、结果缓存、per-key 缓存控制 |
+| 0.14.1 | 新增 `[fun]` 命名查询、`external_exists` / `external_value`、per-service 缓存 + TTL |
+| 0.14.0 | 首次发布：连接池去重、双层超时、结果缓存 |

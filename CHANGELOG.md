@@ -5,16 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.2]
+
+### Added
+- **命名查询 `[fun]`**: knowdb.toml 新增 `[fun.<name>]` 配置段，通过 `call` 字段将 Redis 命令封装为命名查询。wfusion 只需传 service name + arg，不感知底层是 Bloom、Hash 还是 Set。
+- **`external_exists` / `external_value` API**: 两个公开函数，分别对应 `bool` 和 `Option<String>` 返回值，调用时自动校验 call 类型。
+- **Per-service 缓存控制**: `[fun.<name>]` 支持 `cache = false` 关闭缓存、`ttl_ms` 设置独立过期时间。
+
+### Changed
+- **缓存配置简化**: 移除 `[[cache.redis_key]]`，per-key 缓存控制统一到 `[fun.<name>]` 的 `cache` / `ttl_ms` 字段。
+- **缓存 TTL**: 新增 `CachedRedisEntry { cached_at, ttl_ms }`，支持 per-entry TTL 过期。ttl_ms=0 时仅用 generation 失效。
+
 ## [0.14.1]
 
 ### Added
-- **Redis 类型化 API**: `redis_bf_exists` / `redis_hget` / `redis_get` / `redis_set_exists` / `redis_bf_add` / `redis_bf_create` 六个语义明确的公开函数，返回值类型化（`bool`、`Option<String>`、`Vec<bool>`），无需手动解析字符串。
+- **Redis 类型化 API**: `redis_bf_exists` / `redis_hget` / `redis_get` / `redis_set_exists` / `redis_bf_add` / `redis_bf_create` 六个函数，返回值类型化（`bool`、`Option<String>`、`Vec<bool>`）。
 - **Redis 结果缓存**: 四个读函数自动使用进程内 LRU 缓存，复用 `[cache]` 配置，generation 机制自然失效。
-- **Per-key 缓存控制**: `[[cache.redis_key]]` 支持按 Redis key 开关缓存，读写路径均检查。
-- **缓存单元测试**: 6 个 CI-safe 缓存行为测试（hit/miss、disabled key、per-key 隔离、generation 隔离）。
+- **缓存单元测试**: CI-safe 缓存行为测试（hit/miss、global disable、generation 隔离）。
 
 ### Changed
-- **Redis API 简化**: 移除 name 参数、魔法命令字符串、通用 `redis_exec`。Provider 名称由内部管理，wfusion 无需感知。
+- **Redis API 简化**: 移除 name 参数、魔法命令字符串、通用 `redis_exec`。Provider 名称由内部管理。
 - **Provider Config 简化**: knowdb.toml 的 `[provider]` 拆分为 `[provider.sqldb]` 和 `[provider.redis]`，旧平铺格式已移除。
 
 ## [0.14.0]

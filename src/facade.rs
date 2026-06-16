@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{
+    collections::HashMap,
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
 };
@@ -261,11 +262,11 @@ pub fn init_mysql_provider_with_config(config: MySqlProviderConfig) -> Knowledge
 pub fn redis_bf_exists(key: &str, item: &str) -> KnowledgeResult<bool> {
     if let Some(generation) = current_generation() {
         let ck = redis_cache_key(RedisCmdTag::BfExists, generation, key, &[item]);
-        if let Some(CachedRedisValue::Bool(v)) = runtime().redis_cache_get(&ck, key) {
+        if let Some(CachedRedisValue::Bool(v)) = runtime().redis_cache_get(&ck) {
             return Ok(v);
         }
         let result = crate::redis::bf_exists("knowdb", key, item)?;
-        runtime().redis_cache_put(ck, key, CachedRedisValue::Bool(result));
+        runtime().redis_cache_put(ck, CachedRedisValue::Bool(result));
         return Ok(result);
     }
     crate::redis::bf_exists("knowdb", key, item)
@@ -277,11 +278,11 @@ pub fn redis_bf_exists(key: &str, item: &str) -> KnowledgeResult<bool> {
 pub fn redis_hget(key: &str, field: &str) -> KnowledgeResult<Option<String>> {
     if let Some(generation) = current_generation() {
         let ck = redis_cache_key(RedisCmdTag::HGet, generation, key, &[field]);
-        if let Some(CachedRedisValue::OptString(ref v)) = runtime().redis_cache_get(&ck, key) {
+        if let Some(CachedRedisValue::OptString(ref v)) = runtime().redis_cache_get(&ck) {
             return Ok(v.clone());
         }
         let result = crate::redis::hget("knowdb", key, field)?;
-        runtime().redis_cache_put(ck, key, CachedRedisValue::OptString(result.clone()));
+        runtime().redis_cache_put(ck, CachedRedisValue::OptString(result.clone()));
         return Ok(result);
     }
     crate::redis::hget("knowdb", key, field)
@@ -293,11 +294,11 @@ pub fn redis_hget(key: &str, field: &str) -> KnowledgeResult<Option<String>> {
 pub fn redis_get(key: &str) -> KnowledgeResult<Option<String>> {
     if let Some(generation) = current_generation() {
         let ck = redis_cache_key(RedisCmdTag::Get, generation, key, &[]);
-        if let Some(CachedRedisValue::OptString(ref v)) = runtime().redis_cache_get(&ck, key) {
+        if let Some(CachedRedisValue::OptString(ref v)) = runtime().redis_cache_get(&ck) {
             return Ok(v.clone());
         }
         let result = crate::redis::get("knowdb", key)?;
-        runtime().redis_cache_put(ck, key, CachedRedisValue::OptString(result.clone()));
+        runtime().redis_cache_put(ck, CachedRedisValue::OptString(result.clone()));
         return Ok(result);
     }
     crate::redis::get("knowdb", key)
@@ -307,11 +308,11 @@ pub fn redis_get(key: &str) -> KnowledgeResult<Option<String>> {
 pub fn redis_set_exists(key: &str, member: &str) -> KnowledgeResult<bool> {
     if let Some(generation) = current_generation() {
         let ck = redis_cache_key(RedisCmdTag::SetExists, generation, key, &[member]);
-        if let Some(CachedRedisValue::Bool(v)) = runtime().redis_cache_get(&ck, key) {
+        if let Some(CachedRedisValue::Bool(v)) = runtime().redis_cache_get(&ck) {
             return Ok(v);
         }
         let result = crate::redis::set_exists("knowdb", key, member)?;
-        runtime().redis_cache_put(ck, key, CachedRedisValue::Bool(result));
+        runtime().redis_cache_put(ck, CachedRedisValue::Bool(result));
         return Ok(result);
     }
     crate::redis::set_exists("knowdb", key, member)
@@ -333,6 +334,63 @@ pub fn redis_bf_add(key: &str, items: &[&str]) -> KnowledgeResult<Vec<bool>> {
 /// Requires the RedisBloom module.
 pub fn redis_bf_create(key: &str, error_rate: f64, capacity: i64) -> KnowledgeResult<()> {
     crate::redis::bf_reserve("knowdb", key, error_rate, capacity)
+}
+
+// ---------------------------------------------------------------------------
+// External call API — named queries from [fun.<name>]
+// ---------------------------------------------------------------------------
+
+/// Register [fun] definitions from knowdb.toml. Called once during init.
+pub(crate) fn register_fun_map(map: HashMap<String, crate::loader::FunSpec>) {
+    crate::fun::register_fun_map(map);
+}
+
+/// Execute a [fun.<name>] named query where returns = "bool".
+pub fn external_exists(service: &str, arg: &str) -> KnowledgeResult<bool> {
+    let spec = crate::fun::resolve_spec(service, true)?;
+    let redis_key = spec.key.as_deref().unwrap_or(arg);
+    if spec.enabled()
+        && let Some(generation) = current_generation()
+    {
+        let ck = redis_cache_key(RedisCmdTag::BfExists, generation, redis_key, &[arg]);
+        if let Some(CachedRedisValue::Bool(v)) = runtime().redis_cache_get(&ck) {
+            return Ok(v);
+        }
+        let result = crate::fun::external_exists(service, arg)?;
+        if let Some(ttl) = spec.ttl_ms {
+            runtime().redis_cache_put_with_ttl(ck, CachedRedisValue::Bool(result), ttl);
+        } else {
+            runtime().redis_cache_put(ck, CachedRedisValue::Bool(result));
+        }
+        return Ok(result);
+    }
+    crate::fun::external_exists(service, arg)
+}
+
+/// Execute a [fun.<name>] named query where returns = "value".
+pub fn external_value(service: &str, arg: &str) -> KnowledgeResult<Option<String>> {
+    let spec = crate::fun::resolve_spec(service, false)?;
+    let redis_key = spec.key.as_deref().unwrap_or(arg);
+    if spec.enabled()
+        && let Some(generation) = current_generation()
+    {
+        let ck = redis_cache_key(RedisCmdTag::Get, generation, redis_key, &[arg]);
+        if let Some(CachedRedisValue::OptString(ref v)) = runtime().redis_cache_get(&ck) {
+            return Ok(v.clone());
+        }
+        let result = crate::fun::external_value(service, arg)?;
+        if let Some(ttl) = spec.ttl_ms {
+            runtime().redis_cache_put_with_ttl(
+                ck,
+                CachedRedisValue::OptString(result.clone()),
+                ttl,
+            );
+        } else {
+            runtime().redis_cache_put(ck, CachedRedisValue::OptString(result.clone()));
+        }
+        return Ok(result);
+    }
+    crate::fun::external_value(service, arg)
 }
 
 #[allow(dead_code)]
@@ -682,11 +740,8 @@ pub fn init_thread_cloned_from_knowdb(
                 redis_cfg.pool_size,
                 redis_cfg.command_timeout_ms,
             )?;
-            runtime().configure_redis_cache(
-                conf.cache.enabled,
-                conf.cache.capacity,
-                conf.cache.redis_key_map(),
-            );
+            runtime().configure_redis_cache(conf.cache.enabled, conf.cache.capacity);
+            register_fun_map(conf.fun.clone());
             return Ok(());
         }
     }

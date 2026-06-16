@@ -1,4 +1,5 @@
 pub mod cache;
+mod fun;
 pub mod mem;
 mod redis;
 pub use crate::mem::DBQuery;

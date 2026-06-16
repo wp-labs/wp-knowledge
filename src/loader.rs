@@ -30,6 +30,10 @@ pub struct KnowDbConf {
     #[serde(default)]
     pub tables: Vec<TableSpec>,
 
+    /// `[fun.<name>]` — external named-query definitions.
+    #[serde(default)]
+    pub fun: HashMap<String, FunSpec>,
+
     /// Raw provider config — `[provider.sqldb]` / `[provider.redis]`.
     #[serde(default, rename = "provider")]
     provider_raw: Option<ProviderConfig>,
@@ -39,17 +43,37 @@ impl KnowDbConf {
     pub fn provider(&self) -> Option<ProviderConfig> {
         self.provider_raw.clone()
     }
+}
 
-    /// Resolve Redis cache config for a given key.
-    /// Per-key overrides (`[[cache.redis_key]]`) take precedence over `[cache].enabled`.
-    pub fn redis_cache_enabled(&self, key: &str) -> bool {
-        if let Some(entry) = self.cache.redis_key_entry(key)
-            && let Some(enabled) = entry.enabled
-        {
-            return enabled;
-        }
-        self.cache.enabled
+// ---------------------------------------------------------------------------
+// Fun (external named query) config
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunSpec {
+    pub call: FunCall,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default = "default_true")]
+    pub cache: bool,
+    #[serde(default)]
+    pub ttl_ms: Option<u64>,
+}
+
+impl FunSpec {
+    /// Derive return type from the call (bf_exists/sismember → bool, hget/get → value).
+    pub fn returns_bool(&self) -> bool {
+        matches!(self.call, FunCall::BfExists | FunCall::Sismember)
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FunCall {
+    BfExists,
+    Sismember,
+    Hget,
+    Get,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,22 +88,6 @@ pub struct CacheSpec {
     pub capacity: usize,
     #[serde(default = "default_result_cache_ttl_ms")]
     pub ttl_ms: u64,
-    /// `[[cache.redis_key]]` — per-key Redis cache overrides.
-    #[serde(default, rename = "redis_key")]
-    pub redis_key: Vec<RedisKeyCacheSpec>,
-}
-
-impl CacheSpec {
-    fn redis_key_entry(&self, key: &str) -> Option<&RedisKeyCacheSpec> {
-        self.redis_key.iter().find(|e| e.key == key)
-    }
-
-    pub fn redis_key_map(&self) -> HashMap<String, bool> {
-        self.redis_key
-            .iter()
-            .filter_map(|e| e.enabled.map(|v| (e.key.clone(), v)))
-            .collect()
-    }
 }
 
 impl Default for CacheSpec {
@@ -88,18 +96,8 @@ impl Default for CacheSpec {
             enabled: default_true(),
             capacity: default_result_cache_capacity(),
             ttl_ms: default_result_cache_ttl_ms(),
-            redis_key: Vec::new(),
         }
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RedisKeyCacheSpec {
-    pub key: String,
-    #[serde(default)]
-    pub enabled: Option<bool>,
-    #[serde(default)]
-    pub capacity: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -776,7 +774,7 @@ capacity = 512
         )
         .expect("parse knowdb with cache");
 
-        assert!(conf.redis_cache_enabled("k"));
+        assert!(conf.cache.enabled);
         assert_eq!(conf.cache.capacity, 512);
     }
 
@@ -792,37 +790,95 @@ version = 2
         .expect("parse knowdb without redis.cache");
 
         // No [cache] → defaults enabled=true, capacity=1024
-        assert!(conf.redis_cache_enabled("k"));
+        assert!(conf.cache.enabled);
         assert_eq!(conf.cache.capacity, 1024);
     }
 
+    // -----------------------------------------------------------------------
+    // Fun (external named query) config tests
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn parse_redis_key_cache_overrides() {
+    fn parse_fun_bool_services() {
         let dict = EnvDict::default();
         let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
             r#"
 version = 2
 
-[cache]
-enabled = true
-capacity = 512
-
-[[cache.redis_key]]
+[fun.password_check]
+call = "bf_exists"
 key = "weak_passwords"
-enabled = false
 
-[[cache.redis_key]]
-key = "black_domains"
+[fun.ip_whitelist]
+call = "sismember"
+key = "allowed_ips"
 "#,
             &dict,
         )
-        .expect("parse knowdb with redis_key");
+        .expect("parse fun bool services");
 
-        // Per-key disabled
-        assert!(!conf.redis_cache_enabled("weak_passwords"));
-        // Not listed → inherits from [cache].enabled
-        assert!(conf.redis_cache_enabled("black_domains"));
-        assert!(conf.redis_cache_enabled("other_key"));
-        assert_eq!(conf.cache.capacity, 512);
+        let pw = conf.fun.get("password_check").expect("password_check");
+        assert_eq!(pw.call, FunCall::BfExists);
+        assert_eq!(pw.key.as_deref(), Some("weak_passwords"));
+        assert!(pw.returns_bool());
+
+        let ip = conf.fun.get("ip_whitelist").expect("ip_whitelist");
+        assert_eq!(ip.call, FunCall::Sismember);
+        assert_eq!(ip.key.as_deref(), Some("allowed_ips"));
+        assert!(ip.returns_bool());
+    }
+
+    #[test]
+    fn parse_fun_value_services() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[fun.threat_actor]
+call = "hget"
+key = "threat_actors"
+cache = true
+ttl_ms = 60000
+
+[fun.user_tag]
+call = "get"
+"#,
+            &dict,
+        )
+        .expect("parse fun value services");
+
+        let ta = conf.fun.get("threat_actor").expect("threat_actor");
+        assert_eq!(ta.call, FunCall::Hget);
+        assert_eq!(ta.key.as_deref(), Some("threat_actors"));
+        assert!(ta.cache);
+        assert_eq!(ta.ttl_ms, Some(60000));
+        assert!(!ta.returns_bool());
+
+        let ut = conf.fun.get("user_tag").expect("user_tag");
+        assert_eq!(ut.call, FunCall::Get);
+        assert!(ut.key.is_none());
+        assert!(ut.cache); // default true
+        assert!(!ut.returns_bool());
+    }
+
+    #[test]
+    fn parse_fun_default_cache() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[fun.app_config]
+call = "get"
+key = "app_config"
+"#,
+            &dict,
+        )
+        .expect("parse fun default cache");
+
+        let spec = conf.fun.get("app_config").expect("app_config");
+        assert!(spec.cache);
+        assert!(spec.ttl_ms.is_none());
     }
 }
