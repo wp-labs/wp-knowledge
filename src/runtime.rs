@@ -1269,6 +1269,10 @@ fn stable_field_params_hash(params: &[DataField]) -> u64 {
                 16u8.hash(&mut hasher);
                 value.0.hash(&mut hasher);
             }
+            Value::BigUint(value) => {
+                17u8.hash(&mut hasher);
+                value.to_string().hash(&mut hasher);
+            }
         }
     }
     hasher.finish()
@@ -1296,6 +1300,8 @@ pub fn fields_to_params(params: &[DataField]) -> Vec<QueryParam> {
                 Value::Email(value) => QueryValue::Text(value.0.to_string()),
                 Value::IdCard(value) => QueryValue::Text(value.0.to_string()),
                 Value::MobilePhone(value) => QueryValue::Text(value.0.to_string()),
+                // 任意精度整数：以十进制文本传递，消费端按数值语义处理
+                Value::BigUint(value) => QueryValue::Text(value.to_string()),
             };
             QueryParam {
                 name: field.get_name().to_string(),
@@ -1385,6 +1391,32 @@ mod tests {
         }
         let roundtrip = params_to_fields(&params);
         assert!(matches!(roundtrip[0].get_value(), Value::Chars(_)));
+    }
+
+    #[test]
+    fn fields_to_params_biguint_is_text() {
+        use num_bigint::BigUint;
+        use std::str::FromStr;
+
+        let fields = [DataField::new(
+            wp_model_core::model::DataType::BigInt,
+            ":ip_num",
+            Value::BigUint(BigUint::from_str("382824323044708348099391746388336347272").unwrap()),
+        )];
+        // 任意精度整数以十进制文本传递
+        let params = fields_to_params(&fields);
+        assert_eq!(params.len(), 1);
+        match &params[0].value {
+            QueryValue::Text(value) => {
+                assert_eq!(value, "382824323044708348099391746388336347272")
+            }
+            other => panic!("unexpected param value: {other:?}"),
+        }
+        // 参数 hash 稳定可重复（缓存键）
+        assert_eq!(
+            stable_field_params_hash(&fields),
+            stable_field_params_hash(&fields)
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

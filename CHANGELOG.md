@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0]
+
+### ⚠️ BREAKING CHANGES
+
+- **Dependency `wp-model-core` 0.8 → 0.9**: upstream added `Value::BigUint` / `DataType::BigInt` variants; version bumped to 0.15.0.  
+  依赖 `wp-model-core` 0.8 → 0.9（上游新增 `Value::BigUint` / `DataType::BigInt` 变体），版本升至 0.15.0。
+
+### Added
+
+- **Arbitrary-precision integer parameters (`Value::BigUint`)**: IPv4/IPv6 统一数值键等超出 `i64` 范围的整数可作为 SQL 参数，无精度损失。  
+  新增任意精度整数参数（`Value::BigUint`）支持，用于 IPv4/IPv6 统一数值键等超出 `i64` 范围的整数场景：
+  - **PostgreSQL**: `Value::BigUint` 绑定为 `BigDecimal`，编码为 `numeric` 参数。  
+    PostgreSQL：绑定为 `BigDecimal`（`numeric` 编码）。
+  - **MySQL**: 绑定为 `BigDecimal`，编码为 `DECIMAL` 参数。  
+    MySQL：绑定为 `BigDecimal`（`DECIMAL` 编码）。
+  - **SQLite**: 以十进制文本绑定，SQLite 数值比较按 affinity 自动转换。  
+    SQLite：以十进制文本绑定，数值比较按 affinity 自动转换。
+  - **缓存/参数序列化**: `stable_field_params_hash` 与 `fields_to_params` 支持 `Value::BigUint`（十进制文本）。  
+    缓存键 hash 与参数序列化支持 `Value::BigUint`（十进制文本）。
+
+### Dependencies
+
+- `wp-model-core`: `0.8` → `0.9`.  
+  `wp-model-core`：`0.8` → `0.9`。
+- Add `num-bigint = "0.4"` for `Value::BigUint` interop.  
+  新增 `num-bigint = "0.4"` 依赖（与 `Value::BigUint` 互操作）。
+
+### Tests
+
+- SQLite `ToSql` BigUint binding round-trip（十进制文本，含 IPv6 统一键 `382824323044708348099391746388336347272`）。
+- `fields_to_params` BigUint → `QueryValue::Text` 与参数 hash 稳定性。
+
+### Fixed
+
+- Clippy `-D warnings`: remove redundant reference in `loader.rs` `format!`.  
+  Clippy 修复：`loader.rs` `format!` 冗余引用。
+
 ## [0.14.1]
 
 ### Added
