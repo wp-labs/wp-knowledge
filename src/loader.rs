@@ -392,7 +392,7 @@ fn load_one_table(
     let clean_sql = if clean_path.exists() {
         replace_table(&read_to_string(&clean_path)?, &t.name)
     } else {
-        format!("DELETE FROM {}", &t.name)
+        format!("DELETE FROM {}", t.name)
     };
 
     // 建表与清理

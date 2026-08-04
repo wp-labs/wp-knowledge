@@ -81,6 +81,8 @@ impl ToSql for SqlNamedParam {
             model::Value::Symbol(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
             model::Value::Time(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
             model::Value::Digit(v) => Ok(ToSqlOutput::Owned(Value::Integer(*v))),
+            // 任意精度整数：超出 i64 范围，以十进制文本绑定；SQLite 数值比较按 affinity 自动转换
+            model::Value::BigUint(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
             model::Value::Hex(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
             model::Value::Float(v) => Ok(ToSqlOutput::Owned(Value::Real(*v))),
             model::Value::IpNet(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
@@ -721,6 +723,26 @@ mod tests {
             db.query_row_params(sql, &p.to_params())?;
             let row = db.query_row("SELECT v FROM p ORDER BY rowid DESC LIMIT 1")?;
             assert!(matches!(row[0].get_value(), model::Value::Chars(_)));
+        }
+        // BigUint -> 十进制文本（超出 i64 范围，SQLite 按 affinity 数值比较）
+        {
+            use num_bigint::BigUint;
+            use std::str::FromStr;
+            let sql = "INSERT INTO p (v) VALUES (:v)";
+            let p = [SqlNamedParam(DataField::new(
+                model::DataType::BigInt,
+                ":v",
+                model::Value::BigUint(
+                    BigUint::from_str("382824323044708348099391746388336347272").unwrap(),
+                ),
+            ))];
+            db.query_row_params(sql, &p.to_params())?;
+            let row = db.query_row("SELECT v FROM p ORDER BY rowid DESC LIMIT 1")?;
+            assert!(matches!(row[0].get_value(), model::Value::Chars(_)));
+            assert_eq!(
+                row[0].get_chars(),
+                Some("382824323044708348099391746388336347272")
+            );
         }
         Ok(())
     }

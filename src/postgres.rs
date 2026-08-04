@@ -3,8 +3,10 @@ use std::future::Future;
 
 use crate::error::{KnowReason, KnowledgeResult};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use num_bigint::{BigInt, Sign};
 use orion_error::conversion::ToStructError;
 use sqlx::postgres::{PgArguments, PgColumn, PgPoolOptions, PgRow, types::Oid};
+use sqlx::types::BigDecimal;
 use sqlx::{Column, Executor, Pool, Postgres, Row, TypeInfo, ValueRef};
 use tokio::runtime::Runtime;
 use wp_model_core::model::{DataField, DataType, Value};
@@ -416,6 +418,11 @@ fn bind_postgres_field<'q>(
     match field.get_value() {
         Value::Bool(value) => query.bind(*value),
         Value::Digit(value) => query.bind(*value),
+        // 任意精度整数：绑定为 PostgreSQL numeric（BigDecimal），无精度损失
+        Value::BigUint(value) => {
+            let dec = BigDecimal::from(BigInt::from_biguint(Sign::Plus, value.clone()));
+            query.bind(dec)
+        }
         Value::Float(value) => query.bind(*value),
         Value::Null | Value::Ignore(_) => query.bind(Option::<String>::None),
         Value::Chars(value) => query.bind(value.to_string()),
