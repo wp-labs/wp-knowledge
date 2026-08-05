@@ -72,6 +72,7 @@ pool_size = 8
 | --- | --- | --- |
 | 目录式 SQLite authority | `version` `base_dir` `[default]` `[csv]` `[cache]` `[[tables]]` | `authority_uri` 不从 `knowdb.toml` 读取 |
 | 外部 PostgreSQL / MySQL | `version` `[provider]` `[cache]` | `base_dir` `[default]` `[csv]` `[[tables]]` |
+| 内网网段知识 `[intranet_nets]` | 两种模式均生效（随 knowdb.toml 解析注入） | — |
 
 ## 关键字段速查
 
@@ -106,6 +107,30 @@ pool_size = 8
   - 目前只支持 `utf-8`
 - `trim`
   - 默认 `true`
+
+### `[intranet_nets]`
+
+内网网段知识配置（供 `intranet_ip` / `access_direct` 判断内/外网）。
+
+- `enabled`
+  - 默认 `true`（提供配置即生效）
+  - 设 `false` 忽略本节，使用内置默认网段
+- `mode`
+  - `add`：外部网段添加到内置默认网段（默认，推荐）
+  - `replace`：外部网段完全替换内置默认网段
+- `nets`
+  - 内网网段列表（CIDR 写法，支持 IPv4 / IPv6）
+  - 示例：`nets = ["172.32.0.0/16"]`
+
+**默认内置网段**：RFC1918（10/8、172.16/12、192.168/16）+ IPv4/IPv6 loopback + IPv6 ULA（fc00::/7）。CGNAT、link-local 等特殊地址默认不判为内网，可按需配置。
+
+**示例**
+```toml
+[intranet_nets]
+enabled = true
+mode = "add"
+nets = ["172.32.0.0/16"]
+```
 
 ### `[cache]`
 

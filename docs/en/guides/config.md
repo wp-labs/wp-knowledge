@@ -72,6 +72,7 @@ Replace `kind = "postgres"` with `kind = "mysql"` and switch the connection URI 
 | --- | --- | --- |
 | Directory-based SQLite authority | `version` `base_dir` `[default]` `[csv]` `[cache]` `[[tables]]` | `authority_uri` is not read from `knowdb.toml` |
 | External PostgreSQL / MySQL | `version` `[provider]` `[cache]` | `base_dir` `[default]` `[csv]` `[[tables]]` |
+| Intranet network knowledge `[intranet_nets]` | effective in both modes (injected on knowdb.toml parse) | — |
 
 ## Key fields
 
@@ -115,6 +116,30 @@ Replace `kind = "postgres"` with `kind = "mysql"` and switch the connection URI 
   - default `1024`, in entries
 - `ttl_ms`
   - default `30000`
+
+### `[intranet_nets]`
+
+Intranet network knowledge config (feeds `intranet_ip` / `access_direct` intranet-side checks).
+
+- `enabled`
+  - default `true` (config takes effect when present)
+  - set `false` to ignore this section and use the built-in default networks
+- `mode`
+  - `add`: append external networks to the built-in defaults (default, recommended)
+  - `replace`: replace the built-in defaults entirely with the external networks
+- `nets`
+  - list of intranet networks (CIDR notation, IPv4 / IPv6)
+  - example: `nets = ["172.32.0.0/16"]`
+
+**Built-in defaults**: RFC1918 (`10/8`, `172.16/12`, `192.168/16`) + IPv4/IPv6 loopback + IPv6 ULA (`fc00::/7`). Special addresses such as CGNAT / link-local are not treated as intranet by default; extend via config.
+
+**Example**
+```toml
+[intranet_nets]
+enabled = true
+mode = "add"
+nets = ["172.32.0.0/16"]
+```
 
 ### `[provider]`
 
