@@ -37,6 +37,10 @@ pub struct KnowDbConf {
     /// Raw provider config — `[provider.sqldb]` / `[provider.redis]`.
     #[serde(default, rename = "provider")]
     provider_raw: Option<ProviderConfig>,
+
+    /// `[intranet_nets]` — 内网网段知识配置
+    #[serde(default)]
+    pub intranet_nets: Option<crate::intranet_nets::IntranetNetsConf>,
 }
 
 impl KnowDbConf {
@@ -341,6 +345,8 @@ pub fn parse_knowdb_conf(
             .to_err()
             .with_detail("unsupported knowdb.version"));
     }
+    // 注入内网网段配置（`[intranet_nets]` 节），供规则引擎消费
+    crate::intranet_nets::set_intranet_nets_conf(conf.intranet_nets.clone());
     let conf_dir = conf_abs.parent().unwrap_or_else(|| Path::new("."));
     let base_dir = join_rel(conf_dir, &conf.base_dir);
     Ok((conf, conf_abs, base_dir))

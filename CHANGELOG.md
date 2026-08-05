@@ -5,10 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.15.1]
+## [0.15.1 Unreleased]
+
+### Added
+- **Intranet network knowledge (`intranet_nets`)**: 新增 `intranet_nets` 模块，统一管理"哪些 IP 段属于内网"的知识。配置直接放在 `knowdb.toml` 的 `[intranet_nets]` 节（随 knowdb.toml 解析自动注入），内置默认网段（RFC1918 + IPv4/IPv6 loopback + IPv6 ULA）+ 外部配置合并（`add` / `replace`）。提供 `is_intranet(ip)` 查询接口（IPv4/IPv6 分桶扫描；IPv4-mapped IPv6 按 IPv4 判定）、`generate_default_intranet_nets_config`（项目初始化生成 knowdb.toml 节）、`check_intranet_nets_config`（从 knowdb.toml 校验节，供 wproj check）。
+  中文：新增 `intranet_nets` 模块，统一管理"哪些 IP 段属于内网"的知识。配置直接放在 `knowdb.toml` 的 `[intranet_nets]` 节（随 knowdb.toml 解析自动注入），内置默认网段（RFC1918 + IPv4/IPv6 loopback + IPv6 ULA）+ 外部配置合并（`add` / `replace`）。提供 `is_intranet(ip)` 查询接口（IPv4/IPv6 分桶扫描；IPv4-mapped IPv6 按 IPv4 判定）、`generate_default_intranet_nets_config`（项目初始化生成 knowdb.toml 节）、`check_intranet_nets_config`（从 knowdb.toml 校验节，供 wproj check）。
 
 ### Changed
 - **Merge v0.14.2 + v0.15.0**: 合并两条已发布版本线（`[fun]` 命名查询 + `Value::BigUint` 任意精度参数），合流版本 `0.15.1`。
+- **Dependencies**: 新增 `ipnet`（IP 网段集合）、`toml`（配置解析）、`once_cell`（全局 Lazy）依赖。
 
 ## [0.15.0]
 
