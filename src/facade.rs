@@ -2,8 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{
-    collections::HashMap,
     collections::hash_map::DefaultHasher,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
 };
 
@@ -15,7 +15,9 @@ use wp_log::{info_ctrl, warn_kdb};
 use wp_model_core::model::DataField;
 
 use crate::cache::CacheAble;
-use crate::loader::{ProviderKind, SqlProviderKind, parse_knowdb_conf};
+use crate::loader::{
+    DEFAULT_SQLDB_NAME, ProviderKind, SqlProviderKind, SqlProviderSpec, parse_knowdb_conf,
+};
 use crate::mem::RowData;
 use crate::mem::memdb::MemDB;
 use crate::mem::thread_clone::ThreadClonedMDB;
@@ -213,8 +215,26 @@ pub fn init_postgres_provider(connection_uri: &str, pool_size: Option<u32>) -> K
 
 pub fn init_postgres_provider_with_config(config: PostgresProviderConfig) -> KnowledgeResult<()> {
     let connection_uri = config.connection_uri().to_string();
-    let datasource_id = datasource_id_for(ProviderKind::Postgres, &connection_uri);
-    install_provider(
+    install_postgres_provider(DEFAULT_SQLDB_NAME, config, &connection_uri, true)
+}
+
+/// 以命名 provider 安装 PostgreSQL 连接（不替换默认 provider）。
+pub fn init_postgres_provider_named(
+    name: &str,
+    config: PostgresProviderConfig,
+) -> KnowledgeResult<()> {
+    install_postgres_provider(name, config, name, false)
+}
+
+fn install_postgres_provider(
+    name: &str,
+    config: PostgresProviderConfig,
+    datasource_seed: &str,
+    is_default: bool,
+) -> KnowledgeResult<()> {
+    let datasource_id = datasource_id_for(ProviderKind::Postgres, datasource_seed);
+    runtime().install_provider_named(
+        name,
         ProviderKind::Postgres,
         datasource_id.clone(),
         |generation| {
@@ -227,7 +247,9 @@ pub fn init_postgres_provider_with_config(config: PostgresProviderConfig) -> Kno
             )?;
             Ok(Arc::new(provider))
         },
-    )
+        is_default,
+    )?;
+    Ok(())
 }
 
 pub fn init_mysql_provider(connection_uri: &str, pool_size: Option<u32>) -> KnowledgeResult<()> {
@@ -238,17 +260,56 @@ pub fn init_mysql_provider(connection_uri: &str, pool_size: Option<u32>) -> Know
 
 pub fn init_mysql_provider_with_config(config: MySqlProviderConfig) -> KnowledgeResult<()> {
     let connection_uri = config.connection_uri().to_string();
-    let datasource_id = datasource_id_for(ProviderKind::Mysql, &connection_uri);
-    install_provider(ProviderKind::Mysql, datasource_id.clone(), |generation| {
-        let provider = MySqlProvider::connect(
-            &config,
-            MetadataCacheScope {
-                datasource_id: datasource_id.clone(),
-                generation,
-            },
-        )?;
-        Ok(Arc::new(provider))
-    })
+    install_mysql_provider(DEFAULT_SQLDB_NAME, config, &connection_uri, true)
+}
+
+/// 以命名 provider 安装 MySQL 连接（不替换默认 provider）。
+pub fn init_mysql_provider_named(name: &str, config: MySqlProviderConfig) -> KnowledgeResult<()> {
+    install_mysql_provider(name, config, name, false)
+}
+
+fn install_mysql_provider(
+    name: &str,
+    config: MySqlProviderConfig,
+    datasource_seed: &str,
+    is_default: bool,
+) -> KnowledgeResult<()> {
+    let datasource_id = datasource_id_for(ProviderKind::Mysql, datasource_seed);
+    runtime().install_provider_named(
+        name,
+        ProviderKind::Mysql,
+        datasource_id.clone(),
+        |generation| {
+            let provider = MySqlProvider::connect(
+                &config,
+                MetadataCacheScope {
+                    datasource_id: datasource_id.clone(),
+                    generation,
+                },
+            )?;
+            Ok(Arc::new(provider))
+        },
+        is_default,
+    )?;
+    Ok(())
+}
+
+fn build_postgres_config(spec: &SqlProviderSpec) -> PostgresProviderConfig {
+    PostgresProviderConfig::new(spec.connection_uri.clone())
+        .with_pool_size(spec.pool_size)
+        .with_min_connections(spec.min_connections)
+        .with_acquire_timeout_ms(spec.acquire_timeout_ms)
+        .with_idle_timeout_ms(spec.idle_timeout_ms)
+        .with_max_lifetime_ms(spec.max_lifetime_ms)
+}
+
+fn build_mysql_config(spec: &SqlProviderSpec) -> MySqlProviderConfig {
+    MySqlProviderConfig::new(spec.connection_uri.clone())
+        .with_pool_size(spec.pool_size)
+        .with_min_connections(spec.min_connections)
+        .with_acquire_timeout_ms(spec.acquire_timeout_ms)
+        .with_idle_timeout_ms(spec.idle_timeout_ms)
+        .with_max_lifetime_ms(spec.max_lifetime_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -440,6 +501,55 @@ pub fn install_runtime_telemetry(
     install_telemetry(telemetry_impl)
 }
 
+pub use crate::sql_route::route_provider_sql;
+
+/// 指定名称的 provider 是否已安装。
+pub fn provider_exists(name: &str) -> bool {
+    runtime().provider_exists(name)
+}
+
+/// 当前已安装的命名 provider 名称列表。
+pub fn provider_names() -> Vec<String> {
+    runtime().provider_names()
+}
+
+/// 对指定命名 provider 执行查询（全部行）。
+pub fn query_for(name: &str, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+    runtime()
+        .execute_for(
+            name,
+            &QueryRequest::many(sql, Vec::new(), CachePolicy::Bypass),
+        )
+        .map(QueryResponse::into_rows)
+}
+
+/// 对指定命名 provider 异步执行查询（全部行）。
+pub async fn query_async_for(name: &str, sql: &str) -> KnowledgeResult<Vec<RowData>> {
+    runtime()
+        .execute_for_async(
+            name,
+            &QueryRequest::many(sql, Vec::new(), CachePolicy::Bypass),
+        )
+        .await
+        .map(QueryResponse::into_rows)
+}
+
+/// 对指定命名 provider 执行首行查询。
+pub fn query_fields_for(name: &str, sql: &str, params: &[DataField]) -> KnowledgeResult<RowData> {
+    runtime().execute_first_row_fields_for(name, sql, params, CachePolicy::Bypass)
+}
+
+/// 对指定命名 provider 异步执行首行查询。
+pub async fn query_fields_for_async(
+    name: &str,
+    sql: &str,
+    params: &[DataField],
+) -> KnowledgeResult<RowData> {
+    runtime()
+        .execute_first_row_fields_for_async(name, sql, params, CachePolicy::Bypass)
+        .await
+}
+
 pub fn query(sql: &str) -> KnowledgeResult<Vec<RowData>> {
     runtime()
         .execute(&QueryRequest::many(sql, Vec::new(), CachePolicy::Bypass))
@@ -516,29 +626,17 @@ pub fn cache_query_fields_with_scope<const N: usize>(
     query_params: &[DataField],
     cache: &mut impl CacheAble<DataField, RowData, N>,
 ) -> RowData {
-    if let Some(generation) = current_generation() {
-        cache.prepare_generation(generation);
+    let generation = current_generation();
+    let provider_kind = runtime().current_provider_kind();
+    if let Some(hit) = local_cache_hit(
+        local_cache_scope,
+        c_params,
+        cache,
+        generation,
+        provider_kind,
+    ) {
+        return hit;
     }
-    if let Some(hit) = cache.fetch_scoped(local_cache_scope, c_params) {
-        runtime().record_local_cache_hit();
-        if telemetry_enabled() {
-            telemetry().on_cache(&CacheTelemetryEvent {
-                layer: CacheLayer::Local,
-                outcome: CacheOutcome::Hit,
-                provider_kind: runtime().current_provider_kind(),
-            });
-        }
-        return hit.clone();
-    }
-    runtime().record_local_cache_miss();
-    if telemetry_enabled() {
-        telemetry().on_cache(&CacheTelemetryEvent {
-            layer: CacheLayer::Local,
-            outcome: CacheOutcome::Miss,
-            provider_kind: runtime().current_provider_kind(),
-        });
-    }
-
     match runtime().execute_first_row_fields(sql, query_params, CachePolicy::UseGlobal) {
         Ok(row) => {
             cache.save_scoped(local_cache_scope, c_params, row.clone());
@@ -549,6 +647,84 @@ pub fn cache_query_fields_with_scope<const N: usize>(
             Vec::new()
         }
     }
+}
+
+/// 本地缓存路由派发：`provider` 为 `Some(name)` 时走命名 provider，`None` 时走默认 provider。
+pub fn cache_query_fields_route<const N: usize>(
+    provider: Option<&str>,
+    sql: &str,
+    local_cache_scope: u64,
+    c_params: &[DataField; N],
+    query_params: &[DataField],
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+) -> RowData {
+    let Some(name) = provider else {
+        return cache_query_fields_with_scope(
+            sql,
+            local_cache_scope,
+            c_params,
+            query_params,
+            cache,
+        );
+    };
+    let handle = match runtime().provider_by_name(name) {
+        Ok(handle) => handle,
+        Err(err) => {
+            warn_kdb!("[kdb] named provider '{name}' unavailable: {}", err);
+            return Vec::new();
+        }
+    };
+    let generation = Some(handle.generation.0);
+    let provider_kind = Some(handle.kind.clone());
+    // provider 粒度 scope：与默认 provider 区分，使本地缓存代际按 provider 独立跟踪，
+    // 混用命名库与默认库时不互相重置。
+    let scope = local_cache_scope ^ stable_hash(name);
+    if let Some(hit) = local_cache_hit(scope, c_params, cache, generation, provider_kind) {
+        return hit;
+    }
+    match runtime().execute_first_row_fields_for(name, sql, query_params, CachePolicy::UseGlobal) {
+        Ok(row) => {
+            cache.save_scoped(scope, c_params, row.clone());
+            row
+        }
+        Err(err) => {
+            warn_kdb!("[kdb] query error: {}", err);
+            Vec::new()
+        }
+    }
+}
+
+/// 本地缓存命中检查（含 generation 准备）与 miss 记录。命中时返回 `Some(hit)`。
+fn local_cache_hit<const N: usize>(
+    local_cache_scope: u64,
+    c_params: &[DataField; N],
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+    generation: Option<u64>,
+    provider_kind: Option<ProviderKind>,
+) -> Option<RowData> {
+    if let Some(generation) = generation {
+        cache.prepare_generation(local_cache_scope, generation);
+    }
+    if let Some(hit) = cache.fetch_scoped(local_cache_scope, c_params) {
+        runtime().record_local_cache_hit();
+        if telemetry_enabled() {
+            telemetry().on_cache(&CacheTelemetryEvent {
+                layer: CacheLayer::Local,
+                outcome: CacheOutcome::Hit,
+                provider_kind,
+            });
+        }
+        return Some(hit.clone());
+    }
+    runtime().record_local_cache_miss();
+    if telemetry_enabled() {
+        telemetry().on_cache(&CacheTelemetryEvent {
+            layer: CacheLayer::Local,
+            outcome: CacheOutcome::Miss,
+            provider_kind,
+        });
+    }
+    None
 }
 
 pub async fn cache_query_fields_async<const N: usize>(
@@ -590,29 +766,17 @@ pub async fn cache_query_fields_async_with_scope<const N: usize, F>(
 where
     F: FnOnce() -> Vec<DataField>,
 {
-    if let Some(generation) = current_generation() {
-        cache.prepare_generation(generation);
+    let generation = current_generation();
+    let provider_kind = runtime().current_provider_kind();
+    if let Some(hit) = local_cache_hit(
+        local_cache_scope,
+        c_params,
+        cache,
+        generation,
+        provider_kind,
+    ) {
+        return hit;
     }
-    if let Some(hit) = cache.fetch_scoped(local_cache_scope, c_params) {
-        runtime().record_local_cache_hit();
-        if telemetry_enabled() {
-            telemetry().on_cache(&CacheTelemetryEvent {
-                layer: CacheLayer::Local,
-                outcome: CacheOutcome::Hit,
-                provider_kind: runtime().current_provider_kind(),
-            });
-        }
-        return hit.clone();
-    }
-    runtime().record_local_cache_miss();
-    if telemetry_enabled() {
-        telemetry().on_cache(&CacheTelemetryEvent {
-            layer: CacheLayer::Local,
-            outcome: CacheOutcome::Miss,
-            provider_kind: runtime().current_provider_kind(),
-        });
-    }
-
     let query_params = build_query_params();
     match runtime()
         .execute_first_row_fields_async(sql, &query_params, CachePolicy::UseGlobal)
@@ -620,6 +784,58 @@ where
     {
         Ok(row) => {
             cache.save_scoped(local_cache_scope, c_params, row.clone());
+            row
+        }
+        Err(err) => {
+            warn_kdb!("[kdb] query error: {}", err);
+            Vec::new()
+        }
+    }
+}
+
+/// 异步本地缓存路由派发：`provider` 为 `Some(name)` 时走命名 provider，`None` 时走默认 provider。
+pub async fn cache_query_fields_route_async<const N: usize, F>(
+    provider: Option<&str>,
+    sql: &str,
+    local_cache_scope: u64,
+    c_params: &[DataField; N],
+    build_query_params: F,
+    cache: &mut impl CacheAble<DataField, RowData, N>,
+) -> RowData
+where
+    F: FnOnce() -> Vec<DataField>,
+{
+    let Some(name) = provider else {
+        return cache_query_fields_async_with_scope(
+            sql,
+            local_cache_scope,
+            c_params,
+            build_query_params,
+            cache,
+        )
+        .await;
+    };
+    let handle = match runtime().provider_by_name(name) {
+        Ok(handle) => handle,
+        Err(err) => {
+            warn_kdb!("[kdb] named provider '{name}' unavailable: {}", err);
+            return Vec::new();
+        }
+    };
+    let generation = Some(handle.generation.0);
+    let provider_kind = Some(handle.kind.clone());
+    // provider 粒度 scope：与默认 provider 区分，本地缓存代际按 provider 独立跟踪。
+    let scope = local_cache_scope ^ stable_hash(name);
+    if let Some(hit) = local_cache_hit(scope, c_params, cache, generation, provider_kind) {
+        return hit;
+    }
+    let query_params = build_query_params();
+    match runtime()
+        .execute_first_row_fields_for_async(name, sql, &query_params, CachePolicy::UseGlobal)
+        .await
+    {
+        Ok(row) => {
+            cache.save_scoped(scope, c_params, row.clone());
             row
         }
         Err(err) => {
@@ -692,44 +908,54 @@ pub fn init_thread_cloned_from_knowdb(
 ) -> KnowledgeResult<()> {
     let (conf, conf_abs, _) = parse_knowdb_conf(root, knowdb_conf, dict)?;
     if let Some(provider_cfg) = conf.provider() {
-        // New-style [provider.sqldb]
-        if let Some(sqldb) = provider_cfg.sqldb {
-            match sqldb.kind {
-                SqlProviderKind::Postgres => {
-                    info_ctrl!("init postgres knowdb provider({}) ", conf_abs.display(),);
-                    init_postgres_provider_with_config(
-                        PostgresProviderConfig::new(sqldb.connection_uri)
-                            .with_pool_size(sqldb.pool_size)
-                            .with_min_connections(sqldb.min_connections)
-                            .with_acquire_timeout_ms(sqldb.acquire_timeout_ms)
-                            .with_idle_timeout_ms(sqldb.idle_timeout_ms)
-                            .with_max_lifetime_ms(sqldb.max_lifetime_ms),
-                    )?;
-                    runtime().configure_result_cache(
-                        conf.cache.enabled,
-                        conf.cache.capacity,
-                        Duration::from_millis(conf.cache.ttl_ms.max(1)),
-                    );
-                    return Ok(());
-                }
-                SqlProviderKind::Mysql => {
-                    info_ctrl!("init mysql knowdb provider({}) ", conf_abs.display(),);
-                    init_mysql_provider_with_config(
-                        MySqlProviderConfig::new(sqldb.connection_uri)
-                            .with_pool_size(sqldb.pool_size)
-                            .with_min_connections(sqldb.min_connections)
-                            .with_acquire_timeout_ms(sqldb.acquire_timeout_ms)
-                            .with_idle_timeout_ms(sqldb.idle_timeout_ms)
-                            .with_max_lifetime_ms(sqldb.max_lifetime_ms),
-                    )?;
-                    runtime().configure_result_cache(
-                        conf.cache.enabled,
-                        conf.cache.capacity,
-                        Duration::from_millis(conf.cache.ttl_ms.max(1)),
-                    );
-                    return Ok(());
+        // New-style [provider.sqldb] / [[provider.sqldb]]
+        if let Some(specs) = provider_cfg.sqldb
+            && !specs.is_empty()
+        {
+            let expected = SqlProviderSpec::validate_specs(&specs)?;
+            // 默认 provider：生效名为 `default`（历史单库）者优先，否则取第一个。
+            let default_name = if expected.contains(DEFAULT_SQLDB_NAME) {
+                DEFAULT_SQLDB_NAME.to_string()
+            } else {
+                specs[0].effective_name().to_string()
+            };
+            // 外部 SQL provider 只读（仅 SELECT），初始化中途失败时允许部分安装：
+            // 已连通的库照常可用、连不上的库不可查询，错误由调用方记录后继续。
+            // 因此不做"先全部建池再统一提交"的事务化处理。
+            for spec in &specs {
+                let name = spec.effective_name().to_string();
+                let is_default = name == default_name;
+                // 无显式 name 的历史单库保留 connection_uri 作为 datasource 种子
+                let seed = match &spec.name {
+                    Some(_) => name.clone(),
+                    None => spec.connection_uri.clone(),
+                };
+                match spec.kind {
+                    SqlProviderKind::Postgres => {
+                        info_ctrl!(
+                            "init postgres knowdb provider({name}:{}) ",
+                            conf_abs.display(),
+                        );
+                        install_postgres_provider(
+                            &name,
+                            build_postgres_config(spec),
+                            &seed,
+                            is_default,
+                        )?;
+                    }
+                    SqlProviderKind::Mysql => {
+                        info_ctrl!("init mysql knowdb provider({name}:{}) ", conf_abs.display(),);
+                        install_mysql_provider(&name, build_mysql_config(spec), &seed, is_default)?;
+                    }
                 }
             }
+            runtime().configure_result_cache(
+                conf.cache.enabled,
+                conf.cache.capacity,
+                Duration::from_millis(conf.cache.ttl_ms.max(1)),
+            );
+            runtime().prune_named_providers_except(&expected);
+            return Ok(());
         }
         // New-style [provider.redis]
         if let Some(redis_cfg) = provider_cfg.redis {
@@ -742,6 +968,8 @@ pub fn init_thread_cloned_from_knowdb(
             )?;
             runtime().configure_redis_cache(conf.cache.enabled, conf.cache.capacity);
             register_fun_map(conf.fun.clone());
+            // redis-only 配置不注册任何 sqldb 命名 provider，清空过期命名注册
+            runtime().prune_named_providers_except(&HashSet::new());
             return Ok(());
         }
     }
@@ -761,6 +989,8 @@ pub fn init_thread_cloned_from_knowdb(
         conf.cache.capacity,
         Duration::from_millis(conf.cache.ttl_ms.max(1)),
     );
+    // 本地 authority 模式：仅保留默认 provider，清理残留的命名 provider
+    runtime().prune_named_providers_except(&HashSet::from([DEFAULT_SQLDB_NAME.to_string()]));
     Ok(())
 }
 
@@ -1709,5 +1939,209 @@ connection_uri = "{connection_uri}"
         assert_eq!(row[0].to_string(), "chars(first)");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // 安装一个命名内存 provider（不替换默认 provider）。
+    fn install_named_mem_provider(name: &str, db: MemDB) {
+        let datasource_id = DatasourceId::from_seed(ProviderKind::SqliteAuthority, name);
+        let ds_for_scope = datasource_id.clone();
+        runtime()
+            .install_provider_named(
+                name,
+                ProviderKind::SqliteAuthority,
+                datasource_id,
+                |generation| {
+                    Ok(Arc::new(MemProvider {
+                        db,
+                        metadata_scope: MetadataCacheScope {
+                            datasource_id: ds_for_scope.clone(),
+                            generation,
+                        },
+                    }))
+                },
+                false,
+            )
+            .expect("install named mem provider");
+    }
+
+    #[test]
+    fn cache_query_fields_route_separates_named_and_default_providers() {
+        let _guard = crate::runtime::runtime_test_guard()
+            .lock()
+            .expect("provider test guard");
+
+        // 默认 provider：route_t.value = 'default'
+        let db_default = MemDB::instance();
+        db_default
+            .execute("CREATE TABLE route_t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create default table");
+        db_default
+            .execute("INSERT INTO route_t (id, value) VALUES (1, 'default')")
+            .expect("seed default");
+        init_mem_provider(db_default).expect("init default provider");
+
+        // 命名 provider "geo"：route_t.value = 'geo'
+        let db_geo = MemDB::instance();
+        db_geo
+            .execute("CREATE TABLE route_t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create geo table");
+        db_geo
+            .execute("INSERT INTO route_t (id, value) VALUES (1, 'geo')")
+            .expect("seed geo");
+        install_named_mem_provider("geo", db_geo);
+
+        let sql = "SELECT value FROM route_t WHERE id=:id";
+        let c_params = [DataField::from_digit("id", 1)];
+        let query_params = [DataField::from_digit(":id", 1)];
+        let mut cache = FieldQueryCache::default();
+
+        let named =
+            cache_query_fields_route(Some("geo"), sql, 0, &c_params, &query_params, &mut cache);
+        assert_eq!(named[0].to_string(), "chars(geo)");
+
+        // 同一 cache 实例切到默认 provider，本地缓存必须按 provider 隔离
+        let default = cache_query_fields_route(None, sql, 0, &c_params, &query_params, &mut cache);
+        assert_eq!(default[0].to_string(), "chars(default)");
+
+        // 再查命名 provider，仍返回 geo
+        let named_again =
+            cache_query_fields_route(Some("geo"), sql, 0, &c_params, &query_params, &mut cache);
+        assert_eq!(named_again[0].to_string(), "chars(geo)");
+    }
+
+    #[test]
+    fn mixed_provider_queries_keep_local_cache_per_provider() {
+        let _guard = crate::runtime::runtime_test_guard()
+            .lock()
+            .expect("provider test guard");
+
+        let db_default = MemDB::instance();
+        db_default
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create default table");
+        db_default
+            .execute("INSERT INTO t (id, value) VALUES (1, 'default')")
+            .expect("seed default");
+        init_mem_provider(db_default).expect("init default provider");
+
+        let db_geo = MemDB::instance();
+        db_geo
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create geo table");
+        db_geo
+            .execute("INSERT INTO t (id, value) VALUES (1, 'geo')")
+            .expect("seed geo");
+        install_named_mem_provider("geo", db_geo);
+
+        let sql = "SELECT value FROM t WHERE id=:id";
+        let c_params = [DataField::from_digit("id", 1)];
+        let query_params = [DataField::from_digit(":id", 1)];
+        let mut cache = FieldQueryCache::default();
+
+        let before = runtime_snapshot();
+        // 1) 命名 provider：miss → 执行
+        let row =
+            cache_query_fields_route(Some("geo"), sql, 0, &c_params, &query_params, &mut cache);
+        assert_eq!(row[0].to_string(), "chars(geo)");
+        // 2) 默认 provider：scope 不同，不应清空 geo 的本地缓存
+        let row = cache_query_fields_route(None, sql, 0, &c_params, &query_params, &mut cache);
+        assert_eq!(row[0].to_string(), "chars(default)");
+        // 3) 再查命名 provider：应命中本地缓存（不重新执行）
+        let row =
+            cache_query_fields_route(Some("geo"), sql, 0, &c_params, &query_params, &mut cache);
+        assert_eq!(row[0].to_string(), "chars(geo)");
+        let after = runtime_snapshot();
+        assert!(
+            after.local_cache_hits > before.local_cache_hits,
+            "命名 provider 二次查询应命中本地缓存（按 provider 隔离代际）"
+        );
+    }
+
+    #[test]
+    fn local_authority_init_prunes_stale_named_providers() {
+        let _guard = crate::runtime::runtime_test_guard()
+            .lock()
+            .expect("provider test guard");
+
+        // 先安装命名 provider，模拟上一份配置的残留
+        let db = MemDB::instance();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create table");
+        db.execute("INSERT INTO t (id, value) VALUES (1, 'x')")
+            .expect("seed table");
+        install_named_mem_provider("geo", db);
+        assert!(provider_exists("geo"));
+
+        // 再用本地 authority 配置初始化 → 应清理 geo，仅保留 default
+        let root = uniq_cache_cfg_tmp_dir();
+        let conf_path = write_minimal_knowdb_with_cache(&root, true, 16, 30_000);
+        let auth_file = root.join(".run").join("authority.sqlite");
+        fs::create_dir_all(auth_file.parent().expect("authority parent"))
+            .expect("create authority parent");
+        let authority_uri = format!("file:{}?mode=rwc&uri=true", auth_file.display());
+
+        init_thread_cloned_from_knowdb(&root, &conf_path, &authority_uri, &EnvDict::default())
+            .expect("init local authority");
+
+        assert!(!provider_exists("geo"));
+        assert!(provider_exists(DEFAULT_SQLDB_NAME));
+
+        restore_default_result_cache_config();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cache_query_fields_route_unknown_provider_returns_empty() {
+        let _guard = crate::runtime::runtime_test_guard()
+            .lock()
+            .expect("provider test guard");
+        let c_params = [DataField::from_digit("id", 1)];
+        let query_params = [DataField::from_digit(":id", 1)];
+        let mut cache = FieldQueryCache::default();
+        let out = cache_query_fields_route(
+            Some("nope"),
+            "SELECT value FROM t WHERE id=:id",
+            0,
+            &c_params,
+            &query_params,
+            &mut cache,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn query_for_named_provider_returns_rows() {
+        let _guard = crate::runtime::runtime_test_guard()
+            .lock()
+            .expect("provider test guard");
+        let db = MemDB::instance();
+        db.execute("CREATE TABLE named_t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create named table");
+        db.execute("INSERT INTO named_t (id, value) VALUES (1, 'named')")
+            .expect("seed named");
+        install_named_mem_provider("geo", db);
+
+        let rows = query_for("geo", "SELECT value FROM named_t WHERE id = 1").expect("query geo");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].to_string(), "chars(named)");
+        assert!(provider_exists("geo"));
+        assert!(!provider_exists("nope"));
+        assert!(provider_names().iter().any(|name| name == "geo"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_async_for_named_provider_works() {
+        let _guard = crate::runtime::runtime_test_guard().lock_async().await;
+        let db = MemDB::instance();
+        db.execute("CREATE TABLE named_t (id INTEGER PRIMARY KEY, value TEXT)")
+            .expect("create named table");
+        db.execute("INSERT INTO named_t (id, value) VALUES (1, 'async-named')")
+            .expect("seed named");
+        install_named_mem_provider("geo", db);
+
+        let rows = query_async_for("geo", "SELECT value FROM named_t WHERE id = 1")
+            .await
+            .expect("query geo");
+        assert_eq!(rows[0][0].to_string(), "chars(async-named)");
     }
 }

@@ -50,6 +50,8 @@ max = 100
 
 ### 外部 PostgreSQL / MySQL
 
+单个数据库：
+
 ```toml
 version = 2
 
@@ -58,7 +60,7 @@ enabled = true
 capacity = 1024
 ttl_ms = 30000
 
-[provider]
+[provider.sqldb]
 kind = "postgres"
 connection_uri = "postgres://user:${DB_PASSWORD}@127.0.0.1:5432/demo"
 pool_size = 8
@@ -66,12 +68,40 @@ pool_size = 8
 
 把 `kind = "postgres"` 换成 `kind = "mysql"`，连接串换成 MySQL 格式即可。
 
+**多个数据库**：用数组形式 `[[provider.sqldb]]`，每个配置一个 `name`：
+
+```toml
+version = 2
+
+[[provider.sqldb]]
+name = "geo"
+kind = "postgres"
+connection_uri = "postgres://user:${GEO_DB_PASSWORD}@127.0.0.1:5432/geo_db"
+pool_size = 8
+
+[[provider.sqldb]]
+name = "asset"
+kind = "postgres"
+connection_uri = "postgres://user:${ASSET_DB_PASSWORD}@127.0.0.1:5432/asset_db"
+pool_size = 8
+```
+
+- 没有写 `name` 的（或单个 `[provider.sqldb]`）生效名为 `default`，作为默认库。
+- 未带前缀的 OML 查询走默认库；带前缀的查询指定具体库：
+
+```oml
+country = select country_name from geo.public.ip_geo_city where ip_num = @ip_num;
+-- 路由到 name="geo" 的库；发往 PostgreSQL 的 SQL 会剥离 geo. 前缀。
+```
+
+- `name` 仅允许 `[A-Za-z0-9_]`；重名会报配置错误。
+
 ## 哪些配置会生效
 
 | 模式 | 会生效 | 不参与主流程 |
 | --- | --- | --- |
 | 目录式 SQLite authority | `version` `base_dir` `[default]` `[csv]` `[cache]` `[[tables]]` | `authority_uri` 不从 `knowdb.toml` 读取 |
-| 外部 PostgreSQL / MySQL | `version` `[provider]` `[cache]` | `base_dir` `[default]` `[csv]` `[[tables]]` |
+| 外部 PostgreSQL / MySQL | `version` `[provider.sqldb]`（或 `[[provider.sqldb]]`） `[cache]` | `base_dir` `[default]` `[csv]` `[[tables]]` |
 | 内网网段知识 `[intranet_nets]` | 两种模式均生效（随 knowdb.toml 解析注入） | — |
 
 ## 关键字段速查
@@ -82,7 +112,7 @@ pool_size = 8
   - 必填，只能是 `2`
 - `base_dir`
   - 表目录根路径，相对 `knowdb.toml` 所在目录解析
-- `[provider]`
+- `[provider.sqldb]` / `[[provider.sqldb]]`
   - 只在外部 provider 模式下使用
 - `[[tables]]`
   - 只在目录式 SQLite authority 模式下使用
@@ -141,8 +171,12 @@ nets = ["172.32.0.0/16"]
 - `ttl_ms`
   - 默认 `30000`
 
-### `[provider]`
+### `[provider.sqldb]`
 
+- `name`
+  - 可选；多库时必须写，用于 OML 查询前缀路由
+  - 未写时生效名为 `default`
+  - 仅允许 `[A-Za-z0-9_]`，重名会报错
 - `kind`
   - 必填，`postgres` 或 `mysql`
 - `connection_uri`
@@ -150,7 +184,7 @@ nets = ["172.32.0.0/16"]
 - `pool_size`
   - 可选，默认 `8`
 
-不要写 `kind = "sqlite_authority"`。目录式模式下直接省略 `[provider]`。
+不要写 `kind = "sqlite_authority"`。目录式模式下直接省略 `[provider.sqldb]`。
 
 ### `[[tables]]`
 
@@ -200,7 +234,7 @@ knowdb/
 - `${VAR}` 会在 TOML 反序列化前展开，例如：
 
 ```toml
-[provider]
+[provider.sqldb]
 kind = "mysql"
 connection_uri = "mysql://root:${MYSQL_PASSWORD}@127.0.0.1:3306/demo"
 ```

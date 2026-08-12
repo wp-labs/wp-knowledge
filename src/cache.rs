@@ -5,6 +5,9 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 use wp_model_core::model::{DataField, FValueStr, Value};
 
+/// 本地缓存去重索引表上限：触顶后整体重置，防止运行期无界增长。
+const MAX_LOCAL_IDX: usize = 100_000;
+
 #[derive(Debug, Clone)]
 pub struct FieldQueryCache {
     str_idx: HashMap<FValueStr, usize>,
@@ -12,7 +15,9 @@ pub struct FieldQueryCache {
     ip_idx: HashMap<IpAddr, usize>,
     cache_data: LruCache<LocalCacheKey, Vec<DataField>>,
     idx_num: usize,
-    generation: Option<u64>,
+    /// `scope -> generation`：本地缓存按 scope（provider 粒度）跟踪代际，
+    /// 避免多 provider 切换时整缓存重置。
+    generations: HashMap<u64, u64>,
 }
 
 pub type QueryLocalCache = FieldQueryCache;
@@ -32,7 +37,7 @@ impl FieldQueryCache {
             ip_idx: HashMap::new(),
             cache_data: LruCache::new(NonZeroUsize::new(size).expect("non-zero cache size")),
             idx_num: 0,
-            generation: None,
+            generations: HashMap::new(),
         }
     }
 
@@ -46,6 +51,15 @@ impl FieldQueryCache {
     }
 
     fn try_up_idx(&mut self, param: &DataField) -> Option<usize> {
+        if self.idx_num >= MAX_LOCAL_IDX {
+            // 索引表触顶：整体重置，防止无界增长（代价是清空一次本地缓存）
+            self.str_idx.clear();
+            self.i64_idx.clear();
+            self.ip_idx.clear();
+            self.cache_data.clear();
+            self.generations.clear();
+            self.idx_num = 0;
+        }
         match param.get_value() {
             Value::Chars(v) => {
                 if let Some(idx) = self.str_idx.get(v) {
@@ -78,12 +92,22 @@ impl FieldQueryCache {
         }
     }
 
-    fn reset(&mut self) {
-        self.str_idx.clear();
-        self.i64_idx.clear();
-        self.ip_idx.clear();
-        self.cache_data.clear();
-        self.idx_num = 0;
+    /// 仅当 scope 的 generation 变化时，清理该 scope 的缓存条目；
+    /// 其它 provider 的本地缓存保留。
+    fn prepare_generation_scoped(&mut self, scope: u64, generation: u64) {
+        if self.generations.get(&scope) == Some(&generation) {
+            return;
+        }
+        self.generations.insert(scope, generation);
+        let stale: Vec<LocalCacheKey> = self
+            .cache_data
+            .iter()
+            .filter(|(key, _)| key.scope_hash == scope)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            self.cache_data.pop(&key);
+        }
     }
 }
 
@@ -104,7 +128,8 @@ struct LocalCacheKey {
 }
 
 pub trait CacheAble<P, T, const N: usize> {
-    fn prepare_generation(&mut self, _generation: u64) {}
+    /// 通知缓存某 scope 进入新 generation（通常因 provider 重载）。实现可只清理该 scope。
+    fn prepare_generation(&mut self, _scope: u64, _generation: u64) {}
     fn save_scoped(&mut self, _scope_hash: u64, params: &[P; N], result: T) {
         self.save(params, result);
     }
@@ -116,11 +141,8 @@ pub trait CacheAble<P, T, const N: usize> {
 }
 
 impl CacheAble<DataField, Vec<DataField>, 1> for FieldQueryCache {
-    fn prepare_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.reset();
-            self.generation = Some(generation);
-        }
+    fn prepare_generation(&mut self, scope: u64, generation: u64) {
+        self.prepare_generation_scoped(scope, generation);
     }
     fn save_scoped(&mut self, scope_hash: u64, params: &[DataField; 1], result: Vec<DataField>) {
         if let Some(i0) = self.try_up_idx(&params[0]) {
@@ -154,11 +176,8 @@ impl CacheAble<DataField, Vec<DataField>, 1> for FieldQueryCache {
 }
 
 impl CacheAble<DataField, Vec<DataField>, 2> for FieldQueryCache {
-    fn prepare_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.reset();
-            self.generation = Some(generation);
-        }
+    fn prepare_generation(&mut self, scope: u64, generation: u64) {
+        self.prepare_generation_scoped(scope, generation);
     }
 
     fn save_scoped(&mut self, scope_hash: u64, params: &[DataField; 2], result: Vec<DataField>) {
@@ -193,11 +212,8 @@ impl CacheAble<DataField, Vec<DataField>, 2> for FieldQueryCache {
 }
 
 impl CacheAble<DataField, Vec<DataField>, 3> for FieldQueryCache {
-    fn prepare_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.reset();
-            self.generation = Some(generation);
-        }
+    fn prepare_generation(&mut self, scope: u64, generation: u64) {
+        self.prepare_generation_scoped(scope, generation);
     }
 
     fn save_scoped(&mut self, scope_hash: u64, params: &[DataField; 3], result: Vec<DataField>) {
@@ -240,11 +256,8 @@ impl CacheAble<DataField, Vec<DataField>, 3> for FieldQueryCache {
 }
 
 impl CacheAble<DataField, Vec<DataField>, 4> for FieldQueryCache {
-    fn prepare_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.reset();
-            self.generation = Some(generation);
-        }
+    fn prepare_generation(&mut self, scope: u64, generation: u64) {
+        self.prepare_generation_scoped(scope, generation);
     }
 
     fn save_scoped(&mut self, scope_hash: u64, params: &[DataField; 4], result: Vec<DataField>) {
@@ -289,11 +302,8 @@ impl CacheAble<DataField, Vec<DataField>, 4> for FieldQueryCache {
 }
 
 impl CacheAble<DataField, Vec<DataField>, 5> for FieldQueryCache {
-    fn prepare_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.reset();
-            self.generation = Some(generation);
-        }
+    fn prepare_generation(&mut self, scope: u64, generation: u64) {
+        self.prepare_generation_scoped(scope, generation);
     }
 
     fn save_scoped(&mut self, scope_hash: u64, params: &[DataField; 5], result: Vec<DataField>) {
@@ -340,11 +350,8 @@ impl CacheAble<DataField, Vec<DataField>, 5> for FieldQueryCache {
 }
 
 impl CacheAble<DataField, Vec<DataField>, 6> for FieldQueryCache {
-    fn prepare_generation(&mut self, generation: u64) {
-        if self.generation != Some(generation) {
-            self.reset();
-            self.generation = Some(generation);
-        }
+    fn prepare_generation(&mut self, scope: u64, generation: u64) {
+        self.prepare_generation_scoped(scope, generation);
     }
 
     fn save_scoped(&mut self, scope_hash: u64, params: &[DataField; 6], result: Vec<DataField>) {

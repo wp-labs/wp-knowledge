@@ -16,6 +16,7 @@ mod pool_config;
 mod postgres;
 mod provider_runtime;
 pub mod runtime;
+pub mod sql_route;
 pub mod sqlite_ext;
 pub mod telemetry;
 

@@ -5,15 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.15.1 Unreleased]
+## [0.16.0 latest]
+
+### ⚠️ BREAKING CHANGES
+- **多 SQL provider 配置格式**: `ProviderConfig.sqldb` 由单个 `Option<SqlProviderSpec>` 改为 `Option<Vec<SqlProviderSpec>>`，同时兼容 `[provider.sqldb]`（单表）与 `[[provider.sqldb]]`（数组）两种 TOML 写法。读取 `conf.provider().sqldb` 的调用方需适配为 `Vec`。
+- **`CacheAble::prepare_generation` 签名变更**: 增加 `scope` 参数（`prepare_generation(scope, generation)`），本地缓存按 provider 粒度跟踪代际；自定义 `CacheAble` 实现需同步更新。
+- **版本升至 0.16.0**: 因配置格式与公共 API 变更（新增 `[[provider.sqldb]]`、命名 provider 注册表、路由 API），版本自 0.15.x 升至 0.16.0。
 
 ### Added
-- **Intranet network knowledge (`intranet_nets`)**: 新增 `intranet_nets` 模块，统一管理"哪些 IP 段属于内网"的知识。配置直接放在 `knowdb.toml` 的 `[intranet_nets]` 节（随 knowdb.toml 解析自动注入），内置默认网段（RFC1918 + IPv4/IPv6 loopback + IPv6 ULA）+ 外部配置合并（`add` / `replace`）。提供 `is_intranet(ip)` 查询接口（IPv4/IPv6 分桶扫描；IPv4-mapped IPv6 按 IPv4 判定）、`generate_default_intranet_nets_config`（项目初始化生成 knowdb.toml 节）、`check_intranet_nets_config`（从 knowdb.toml 校验节，供 wproj check）。
-  中文：新增 `intranet_nets` 模块，统一管理"哪些 IP 段属于内网"的知识。配置直接放在 `knowdb.toml` 的 `[intranet_nets]` 节（随 knowdb.toml 解析自动注入），内置默认网段（RFC1918 + IPv4/IPv6 loopback + IPv6 ULA）+ 外部配置合并（`add` / `replace`）。提供 `is_intranet(ip)` 查询接口（IPv4/IPv6 分桶扫描；IPv4-mapped IPv6 按 IPv4 判定）、`generate_default_intranet_nets_config`（项目初始化生成 knowdb.toml 节）、`check_intranet_nets_config`（从 knowdb.toml 校验节，供 wproj check）。
+- **多 SQL provider 支持（`[[provider.sqldb]]`）**: `knowdb.toml` 支持配置多个 PostgreSQL/MySQL 数据库。新增数组形式 `[[provider.sqldb]]`（兼容单个 `[provider.sqldb]`），每个可配 `name`（缺省生效名 `default`，仅允许 `[A-Za-z0-9_]`，重名报错）。运行时新增命名 provider 注册表，可按名称安装/查询/清理（`install_provider_named` / `provider_by_name` / `provider_exists` / `provider_names` / `prune_named_providers_except`，默认 provider 与命名 provider 共享单调 generation 计数器）。`init_thread_cloned_from_knowdb` 遍历 sqldb 列表逐个安装：生效名 `default`（或无 name 的历史单库）作为默认库，其余按名注册。新增门面 API：`query_for` / `query_async_for` / `query_fields_for` / `query_fields_for_async` / `cache_query_fields_route`(+async)，以及 `route_provider_sql`（识别 `from <provider>.<schema>.<table>` 前缀并剥离，引号感知）。新模块 `sql_route` 提供前缀剥离工具与 SQL 表引用解析（`first_table_name` 供 wp-oml 复用）。
+  中文：新增多 SQL provider 支持。`knowdb.toml` 支持多个 PostgreSQL/MySQL 数据库，OML 查询通过 `from <provider>.<schema>.<table>` 指定数据库；无前缀查询走默认库。兼容历史单个 `[provider.sqldb]`（生效名 `default`，datasource 身份不变）。
+
+### Fixed
+- **SQL 表引用解析误匹配注释内 `from`**: `first_table_name` 的 `find_keyword`/`matching_paren` 现在跳过 `--` 行注释与 `/* */` 块注释，与前缀剥离函数行为一致，避免注释里的 `from <table>` 干扰 provider 路由与 sqlite/provider 判定。
+- **配置切换后残留命名 provider**: `init_thread_cloned_from_knowdb` 在 redis-only 路径清空命名注册表、本地 authority 路径仅保留 `default`，消除切换配置后 `from <旧名>.` 路由到过期连接池的问题。
+- **多 provider 混用本地缓存抖动**: `FieldQueryCache` 的 generation 改为按 scope（provider 粒度）跟踪，`prepare_generation(scope, generation)` 只清理受影响 scope 的条目；命名 provider 使用独立本地缓存 scope。同一 OML 模型混用命名库与默认库时不再整缓存重置。
+- **前缀剥离支持引号表名**: `strip_provider_prefix` 允许 `name.` 后跟 `"..."` / 反引号 / `[...]` 引号表名。
+- **路由记忆化**: `route_provider_sql` 按 `(SQL hash, provider 注册表版本号)` memo 缓存，热路径避免重复扫描；`KnowledgeRuntime` 新增 `named_provider_epoch`（安装/清理递增，用于 memo 失效）。
+- **本地缓存索引表上限**: `FieldQueryCache` 去重索引表触顶（`MAX_LOCAL_IDX`）时整体重置，防止运行期无界增长。
+- **清理未用 API**: `ProviderConfig::sqldb_specs()` 改为 `sqldb_names()`（返回生效名列表），供 wp-station `configured_provider_names` 使用。
 
 ### Changed
-- **Merge v0.14.2 + v0.15.0**: 合并两条已发布版本线（`[fun]` 命名查询 + `Value::BigUint` 任意精度参数），合流版本 `0.15.1`。
-- **Dependencies**: 新增 `ipnet`（IP 网段集合）、`toml`（配置解析）、`once_cell`（全局 Lazy）依赖。
+- **兼容历史单库**: 单个 `[provider.sqldb]`（无 `name`）生效名为 `default`，datasource 种子沿用 `connection_uri`，结果缓存身份与旧行为一致；无前缀查询仍走默认库。
 
 ## [0.15.0]
 

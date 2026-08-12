@@ -1,9 +1,12 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
+
+/// 默认 provider 在命名注册表中的键名，与配置层 [`crate::loader::DEFAULT_SQLDB_NAME`] 保持一致。
+pub const DEFAULT_PROVIDER_NAME: &str = "default";
 
 use crate::error::{KnowReason, KnowledgeResult};
 use async_trait::async_trait;
@@ -265,6 +268,10 @@ struct CachedRedisEntry {
 
 pub struct KnowledgeRuntime {
     provider: RwLock<Option<Arc<ProviderHandle>>>,
+    /// 命名 provider 注册表：`name -> handle`。默认 provider 也会以 [`DEFAULT_PROVIDER_NAME`] 注册。
+    named_providers: RwLock<HashMap<String, Arc<ProviderHandle>>>,
+    /// 命名 provider 注册表版本号：任何安装/清理都会递增，用于路由 memo 失效。
+    named_provider_epoch: AtomicU64,
     next_generation: AtomicU64,
     provider_epoch: AtomicU64,
     current_generation_value: AtomicU64,
@@ -295,6 +302,8 @@ impl KnowledgeRuntime {
         let capacity = NonZeroUsize::new(config.capacity).expect("non-zero capacity");
         Self {
             provider: RwLock::new(None),
+            named_providers: RwLock::new(HashMap::new()),
+            named_provider_epoch: AtomicU64::new(0),
             next_generation: AtomicU64::new(0),
             provider_epoch: AtomicU64::new(0),
             current_generation_value: AtomicU64::new(0),
@@ -326,6 +335,23 @@ impl KnowledgeRuntime {
     where
         F: FnOnce(Generation) -> KnowledgeResult<Arc<dyn ProviderExecutor>>,
     {
+        self.install_provider_named(DEFAULT_PROVIDER_NAME, kind, datasource_id, build, true)
+    }
+
+    /// 安装一个 provider：注册到命名注册表（`name -> handle`），并在 `is_default`
+    /// 时同时设置为默认 provider。共享同一个单调递增 generation 计数器，
+    /// 保证重载后的结果缓存键不与旧数据冲突。
+    pub fn install_provider_named<F>(
+        &self,
+        name: &str,
+        kind: ProviderKind,
+        datasource_id: DatasourceId,
+        build: F,
+        is_default: bool,
+    ) -> KnowledgeResult<Generation>
+    where
+        F: FnOnce(Generation) -> KnowledgeResult<Arc<dyn ProviderExecutor>>,
+    {
         let generation = Generation(self.next_generation.fetch_add(1, Ordering::SeqCst) + 1);
         let previous = self
             .provider
@@ -333,7 +359,8 @@ impl KnowledgeRuntime {
             .ok()
             .and_then(|guard| guard.as_ref().cloned());
         debug_kdb!(
-            "[kdb] reload provider start kind={kind:?} datasource_id={} target_generation={} previous_generation={}",
+            "[kdb] reload provider start name={} kind={kind:?} datasource_id={} target_generation={} previous_generation={}",
+            name,
             datasource_id.0,
             generation.0,
             previous
@@ -346,7 +373,8 @@ impl KnowledgeRuntime {
             Err(err) => {
                 self.reload_failures.fetch_add(1, Ordering::Relaxed);
                 warn_kdb!(
-                    "[kdb] reload provider failed kind={kind:?} datasource_id={} target_generation={} err={}",
+                    "[kdb] reload provider failed name={} kind={kind:?} datasource_id={} target_generation={} err={}",
+                    name,
                     datasource_id.0,
                     generation.0,
                     err
@@ -361,7 +389,8 @@ impl KnowledgeRuntime {
             }
         };
         debug_kdb!(
-            "[kdb] install provider kind={kind:?} datasource_id={} generation={}",
+            "[kdb] install provider name={} kind={kind:?} datasource_id={} generation={}",
+            name,
             datasource_id.0,
             generation.0
         );
@@ -373,17 +402,27 @@ impl KnowledgeRuntime {
             generation,
             kind: kind_for_handle,
         });
-        self.provider_epoch.fetch_add(1, Ordering::AcqRel);
         {
             let mut guard = self
-                .provider
+                .named_providers
                 .write()
-                .expect("runtime provider lock poisoned");
-            *guard = Some(handle);
+                .expect("runtime named provider lock poisoned");
+            guard.insert(name.to_string(), handle.clone());
         }
-        self.current_generation_value
-            .store(generation.0, Ordering::Release);
-        self.provider_epoch.fetch_add(1, Ordering::Release);
+        self.named_provider_epoch.fetch_add(1, Ordering::AcqRel);
+        if is_default {
+            self.provider_epoch.fetch_add(1, Ordering::AcqRel);
+            {
+                let mut guard = self
+                    .provider
+                    .write()
+                    .expect("runtime provider lock poisoned");
+                *guard = Some(handle);
+            }
+            self.current_generation_value
+                .store(generation.0, Ordering::Release);
+            self.provider_epoch.fetch_add(1, Ordering::Release);
+        }
         self.reload_successes.fetch_add(1, Ordering::Relaxed);
         if telemetry_enabled() {
             telemetry().on_reload(&ReloadTelemetryEvent {
@@ -392,7 +431,8 @@ impl KnowledgeRuntime {
             });
         }
         debug_kdb!(
-            "[kdb] reload provider success kind={kind:?} datasource_id={} generation={}",
+            "[kdb] reload provider success name={} kind={kind:?} datasource_id={} generation={}",
+            name,
             datasource_id.0,
             generation.0
         );
@@ -521,6 +561,52 @@ impl KnowledgeRuntime {
             .and_then(|guard| guard.as_ref().map(|handle| handle.kind.clone()))
     }
 
+    /// 按名称取 provider handle；未找到时返回错误。
+    pub fn provider_by_name(&self, name: &str) -> KnowledgeResult<Arc<ProviderHandle>> {
+        self.named_providers
+            .read()
+            .expect("runtime named provider lock poisoned")
+            .get(name)
+            .cloned()
+            .ok_or_else(|| {
+                KnowReason::from_logic()
+                    .to_err()
+                    .with_detail(format!("knowledge provider '{name}' not initialized"))
+            })
+    }
+
+    pub fn provider_exists(&self, name: &str) -> bool {
+        self.named_providers
+            .read()
+            .ok()
+            .is_some_and(|guard| guard.contains_key(name))
+    }
+
+    pub fn provider_names(&self) -> Vec<String> {
+        self.named_providers
+            .read()
+            .ok()
+            .map(|guard| guard.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// 清理命名注册表中不在 `keep` 内的过期 provider。仅在成功安装后调用，
+    /// 中途失败时保留旧状态。
+    pub fn prune_named_providers_except(&self, keep: &HashSet<String>) {
+        if let Ok(mut guard) = self.named_providers.write() {
+            let before = guard.len();
+            guard.retain(|name, _| keep.contains(name));
+            if guard.len() != before {
+                self.named_provider_epoch.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// 命名 provider 注册表版本号：任何安装/清理都会递增，用于路由 memo 失效判断。
+    pub fn named_provider_epoch(&self) -> u64 {
+        self.named_provider_epoch.load(Ordering::Acquire)
+    }
+
     pub fn record_result_cache_hit(&self) {
         self.result_cache_hits.fetch_add(1, Ordering::Relaxed);
     }
@@ -547,6 +633,12 @@ impl KnowledgeRuntime {
 
     pub fn execute(&self, req: &QueryRequest) -> KnowledgeResult<QueryResponse> {
         let handle = self.current_handle()?;
+        self.execute_with_handle(&handle, req)
+    }
+
+    /// 对指定命名 provider 执行查询。
+    pub fn execute_for(&self, name: &str, req: &QueryRequest) -> KnowledgeResult<QueryResponse> {
+        let handle = self.provider_by_name(name)?;
         self.execute_with_handle(&handle, req)
     }
 
@@ -667,6 +759,18 @@ impl KnowledgeRuntime {
         self.execute_first_row_fields_with_handle(&handle, sql, params, cache_policy)
     }
 
+    /// 对指定命名 provider 执行首行查询。
+    pub fn execute_first_row_fields_for(
+        &self,
+        name: &str,
+        sql: &str,
+        params: &[DataField],
+        cache_policy: CachePolicy,
+    ) -> KnowledgeResult<RowData> {
+        let handle = self.provider_by_name(name)?;
+        self.execute_first_row_fields_with_handle(&handle, sql, params, cache_policy)
+    }
+
     fn execute_first_row_fields_with_handle(
         &self,
         handle: &Arc<ProviderHandle>,
@@ -759,9 +863,26 @@ impl KnowledgeRuntime {
                         .with_detail(format!("knowledge async sqlite query join failed: {err}"))
                 })?;
         }
+        self.execute_async_with_handle(&handle, req).await
+    }
+
+    pub async fn execute_for_async(
+        &self,
+        name: &str,
+        req: &QueryRequest,
+    ) -> KnowledgeResult<QueryResponse> {
+        let handle = self.provider_by_name(name)?;
+        self.execute_async_with_handle(&handle, req).await
+    }
+
+    async fn execute_async_with_handle(
+        &self,
+        handle: &Arc<ProviderHandle>,
+        req: &QueryRequest,
+    ) -> KnowledgeResult<QueryResponse> {
         let use_global_cache =
             matches!(req.cache_policy, CachePolicy::UseGlobal) && self.result_cache_enabled();
-        if use_global_cache && let Some(hit) = self.fetch_result_cache(&handle, req) {
+        if use_global_cache && let Some(hit) = self.fetch_result_cache(handle, req) {
             self.record_result_cache_hit();
             if telemetry_enabled() {
                 telemetry().on_cache(&CacheTelemetryEvent {
@@ -844,7 +965,7 @@ impl KnowledgeRuntime {
         };
 
         if use_global_cache {
-            self.save_result_cache(&handle, req, response.clone());
+            self.save_result_cache(handle, req, response.clone());
         }
 
         Ok(response)
@@ -871,11 +992,34 @@ impl KnowledgeRuntime {
                 ))
             })?;
         }
+        self.execute_first_row_fields_async_with_handle(&handle, sql, params, cache_policy)
+            .await
+    }
+
+    pub async fn execute_first_row_fields_for_async(
+        &self,
+        name: &str,
+        sql: &str,
+        params: &[DataField],
+        cache_policy: CachePolicy,
+    ) -> KnowledgeResult<RowData> {
+        let handle = self.provider_by_name(name)?;
+        self.execute_first_row_fields_async_with_handle(&handle, sql, params, cache_policy)
+            .await
+    }
+
+    async fn execute_first_row_fields_async_with_handle(
+        &self,
+        handle: &Arc<ProviderHandle>,
+        sql: &str,
+        params: &[DataField],
+        cache_policy: CachePolicy,
+    ) -> KnowledgeResult<RowData> {
         let use_global_cache =
             matches!(cache_policy, CachePolicy::UseGlobal) && self.result_cache_enabled();
         if use_global_cache
             && let Some(hit) = self.fetch_result_cache_by_key(result_cache_key_fields(
-                &handle,
+                handle,
                 sql,
                 params,
                 QueryModeTag::FirstRow,
@@ -935,7 +1079,7 @@ impl KnowledgeRuntime {
 
         if use_global_cache {
             self.save_result_cache_by_key(
-                result_cache_key_fields(&handle, sql, params, QueryModeTag::FirstRow),
+                result_cache_key_fields(handle, sql, params, QueryModeTag::FirstRow),
                 QueryResponse::Row(row.clone()),
             );
         }
@@ -1441,6 +1585,133 @@ mod tests {
             .expect("execute old handle")
             .into_row();
         assert_eq!(row[0].to_string(), "chars(old)");
+    }
+
+    #[test]
+    fn named_providers_are_registered_and_queryable() {
+        let _guard = runtime_test_guard()
+            .lock()
+            .expect("named provider test guard");
+        runtime()
+            .install_provider_named(
+                "geo",
+                ProviderKind::Postgres,
+                DatasourceId::from_seed(ProviderKind::Postgres, "geo"),
+                |_generation| Ok(Arc::new(TestProvider { value: "geo-value" })),
+                false,
+            )
+            .expect("install geo");
+        runtime()
+            .install_provider_named(
+                "asset",
+                ProviderKind::Postgres,
+                DatasourceId::from_seed(ProviderKind::Postgres, "asset"),
+                |_generation| {
+                    Ok(Arc::new(TestProvider {
+                        value: "asset-value",
+                    }))
+                },
+                true,
+            )
+            .expect("install asset (default)");
+
+        assert!(runtime().provider_exists("geo"));
+        assert!(runtime().provider_exists("asset"));
+        assert!(!runtime().provider_exists("nope"));
+        let names = runtime().provider_names();
+        assert!(names.contains(&"geo".to_string()));
+        assert!(names.contains(&"asset".to_string()));
+
+        let req = QueryRequest::first_row("SELECT value", Vec::new(), CachePolicy::Bypass);
+        let geo_row = runtime()
+            .execute_for("geo", &req)
+            .expect("execute geo")
+            .into_row();
+        assert_eq!(geo_row[0].to_string(), "chars(geo-value)");
+
+        let row = runtime()
+            .execute_first_row_fields_for("asset", "SELECT value", &[], CachePolicy::Bypass)
+            .expect("execute asset");
+        assert_eq!(row[0].to_string(), "chars(asset-value)");
+
+        let default_row = runtime()
+            .execute(&req)
+            .expect("execute default (asset)")
+            .into_row();
+        assert_eq!(default_row[0].to_string(), "chars(asset-value)");
+    }
+
+    #[test]
+    fn prune_named_providers_except_keeps_only_selected() {
+        let _guard = runtime_test_guard().lock().expect("prune test guard");
+        runtime()
+            .install_provider_named(
+                "a",
+                ProviderKind::Postgres,
+                DatasourceId::from_seed(ProviderKind::Postgres, "a"),
+                |_generation| Ok(Arc::new(TestProvider { value: "a" })),
+                false,
+            )
+            .expect("install a");
+        runtime()
+            .install_provider_named(
+                "b",
+                ProviderKind::Postgres,
+                DatasourceId::from_seed(ProviderKind::Postgres, "b"),
+                |_generation| Ok(Arc::new(TestProvider { value: "b" })),
+                false,
+            )
+            .expect("install b");
+
+        let keep: HashSet<String> = ["a".to_string()].into_iter().collect();
+        runtime().prune_named_providers_except(&keep);
+        assert!(runtime().provider_exists("a"));
+        assert!(!runtime().provider_exists("b"));
+    }
+
+    #[test]
+    fn provider_by_name_unknown_returns_error() {
+        let err = runtime()
+            .provider_by_name("nope")
+            .err()
+            .expect("unknown provider name should error");
+        assert!(err.to_string().contains("not initialized"));
+    }
+
+    #[test]
+    fn execute_first_row_fields_for_unknown_returns_error() {
+        let err = runtime()
+            .execute_first_row_fields_for("nope", "SELECT value", &[], CachePolicy::Bypass)
+            .expect_err("unknown provider name");
+        assert!(err.to_string().contains("not initialized"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn named_provider_async_dispatch_works() {
+        let _guard = runtime_test_guard().lock_async().await;
+        runtime()
+            .install_provider_named(
+                "geo",
+                ProviderKind::Postgres,
+                DatasourceId::from_seed(ProviderKind::Postgres, "geo"),
+                |_generation| Ok(Arc::new(TestProvider { value: "geo-async" })),
+                false,
+            )
+            .expect("install geo");
+
+        let req = QueryRequest::first_row("SELECT value", Vec::new(), CachePolicy::Bypass);
+        let row = runtime()
+            .execute_for_async("geo", &req)
+            .await
+            .expect("async geo")
+            .into_row();
+        assert_eq!(row[0].to_string(), "chars(geo-async)");
+
+        let row = runtime()
+            .execute_first_row_fields_for_async("geo", "SELECT value", &[], CachePolicy::Bypass)
+            .await
+            .expect("async geo first row");
+        assert_eq!(row[0].to_string(), "chars(geo-async)");
     }
 
     // -----------------------------------------------------------------------

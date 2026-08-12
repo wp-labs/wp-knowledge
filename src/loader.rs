@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use orion_conf::EnvTomlLoad;
 use serde::Deserialize;
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use wp_log::info_ctrl;
 
 use crate::error::{KnowReason, KnowledgeResult};
@@ -108,16 +110,37 @@ impl Default for CacheSpec {
 // Provider configuration (new format: [provider.sqldb] / [provider.redis])
 // ---------------------------------------------------------------------------
 
+/// SQL 数据库 provider 的默认生效名：未显式 `name` 时使用。
+pub const DEFAULT_SQLDB_NAME: &str = "default";
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderConfig {
-    #[serde(default)]
-    pub sqldb: Option<SqlProviderSpec>,
+    /// 支持 `[provider.sqldb]`（单个）或 `[[provider.sqldb]]`（多个）两种写法。
+    #[serde(default, deserialize_with = "deserialize_sqldb")]
+    pub sqldb: Option<Vec<SqlProviderSpec>>,
     #[serde(default)]
     pub redis: Option<RedisProviderSpec>,
 }
 
+impl ProviderConfig {
+    /// 返回全部 sqldb provider 的生效名列表（无显式 `name` 时为 `default`）。
+    pub fn sqldb_names(&self) -> Vec<String> {
+        self.sqldb
+            .as_ref()
+            .map(|specs| {
+                specs
+                    .iter()
+                    .map(|spec| spec.effective_name().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SqlProviderSpec {
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(rename = "kind")]
     pub kind: SqlProviderKind,
     pub connection_uri: String,
@@ -131,6 +154,68 @@ pub struct SqlProviderSpec {
     pub idle_timeout_ms: Option<u64>,
     #[serde(default)]
     pub max_lifetime_ms: Option<u64>,
+}
+
+impl SqlProviderSpec {
+    /// 生效名称：显式 `name` 缺失时回退到 [`DEFAULT_SQLDB_NAME`]。
+    pub fn effective_name(&self) -> &str {
+        self.name.as_deref().unwrap_or(DEFAULT_SQLDB_NAME)
+    }
+
+    /// 校验 provider 名称字符集（仅 `[A-Za-z0-9_]`）与重名，返回生效名称集合。
+    pub fn validate_specs(specs: &[SqlProviderSpec]) -> KnowledgeResult<HashSet<String>> {
+        let mut seen = HashSet::with_capacity(specs.len());
+        for spec in specs {
+            let name = spec.effective_name();
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                return Err(KnowReason::from_conf().to_err().with_detail(format!(
+                    "invalid sqldb provider name '{name}' (allowed [A-Za-z0-9_])"
+                )));
+            }
+            if !seen.insert(name.to_string()) {
+                return Err(KnowReason::from_conf()
+                    .to_err()
+                    .with_detail(format!("duplicate sqldb provider name '{name}'")));
+            }
+        }
+        Ok(seen)
+    }
+}
+
+/// 同时接受 `[provider.sqldb]`（单表）与 `[[provider.sqldb]]`（数组）两种 TOML 写法。
+fn deserialize_sqldb<'de, D>(deserializer: D) -> Result<Option<Vec<SqlProviderSpec>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct SqlDbVisitor;
+
+    impl<'de> Visitor<'de> for SqlDbVisitor {
+        type Value = Option<Vec<SqlProviderSpec>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .write_str("a `[provider.sqldb]` table or a `[[provider.sqldb]]` array of tables")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let spec = SqlProviderSpec::deserialize(de::value::MapAccessDeserializer::new(map))?;
+            Ok(Some(vec![spec]))
+        }
+
+        fn visit_seq<A>(self, seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let specs =
+                Vec::<SqlProviderSpec>::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+            Ok(Some(specs))
+        }
+    }
+
+    deserializer.deserialize_any(SqlDbVisitor)
 }
 
 /// Config-level SQL provider kind — Postgres and Mysql only.
@@ -596,8 +681,11 @@ pool_size = 12
             .expect("provider")
             .sqldb
             .expect("sqldb provider");
+        assert_eq!(sqldb.len(), 1);
+        let sqldb = &sqldb[0];
         assert!(matches!(sqldb.kind, SqlProviderKind::Postgres));
         assert_eq!(sqldb.pool_size, Some(12));
+        assert_eq!(sqldb.effective_name(), DEFAULT_SQLDB_NAME);
     }
 
     #[test]
@@ -667,7 +755,7 @@ pool_size = 4
         .expect("parse knowdb with both sqldb and redis");
 
         let provider_cfg = conf.provider().expect("provider");
-        let sqldb = provider_cfg.sqldb.expect("sqldb");
+        let sqldb = &provider_cfg.sqldb.expect("sqldb")[0];
         let redis_cfg = provider_cfg.redis.expect("redis");
         assert!(matches!(sqldb.kind, SqlProviderKind::Postgres));
         assert_eq!(redis_cfg.connection_uri, "redis://10.0.0.1:6379");
@@ -723,9 +811,217 @@ pool_size = 8
         )
         .expect("parse new-style mysql sqldb");
 
-        let sqldb = conf.provider().expect("provider").sqldb.expect("sqldb");
+        let sqldb = &conf.provider().expect("provider").sqldb.expect("sqldb")[0];
         assert!(matches!(sqldb.kind, SqlProviderKind::Mysql));
         assert_eq!(sqldb.pool_size, Some(8));
+    }
+
+    #[test]
+    fn parse_array_style_multi_sqldb_providers() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[[provider.sqldb]]
+name = "geo"
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1:5432/geo_db"
+pool_size = 8
+
+[[provider.sqldb]]
+name = "asset"
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1:5432/asset_db"
+pool_size = 12
+"#,
+            &dict,
+        )
+        .expect("parse knowdb with multiple sqldb providers");
+
+        let specs = conf
+            .provider()
+            .expect("provider")
+            .sqldb
+            .expect("sqldb providers");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].name.as_deref(), Some("geo"));
+        assert_eq!(specs[0].effective_name(), "geo");
+        assert_eq!(
+            specs[0].connection_uri,
+            "postgres://demo@127.0.0.1:5432/geo_db"
+        );
+        assert_eq!(specs[0].pool_size, Some(8));
+        assert_eq!(specs[1].name.as_deref(), Some("asset"));
+        assert_eq!(specs[1].effective_name(), "asset");
+        assert_eq!(
+            specs[1].connection_uri,
+            "postgres://demo@127.0.0.1:5432/asset_db"
+        );
+        assert_eq!(specs[1].pool_size, Some(12));
+    }
+
+    #[test]
+    fn parse_single_sqldb_with_explicit_name() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.sqldb]
+name = "geo"
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/geo_db"
+"#,
+            &dict,
+        )
+        .expect("parse single named sqldb");
+
+        let spec = &conf.provider().expect("provider").sqldb.expect("sqldb")[0];
+        assert_eq!(spec.effective_name(), "geo");
+    }
+
+    #[test]
+    fn sqldb_names_applies_default_name() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.sqldb]
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/demo"
+"#,
+            &dict,
+        )
+        .expect("parse unnamed sqldb");
+
+        let names = conf.provider().expect("provider").sqldb_names();
+        assert_eq!(names, vec!["default".to_string()]);
+    }
+
+    #[test]
+    fn validate_specs_rejects_duplicate_effective_names() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[[provider.sqldb]]
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/db1"
+
+[[provider.sqldb]]
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/db2"
+"#,
+            &dict,
+        )
+        .expect("parse two unnamed sqldb");
+
+        let specs = conf.provider().expect("provider").sqldb.expect("sqldb");
+        let err = SqlProviderSpec::validate_specs(&specs).expect_err("duplicate 'default' name");
+        assert!(
+            err.to_string()
+                .contains("duplicate sqldb provider name 'default'")
+        );
+    }
+
+    #[test]
+    fn validate_specs_rejects_invalid_name_charset() {
+        let specs = [SqlProviderSpec {
+            name: Some("bad name".to_string()),
+            kind: SqlProviderKind::Postgres,
+            connection_uri: "postgres://demo@127.0.0.1/db".to_string(),
+            pool_size: None,
+            min_connections: None,
+            acquire_timeout_ms: None,
+            idle_timeout_ms: None,
+            max_lifetime_ms: None,
+        }];
+        let err = SqlProviderSpec::validate_specs(&specs).expect_err("invalid name charset");
+        assert!(err.to_string().contains("invalid sqldb provider name"));
+    }
+
+    #[test]
+    fn parse_empty_sqldb_array_is_empty() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider]
+sqldb = []
+"#,
+            &dict,
+        )
+        .expect("parse empty sqldb array");
+
+        let specs = conf
+            .provider()
+            .expect("provider")
+            .sqldb
+            .expect("sqldb present");
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn mixed_named_and_unnamed_sqldb_applies_default_name() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[[provider.sqldb]]
+name = "geo"
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/geo_db"
+
+[[provider.sqldb]]
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/asset_db"
+"#,
+            &dict,
+        )
+        .expect("parse mixed named/unnamed sqldb");
+
+        let specs = conf.provider().expect("provider").sqldb.expect("sqldb");
+        assert_eq!(specs.len(), 2);
+        // 有显式 name 的生效名是 name；无 name 的生效名是 default
+        assert_eq!(specs[0].effective_name(), "geo");
+        assert_eq!(specs[1].effective_name(), DEFAULT_SQLDB_NAME);
+
+        // validate_specs 对混合配置应通过，且默认库规则为 "default" 优先
+        let expected = SqlProviderSpec::validate_specs(&specs).expect("valid specs");
+        assert!(expected.contains(DEFAULT_SQLDB_NAME));
+    }
+
+    #[test]
+    fn explicit_default_name_is_recognized() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[[provider.sqldb]]
+name = "default"
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/main_db"
+
+[[provider.sqldb]]
+name = "geo"
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/geo_db"
+"#,
+            &dict,
+        )
+        .expect("parse explicit default name");
+
+        let specs = conf.provider().expect("provider").sqldb.expect("sqldb");
+        assert_eq!(specs[0].effective_name(), DEFAULT_SQLDB_NAME);
+        assert_eq!(specs[1].effective_name(), "geo");
+        let expected = SqlProviderSpec::validate_specs(&specs).expect("valid specs");
+        assert!(expected.contains(DEFAULT_SQLDB_NAME));
     }
 
     #[test]
