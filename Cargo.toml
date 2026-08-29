@@ -27,7 +27,7 @@ anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 r2d2 = "0.8"
 rusqlite = { version = "0.32.1", features = ["backup", "functions"] }
-r2d2_sqlite = "0.25"
+r2d2_sqlite = "0.33"
 enum_dispatch = "0.3"
 lazy_static = "1.5"
 csv = "1.4"
