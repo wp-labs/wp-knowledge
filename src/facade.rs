@@ -239,6 +239,7 @@ fn install_postgres_provider(
         datasource_id.clone(),
         |generation| {
             let provider = PostgresProvider::connect(
+                name,
                 &config,
                 MetadataCacheScope {
                     datasource_id: datasource_id.clone(),
@@ -301,6 +302,7 @@ fn build_postgres_config(spec: &SqlProviderSpec) -> PostgresProviderConfig {
         .with_acquire_timeout_ms(spec.acquire_timeout_ms)
         .with_idle_timeout_ms(spec.idle_timeout_ms)
         .with_max_lifetime_ms(spec.max_lifetime_ms)
+        .with_session(spec.postgres_session.as_ref())
 }
 
 fn build_mysql_config(spec: &SqlProviderSpec) -> MySqlProviderConfig {

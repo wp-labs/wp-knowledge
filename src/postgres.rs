@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 
 use crate::error::{KnowReason, KnowledgeResult};
@@ -12,16 +13,85 @@ use tokio::runtime::Runtime;
 use wp_model_core::model::{DataField, DataType, Value};
 
 use crate::field_format::{bytes_to_prefixed_hex, chars_field, display_chars_field};
-use crate::loader::ProviderKind;
+use crate::loader::{PostgresSessionSpec, ProviderKind};
 use crate::mem::{RowData, query_util::metadata_cache_get_or_try_init_async_for_scope_typed};
 use crate::pool_config::CommonPoolConfig as PostgresPoolConfig;
 use crate::provider_runtime;
 use crate::runtime::MetadataCacheScope;
 
+/// 连接级 session 参数名（用于启动验证错误定位）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PgParam {
+    PlanCacheMode,
+    Jit,
+    ApplicationName,
+}
+
+impl PgParam {
+    fn setting_name(self) -> &'static str {
+        match self {
+            PgParam::PlanCacheMode => "plan_cache_mode",
+            PgParam::Jit => "jit",
+            PgParam::ApplicationName => "application_name",
+        }
+    }
+}
+
+impl fmt::Display for PgParam {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.setting_name())
+    }
+}
+
+/// PostgreSQL 连接级 session 初始化（`[provider.sqldb.postgres_session]` 的可执行形式）。
+///
+/// 预生成 `after_connect` 逐条执行的 SET 语句与启动验证期望值；
+/// 仅在显式配置了 `postgres_session` 时存在（`None` = 保持默认行为）。
+#[derive(Debug, Clone)]
+pub(crate) struct PostgresSessionConfig {
+    init_statements: Vec<String>,
+    expectations: Vec<(PgParam, String)>,
+}
+
+impl PostgresSessionConfig {
+    pub(crate) fn from_spec(spec: &PostgresSessionSpec) -> Self {
+        let mut init_statements = Vec::with_capacity(3);
+        let mut expectations = Vec::with_capacity(3);
+        if let Some(mode) = spec.plan_cache_mode {
+            let value = mode.to_sql_value();
+            init_statements.push(format!("SET plan_cache_mode = {value}"));
+            expectations.push((PgParam::PlanCacheMode, value.to_string()));
+        }
+        if let Some(jit) = spec.jit {
+            let value = if jit { "on" } else { "off" };
+            init_statements.push(format!("SET jit = {value}"));
+            expectations.push((PgParam::Jit, value.to_string()));
+        }
+        if let Some(app) = &spec.application_name {
+            let escaped = app.replace('\'', "''");
+            init_statements.push(format!("SET application_name = '{escaped}'"));
+            expectations.push((PgParam::ApplicationName, app.clone()));
+        }
+        Self {
+            init_statements,
+            expectations,
+        }
+    }
+
+    pub(crate) fn init_statements(&self) -> &[String] {
+        &self.init_statements
+    }
+
+    pub(crate) fn expectations(&self) -> &[(PgParam, String)] {
+        &self.expectations
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PostgresProviderConfig {
     connection_uri: String,
     pool: PostgresPoolConfig,
+    session: Option<PostgresSessionConfig>,
 }
 
 impl PostgresProviderConfig {
@@ -29,11 +99,22 @@ impl PostgresProviderConfig {
         Self {
             connection_uri: connection_uri.into(),
             pool: PostgresPoolConfig::default(),
+            session: None,
         }
     }
 
     pub fn connection_uri(&self) -> &str {
         &self.connection_uri
+    }
+
+    /// 配置连接级 session 初始化；`None` 时保持默认行为（不装 after_connect）。
+    pub fn with_session(mut self, spec: Option<&PostgresSessionSpec>) -> Self {
+        self.session = spec.map(PostgresSessionConfig::from_spec);
+        self
+    }
+
+    pub(crate) fn session(&self) -> Option<&PostgresSessionConfig> {
+        self.session.as_ref()
     }
 
     pub(crate) fn pool(&self) -> &PostgresPoolConfig {
@@ -74,6 +155,7 @@ pub struct PostgresProvider {
 
 impl PostgresProvider {
     pub fn connect(
+        provider_name: &str,
         config: &PostgresProviderConfig,
         metadata_scope: MetadataCacheScope,
     ) -> KnowledgeResult<Self> {
@@ -83,6 +165,8 @@ impl PostgresProvider {
             .with_pool_size(Some(config.pool().pool_size().max(1)));
         let pool_size = pool_config.pool_size();
         let connection_uri = config.connection_uri().to_string();
+        let provider_name = provider_name.to_string();
+        let session = config.session().cloned();
         provider_runtime::init_provider_runtime(
             "postgres",
             "wp-kdb-pg-init",
@@ -91,20 +175,35 @@ impl PostgresProvider {
             move |runtime| {
                 let metadata_scope_for_thread = metadata_scope;
                 let pool = runtime.block_on(async {
-                    let pool = PgPoolOptions::new()
+                    let mut opts = PgPoolOptions::new()
                         .max_connections(pool_size)
                         .min_connections(pool_config.min_connections())
                         .acquire_timeout(pool_config.acquire_timeout())
                         .idle_timeout(pool_config.idle_timeout())
-                        .max_lifetime(pool_config.max_lifetime())
-                        .connect(&connection_uri)
-                        .await
-                        .map_err(|err| {
-                            KnowReason::from_conf()
-                                .to_err()
-                                .with_detail(format!("create postgres pool failed: {err}"))
-                        })?;
-                    validate_startup(&pool).await?;
+                        .max_lifetime(pool_config.max_lifetime());
+                    // 配置了 postgres_session 时，对每条新连接（含空闲回收补建、断线重连）应用 SET。
+                    if let Some(session_cfg) = session.as_ref() {
+                        let stmts = session_cfg.init_statements().to_vec();
+                        opts = opts.after_connect(move |conn, _meta| {
+                            let stmts = stmts.clone();
+                            Box::pin(async move {
+                                for stmt in &stmts {
+                                    sqlx::query(stmt).execute(&mut *conn).await.map_err(|err| {
+                                        sqlx::Error::Protocol(format!(
+                                            "apply postgres session SET '{stmt}' failed: {err}"
+                                        ))
+                                    })?;
+                                }
+                                Ok(())
+                            })
+                        });
+                    }
+                    let pool = opts.connect(&connection_uri).await.map_err(|err| {
+                        KnowReason::from_conf()
+                            .to_err()
+                            .with_detail(format!("create postgres pool failed: {err}"))
+                    })?;
+                    validate_startup(&provider_name, &pool, session.as_ref()).await?;
                     Ok::<Pool<Postgres>, crate::error::KnowledgeError>(pool)
                 })?;
                 Ok(Self {
@@ -248,11 +347,32 @@ impl Drop for PostgresProvider {
     }
 }
 
-async fn validate_startup(pool: &Pool<Postgres>) -> KnowledgeResult<()> {
+async fn validate_startup(
+    provider_name: &str,
+    pool: &Pool<Postgres>,
+    session: Option<&PostgresSessionConfig>,
+) -> KnowledgeResult<()> {
     sqlx::query::<Postgres>("SELECT 1")
         .execute(pool)
         .await
-        .map_err(|err| validation_err("connection", err))?;
+        .map_err(|err| validation_err(provider_name, "connection", err))?;
+    // 配置了 postgres_session：读取 current_setting 与期望比对，不一致则初始化失败。
+    if let Some(session) = session {
+        for (param, expected) in session.expectations() {
+            let setting = param.setting_name();
+            let sql = format!("SELECT current_setting('{setting}')");
+            let actual: String = sqlx::query_scalar::<Postgres, String>(&sql)
+                .fetch_one(pool)
+                .await
+                .map_err(|err| validation_err(provider_name, setting, err))?;
+            if actual != *expected {
+                return Err(KnowReason::from_conf().to_err().with_detail(format!(
+                    "postgres provider '{provider_name}': session parameter '{setting}' \
+                     mismatch: expected {expected:?}, actual {actual:?}"
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -441,9 +561,13 @@ fn bind_postgres_field<'q>(
     }
 }
 
-fn validation_err(stage: &str, err: sqlx::Error) -> crate::error::KnowledgeError {
+fn validation_err(
+    provider_name: &str,
+    stage: &str,
+    err: sqlx::Error,
+) -> crate::error::KnowledgeError {
     KnowReason::from_conf().to_err().with_detail(format!(
-        "postgres startup validation failed during {stage}: connection issue: {err}"
+        "postgres provider '{provider_name}' startup validation failed during {stage}: {err}"
     ))
 }
 
@@ -891,7 +1015,59 @@ mod tests {
 
     use super::*;
     use crate::field_format::bytes_to_hex;
+    use crate::loader::PlanCacheMode;
     use wp_model_core::model::DataField;
+
+    #[test]
+    fn session_from_spec_generates_sets_and_expectations() {
+        let spec = PostgresSessionSpec {
+            plan_cache_mode: Some(PlanCacheMode::ForceGenericPlan),
+            jit: Some(false),
+            application_name: Some("ip_geo's".to_string()),
+        };
+        let session = PostgresSessionConfig::from_spec(&spec);
+        assert_eq!(
+            session.init_statements(),
+            &[
+                "SET plan_cache_mode = force_generic_plan".to_string(),
+                "SET jit = off".to_string(),
+                "SET application_name = 'ip_geo''s'".to_string(),
+            ]
+        );
+        assert_eq!(
+            session.expectations(),
+            &[
+                (PgParam::PlanCacheMode, "force_generic_plan".to_string()),
+                (PgParam::Jit, "off".to_string()),
+                (PgParam::ApplicationName, "ip_geo's".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn session_from_spec_empty_when_nothing_set() {
+        let spec = PostgresSessionSpec::default();
+        let session = PostgresSessionConfig::from_spec(&spec);
+        assert!(session.init_statements().is_empty());
+        assert!(session.expectations().is_empty());
+    }
+
+    #[test]
+    fn session_from_spec_renders_auto_and_jit_on() {
+        let spec = PostgresSessionSpec {
+            plan_cache_mode: Some(PlanCacheMode::Auto),
+            jit: Some(true),
+            application_name: None,
+        };
+        let session = PostgresSessionConfig::from_spec(&spec);
+        assert_eq!(
+            session.init_statements(),
+            &[
+                "SET plan_cache_mode = auto".to_string(),
+                "SET jit = on".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn rewrite_sql_skips_pg_cast_comments_and_dollar_quotes() {

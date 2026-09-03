@@ -5,7 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.16.0 latest]
+## [0.16.1 latest]
+
+### Added
+- **PostgreSQL 连接池 `postgres_session` 连接级 session 初始化**：`kind = "postgres"` 的 `[[provider.sqldb]]` 新增 `[provider.sqldb.postgres_session]` 子配置，在 `PgPoolOptions::after_connect` 对池中每条新连接（含空闲回收补建、断线重连）逐条下发 `SET`，用于稳定执行计划（如 IP 地理查询锁定 generic plan）。可配 `plan_cache_mode`（`auto` / `force_generic_plan` / `force_custom_plan`）、`jit`（`true` / `false`）、`application_name`（≤ 63 字节、无控制字符，含单引号自动转义）；各项可省略，省略即不下发、保持数据库默认。
+- **启动自检**：建池后经同一连接池读取 `current_setting` 与期望值逐一比对，不一致报配置错误并定位到具体参数（provider 名 + 参数名）；配置段 `deny_unknown_fields`，不接受任意 SQL 注入入口，不提供自由 after_connect_sql。
+- **配置约束**：`postgres_session` 仅 `kind = "postgres"` 合法，其他 kind 配置该段在加载期（`validate_specs`）报错；未配置该段的 provider 连接池行为与默认完全一致。
+
+### Tests
+- loader：`postgres_session` 三字段解析、未知键（`after_connect_sql`）拒绝、非 postgres kind 拒绝、application_name 超 63 字节拒绝。
+- postgres：SET 语句与期望值生成（含单引号转义）、空配置生成空语句、`auto` / `jit = on` 渲染。
+- testcontainers 集成：真实 PostgreSQL 上配置 `force_generic_plan` + `jit = off` + `application_name`，池内查询 `current_setting` 三项与配置一致。
+
+## [0.16.0]
 
 ### ⚠️ BREAKING CHANGES
 - **多 SQL provider 配置格式**: `ProviderConfig.sqldb` 由单个 `Option<SqlProviderSpec>` 改为 `Option<Vec<SqlProviderSpec>>`，同时兼容 `[provider.sqldb]`（单表）与 `[[provider.sqldb]]`（数组）两种 TOML 写法。读取 `conf.provider().sqldb` 的调用方需适配为 `Vec`。

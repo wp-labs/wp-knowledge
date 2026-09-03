@@ -113,6 +113,46 @@ impl Default for CacheSpec {
 /// SQL 数据库 provider 的默认生效名：未显式 `name` 时使用。
 pub const DEFAULT_SQLDB_NAME: &str = "default";
 
+/// PostgreSQL `plan_cache_mode` 枚举值（`[provider.sqldb.postgres_session]`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanCacheMode {
+    #[default]
+    Auto,
+    ForceGenericPlan,
+    ForceCustomPlan,
+}
+
+impl PlanCacheMode {
+    /// PostgreSQL `SET plan_cache_mode` 接受的取值。
+    pub fn to_sql_value(self) -> &'static str {
+        match self {
+            PlanCacheMode::Auto => "auto",
+            PlanCacheMode::ForceGenericPlan => "force_generic_plan",
+            PlanCacheMode::ForceCustomPlan => "force_custom_plan",
+        }
+    }
+}
+
+/// PostgreSQL 连接级 session 初始化配置（稳定执行计划用）。
+///
+/// 对应 `[provider.sqldb.postgres_session]`；仅 `kind = "postgres"` 生效，
+/// 其他 kind 配置该字段会在 [`SqlProviderSpec::validate_specs`] 被拒绝。
+/// 未配置（`None`）时保持默认行为；每一项 `None` 表示该项不下发。
+/// 不提供任意 after_connect_sql 入口。
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostgresSessionSpec {
+    #[serde(default)]
+    pub plan_cache_mode: Option<PlanCacheMode>,
+    /// `None` = 不下发 `SET jit`（保持数据库默认）。
+    #[serde(default)]
+    pub jit: Option<bool>,
+    /// `None` = 不下发 `SET application_name`。长度 ≤ 63 字节（PG `NAMEDATALEN-1`），无控制字符。
+    #[serde(default)]
+    pub application_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ProviderConfig {
     /// 支持 `[provider.sqldb]`（单个）或 `[[provider.sqldb]]`（多个）两种写法。
@@ -154,6 +194,9 @@ pub struct SqlProviderSpec {
     pub idle_timeout_ms: Option<u64>,
     #[serde(default)]
     pub max_lifetime_ms: Option<u64>,
+    /// PostgreSQL 专属：连接级 session 初始化（稳定执行计划）；仅 `kind = "postgres"` 消费。
+    #[serde(default)]
+    pub postgres_session: Option<PostgresSessionSpec>,
 }
 
 impl SqlProviderSpec {
@@ -176,6 +219,21 @@ impl SqlProviderSpec {
                 return Err(KnowReason::from_conf()
                     .to_err()
                     .with_detail(format!("duplicate sqldb provider name '{name}'")));
+            }
+            if let Some(session) = &spec.postgres_session {
+                if !matches!(spec.kind, SqlProviderKind::Postgres) {
+                    return Err(KnowReason::from_conf().to_err().with_detail(format!(
+                        "provider '{name}': postgres_session is only valid for kind = \"postgres\""
+                    )));
+                }
+                if let Some(app) = &session.application_name {
+                    if app.len() > 63 || app.chars().any(|c| c.is_control()) {
+                        return Err(KnowReason::from_conf().to_err().with_detail(format!(
+                            "provider '{name}': postgres_session.application_name invalid \
+                             (≤ 63 bytes, no control characters)"
+                        )));
+                    }
+                }
             }
         }
         Ok(seen)
@@ -938,9 +996,106 @@ connection_uri = "postgres://demo@127.0.0.1/db2"
             acquire_timeout_ms: None,
             idle_timeout_ms: None,
             max_lifetime_ms: None,
+            postgres_session: None,
         }];
         let err = SqlProviderSpec::validate_specs(&specs).expect_err("invalid name charset");
         assert!(err.to_string().contains("invalid sqldb provider name"));
+    }
+
+    #[test]
+    fn parse_sqldb_postgres_session() {
+        let dict = EnvDict::default();
+        let conf: KnowDbConf = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.sqldb]
+name = "geo"
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/geo_db"
+
+[provider.sqldb.postgres_session]
+plan_cache_mode = "force_generic_plan"
+jit = false
+application_name = "ip_geo_service"
+"#,
+            &dict,
+        )
+        .expect("parse postgres_session config");
+
+        let spec = &conf.provider().expect("provider").sqldb.expect("sqldb")[0];
+        let session = spec.postgres_session.as_ref().expect("postgres_session");
+        assert_eq!(
+            session.plan_cache_mode,
+            Some(PlanCacheMode::ForceGenericPlan)
+        );
+        assert_eq!(session.jit, Some(false));
+        assert_eq!(session.application_name.as_deref(), Some("ip_geo_service"));
+    }
+
+    #[test]
+    fn parse_sqldb_postgres_session_unknown_key_rejected() {
+        let dict = EnvDict::default();
+        let r = <KnowDbConf as EnvTomlLoad<KnowDbConf>>::env_parse_toml(
+            r#"
+version = 2
+
+[provider.sqldb]
+kind = "postgres"
+connection_uri = "postgres://demo@127.0.0.1/demo"
+
+[provider.sqldb.postgres_session]
+plan_cache_mode = "auto"
+after_connect_sql = "SET x = 1"
+"#,
+            &dict,
+        );
+        assert!(
+            r.is_err(),
+            "unknown postgres_session key (after_connect_sql) should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_specs_rejects_session_on_non_postgres() {
+        let specs = [SqlProviderSpec {
+            name: Some("geo".to_string()),
+            kind: SqlProviderKind::Mysql,
+            connection_uri: "mysql://demo@127.0.0.1/db".to_string(),
+            pool_size: None,
+            min_connections: None,
+            acquire_timeout_ms: None,
+            idle_timeout_ms: None,
+            max_lifetime_ms: None,
+            postgres_session: Some(PostgresSessionSpec {
+                plan_cache_mode: Some(PlanCacheMode::ForceGenericPlan),
+                jit: None,
+                application_name: None,
+            }),
+        }];
+        let err = SqlProviderSpec::validate_specs(&specs).expect_err("mysql with postgres_session");
+        assert!(err.to_string().contains("postgres_session"));
+    }
+
+    #[test]
+    fn validate_specs_rejects_application_name_too_long() {
+        let specs = [SqlProviderSpec {
+            name: Some("geo".to_string()),
+            kind: SqlProviderKind::Postgres,
+            connection_uri: "postgres://demo@127.0.0.1/db".to_string(),
+            pool_size: None,
+            min_connections: None,
+            acquire_timeout_ms: None,
+            idle_timeout_ms: None,
+            max_lifetime_ms: None,
+            postgres_session: Some(PostgresSessionSpec {
+                plan_cache_mode: None,
+                jit: None,
+                application_name: Some("x".repeat(64)),
+            }),
+        }];
+        let err = SqlProviderSpec::validate_specs(&specs).expect_err("application_name too long");
+        assert!(err.to_string().contains("application_name"));
     }
 
     #[test]

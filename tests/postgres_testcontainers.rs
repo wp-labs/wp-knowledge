@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use testcontainers::ImageExt;
 use testcontainers::runners::SyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::{Client, NoTls};
@@ -56,6 +57,7 @@ fn connect_with_retry(url: &str) -> (tokio::runtime::Runtime, Client) {
 #[ignore = "requires docker and may need to pull postgres image"]
 fn postgres_provider_query_and_pool_via_testcontainers() {
     let container = Postgres::default()
+        .with_tag("16")
         .start()
         .expect("start postgres testcontainer");
     let port = container
@@ -92,7 +94,7 @@ VALUES
             r#"
 version = 2
 
-[provider]
+[provider.sqldb]
 kind = "postgres"
 connection_uri = "{url}"
 "#
@@ -124,4 +126,63 @@ connection_uri = "{url}"
     assert_eq!(row.len(), 1);
     assert_eq!(row[0].get_name(), "pinying");
     assert_eq!(row[0].to_string(), "chars(linghuchong)");
+}
+
+#[test]
+#[ignore = "requires docker and may need to pull postgres image"]
+fn postgres_provider_applies_postgres_session_via_testcontainers() {
+    // plan_cache_mode 需要 PostgreSQL 12+，显式用 16（模块默认 11-alpine 不支持）。
+    let container = Postgres::default()
+        .with_tag("16")
+        .start()
+        .expect("start postgres testcontainer");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .expect("resolve postgres mapped port");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let tmp = temp_test_dir();
+    let conf_path = tmp.join("session-knowdb.toml");
+    fs::write(
+        &conf_path,
+        format!(
+            r#"
+version = 2
+
+[provider.sqldb]
+name = "geo"
+kind = "postgres"
+connection_uri = "{url}"
+
+[provider.sqldb.postgres_session]
+plan_cache_mode = "force_generic_plan"
+jit = false
+application_name = "ip_geo_service"
+"#
+        ),
+    )
+    .expect("write postgres session config");
+
+    let authority_uri = format!(
+        "file:{}?mode=rwc&uri=true",
+        tmp.join("unused.sqlite").display()
+    );
+    kdb::init_thread_cloned_from_knowdb(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).as_path(),
+        &conf_path,
+        &authority_uri,
+        &orion_variate::EnvDict::default(),
+    )
+    .expect("init postgres provider with postgres_session");
+
+    // after_connect 已对池中每条新连接应用 SET；经同一池读取 current_setting 应匹配配置。
+    let rows = kdb::query_for(
+        "geo",
+        "SELECT current_setting('plan_cache_mode'), current_setting('jit'), \
+         current_setting('application_name')",
+    )
+    .expect("query session settings from provider pool");
+    assert_eq!(rows[0][0].to_string(), "chars(force_generic_plan)");
+    assert_eq!(rows[0][1].to_string(), "chars(off)");
+    assert_eq!(rows[0][2].to_string(), "chars(ip_geo_service)");
 }
