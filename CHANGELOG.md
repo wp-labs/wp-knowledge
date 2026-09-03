@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **启动自检**：建池后经同一连接池读取 `current_setting` 与期望值逐一比对，不一致报配置错误并定位到具体参数（provider 名 + 参数名）；配置段 `deny_unknown_fields`，不接受任意 SQL 注入入口，不提供自由 after_connect_sql。
 - **配置约束**：`postgres_session` 仅 `kind = "postgres"` 合法，其他 kind 配置该段在加载期（`validate_specs`）报错；未配置该段的 provider 连接池行为与默认完全一致。
 
+### Docs
+- zh/en `guides/config.md` 同步 `postgres_session` 配置说明：新增 `[provider.sqldb.postgres_session]` 示例与字段速查、生效时机（after_connect + current_setting 自检）、PG 版本约束、常见失败原因；英文文档顺带补齐 0.16.0 多 SQL provider 结构（`[provider.sqldb]` / `[[provider.sqldb]]`、name 与前缀路由），与中文文档对齐。
+
 ### Tests
 - loader：`postgres_session` 三字段解析、未知键（`after_connect_sql`）拒绝、非 postgres kind 拒绝、application_name 超 63 字节拒绝。
 - postgres：SET 语句与期望值生成（含单引号转义）、空配置生成空语句、`auto` / `jit = on` 渲染。
