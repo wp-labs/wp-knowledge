@@ -96,6 +96,20 @@ country = select country_name from geo.public.ip_geo_city where ip_num = @ip_num
 
 - `name` 仅允许 `[A-Za-z0-9_]`；重名会报配置错误。
 
+**PostgreSQL 连接级 session 初始化（可选）**：给连接池的每条新连接下发固定 `SET`，用于稳定执行计划（如 IP 地理查询锁定 generic plan，避免参数化查询反复重新 planning）。仅 `kind = "postgres"` 支持：
+
+```toml
+[provider.sqldb.postgres_session]
+plan_cache_mode = "force_generic_plan"   # auto / force_generic_plan / force_custom_plan
+jit = false                               # 关闭 JIT，小查询避免 JIT 开销
+application_name = "ip_geo_service"       # 便于 PG 侧监控定位（≤ 63 字节）
+```
+
+- 三项均可省略：省略即不下发，保持数据库默认。
+- 生效时机：建池后对池中**每条新连接**（含空闲回收补建、断线重连）在 `after_connect` 逐条执行 `SET`；初始化时再经同一连接池读取 `current_setting` 与期望值比对，不一致报配置错误并定位到具体参数。
+- `plan_cache_mode` 需要 PostgreSQL 12+；`jit` / `application_name` 更早版本可用。
+- 该配置段拒绝未知字段（`deny_unknown_fields`），不提供任意 SQL 注入入口。
+
 ## 哪些配置会生效
 
 | 模式 | 会生效 | 不参与主流程 |
@@ -183,8 +197,26 @@ nets = ["172.32.0.0/16"]
   - 必填，支持 `${VAR}`
 - `pool_size`
   - 可选，默认 `8`
+- `postgres_session`
+  - 可选；PostgreSQL 连接级 session 初始化，见下节
+  - 仅 `kind = "postgres"` 合法，其他 kind 配置该段会在加载期报错
 
 不要写 `kind = "sqlite_authority"`。目录式模式下直接省略 `[provider.sqldb]`。
+
+### `[provider.sqldb.postgres_session]`
+
+PostgreSQL 专属的连接级 session 初始化（稳定执行计划用）；仅 `kind = "postgres"` 合法。
+
+- `plan_cache_mode`
+  - 可选，`auto` / `force_generic_plan` / `force_custom_plan`
+  - 需要 PostgreSQL 12+；IP 地理等参数化查询建议 `force_generic_plan`
+- `jit`
+  - 可选，`true` / `false`
+  - 小查询建议 `false`，避免 JIT 编译开销
+- `application_name`
+  - 可选，≤ 63 字节、无控制字符；含单引号自动转义
+  - 便于 PG 侧 `pg_stat_activity` 监控定位
+- 未配置的项不下发，保持数据库默认；整个子配置缺省时连接池行为与默认完全一致
 
 ### `[[tables]]`
 
@@ -259,10 +291,11 @@ connection_uri = "mysql://root:${MYSQL_PASSWORD}@127.0.0.1:3306/demo"
 - CSV 行解析失败且 `on_error = "fail"`
 - 实际导入行数小于 `expected_rows.min`
 - PostgreSQL / MySQL 初始化连接失败
+- `postgres_session` 与数据库不匹配（如 PG 11 上配置 `plan_cache_mode`），或启动自检 `current_setting` 与期望不符
 
 ## 建议写法
 
-- 目录式 SQLite authority 模式下，不要写 `[provider]`
+- 目录式 SQLite authority 模式下，不要写 `[provider.sqldb]`
 - `enabled` 写在 `[[tables]]` 层，不要写到 `[tables.expected_rows]` 下面
 - `delimiter` 用单字符
 - 使用 `columns.by_header` 时，保持 `csv.has_header = true`

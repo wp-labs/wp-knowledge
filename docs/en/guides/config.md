@@ -50,6 +50,8 @@ max = 100
 
 ### External PostgreSQL / MySQL
 
+Single database:
+
 ```toml
 version = 2
 
@@ -58,20 +60,62 @@ enabled = true
 capacity = 1024
 ttl_ms = 30000
 
-[provider]
+[provider.sqldb]
 kind = "postgres"
 connection_uri = "postgres://user:${DB_PASSWORD}@127.0.0.1:5432/demo"
 pool_size = 8
 ```
 
-Replace `kind = "postgres"` with `kind = "mysql"` and switch the connection URI to MySQL format if needed.
+Switch `kind = "postgres"` to `kind = "mysql"` and use a MySQL connection URI if needed.
+
+**Multiple databases**: use the array form `[[provider.sqldb]]`, one `name` per database:
+
+```toml
+version = 2
+
+[[provider.sqldb]]
+name = "geo"
+kind = "postgres"
+connection_uri = "postgres://user:${GEO_DB_PASSWORD}@127.0.0.1:5432/geo_db"
+pool_size = 8
+
+[[provider.sqldb]]
+name = "asset"
+kind = "postgres"
+connection_uri = "postgres://user:${ASSET_DB_PASSWORD}@127.0.0.1:5432/asset_db"
+pool_size = 8
+```
+
+- Without a `name` (or with a single `[provider.sqldb]`), the effective name is `default`, used as the default database.
+- OML queries without a prefix go to the default database; prefixed queries target a specific one:
+
+```oml
+country = select country_name from geo.public.ip_geo_city where ip_num = @ip_num;
+-- routes to the provider named "geo"; the geo. prefix is stripped before hitting PostgreSQL.
+```
+
+- `name` allows only `[A-Za-z0-9_]`; duplicates raise a configuration error.
+
+**PostgreSQL per-connection session initialization (optional)**: issue fixed `SET` commands on every connection from the pool to stabilize execution plans (e.g. lock IP-geolocation lookups to generic plans so parameterized queries stop re-planning). Only `kind = "postgres"` supports this:
+
+```toml
+[provider.sqldb.postgres_session]
+plan_cache_mode = "force_generic_plan"   # auto / force_generic_plan / force_custom_plan
+jit = false                               # disable JIT to avoid compile overhead on small queries
+application_name = "ip_geo_service"       # visible in pg_stat_activity (≤ 63 bytes)
+```
+
+- All three are optional; omitted items are not sent and keep the database default.
+- When applied: after the pool is created, each new connection (including recycles and reconnects) runs the `SET`s in `after_connect`; startup then reads `current_setting` through the same pool and compares against expectations, failing with the offending parameter on mismatch.
+- `plan_cache_mode` requires PostgreSQL 12+; `jit` / `application_name` work on earlier versions.
+- Unknown fields in this block are rejected (`deny_unknown_fields`); there is no arbitrary-SQL entry point.
 
 ## Which settings take effect
 
 | Mode | Active settings | Not part of the main flow |
 | --- | --- | --- |
 | Directory-based SQLite authority | `version` `base_dir` `[default]` `[csv]` `[cache]` `[[tables]]` | `authority_uri` is not read from `knowdb.toml` |
-| External PostgreSQL / MySQL | `version` `[provider]` `[cache]` | `base_dir` `[default]` `[csv]` `[[tables]]` |
+| External PostgreSQL / MySQL | `version` `[provider.sqldb]` (or `[[provider.sqldb]]`) `[cache]` | `base_dir` `[default]` `[csv]` `[[tables]]` |
 | Intranet network knowledge `[intranet_nets]` | effective in both modes (injected on knowdb.toml parse) | — |
 
 ## Key fields
@@ -82,7 +126,7 @@ Replace `kind = "postgres"` with `kind = "mysql"` and switch the connection URI 
   - required, must be `2`
 - `base_dir`
   - root for table directories
-- `[provider]`
+- `[provider.sqldb]` / `[[provider.sqldb]]`
   - only for external provider mode
 - `[[tables]]`
   - only for directory-based SQLite authority mode
@@ -141,16 +185,38 @@ mode = "add"
 nets = ["172.32.0.0/16"]
 ```
 
-### `[provider]`
+### `[provider.sqldb]`
 
+- `name`
+  - optional; required when multiple databases, used for OML query prefix routing
+  - without a name (or a single `[provider.sqldb]`), the effective name is `default`
+  - only `[A-Za-z0-9_]`; duplicates are rejected
 - `kind`
   - required, `postgres` or `mysql`
 - `connection_uri`
   - required, `${VAR}` expansion supported
 - `pool_size`
   - optional, default `8`
+- `postgres_session`
+  - optional; per-connection session initialization, see next section
+  - only valid for `kind = "postgres"`; other kinds are rejected at load time
 
-Do not write `kind = "sqlite_authority"`. In directory-based mode, omit `[provider]` completely.
+Do not write `kind = "sqlite_authority"`. In directory-based mode, omit `[provider.sqldb]` completely.
+
+### `[provider.sqldb.postgres_session]`
+
+Per-connection session initialization for PostgreSQL (stabilizes execution plans); only valid with `kind = "postgres"`.
+
+- `plan_cache_mode`
+  - optional, `auto` / `force_generic_plan` / `force_custom_plan`
+  - requires PostgreSQL 12+; prefer `force_generic_plan` for parameterized lookups such as IP geolocation
+- `jit`
+  - optional, `true` / `false`
+  - prefer `false` for small queries to avoid JIT compile overhead
+- `application_name`
+  - optional, ≤ 63 bytes, no control characters; single quotes are escaped automatically
+  - visible in `pg_stat_activity` for monitoring
+- Unset items are not sent, keeping the database default; when the whole block is absent the pool behaves exactly as before
 
 ### `[[tables]]`
 
@@ -200,7 +266,7 @@ Rules:
 - `${VAR}` is expanded before TOML deserialization. Example:
 
 ```toml
-[provider]
+[provider.sqldb]
 kind = "mysql"
 connection_uri = "mysql://root:${MYSQL_PASSWORD}@127.0.0.1:3306/demo"
 ```
@@ -225,10 +291,11 @@ Path resolution order:
 - CSV row parsing fails and `on_error = "fail"`
 - imported rows are below `expected_rows.min`
 - PostgreSQL / MySQL initialization fails to connect
+- `postgres_session` mismatches the database (e.g. `plan_cache_mode` on PostgreSQL 11), or the startup `current_setting` check differs from expectations
 
 ## Recommended patterns
 
-- In the directory-based SQLite authority mode, do not add a `[provider]` block.
+- In the directory-based SQLite authority mode, do not add a `[provider.sqldb]` block.
 - Put `enabled` under `[[tables]]`, not under `[tables.expected_rows]`.
 - Keep `delimiter` to a single character.
 - If you use `columns.by_header`, keep `csv.has_header = true`.
