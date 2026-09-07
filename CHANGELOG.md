@@ -5,7 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.16.3 latest]
+## [0.17.0]
+
+### Added
+- **KnowDB 定期刷新异步服务（`refresh::RefreshService`）**：宿主（如主引擎 daemon）启动本服务，knowdb 负责各数据源的周期更新并**并发通知**——每表一条 `RefreshSpec` 独立计时，重载完成即经事件通道发出 `RefreshEvent{ name, rows }`（原生行 `Vec<RowData>`，宿主在边界自行转换/搬入，服务不感知宿主结构）。失败跳周期（warn）、事件通道满丢弃不阻塞刷新周期、drop/`shutdown()` 中止全部任务并关闭通道；首 tick 跳过（宿主已做启动装载）。
+- **数据源 v1**：`RefreshSource::Authority`（KnowDB V2 conf + sqlite 权威库单表重载）与 `RefreshSource::NamedSql`（命名 SQL provider 直查，`facade::query_async_for`）。
+- **`loader::reload_table_rows`**：权威库单表重载并返回类型化投影行（重读 CSV → create/clean/insert 重灌 → `SELECT columns.by_header`），与启动装载同一代码路径；供 refresh 服务与宿主启动装载共用。
+
+### Tests
+- refresh：Authority 源周期出事件且行类型化（TEXT→Chars）、双表独立并发通知、零周期规格跳过、首 interval 前不触发、失败重载跳过且 `shutdown()` 后通道关闭、drop 干净退出。
+- loader：`reload_table_rows` CSV 覆盖后重载反映新文件（3→1 行）与列名/DDL 类型投影；未知表 / 禁用表 / 纯 `by_index` 表错误路径。
+
+## [0.16.3]
 
 ### Fixed
 - **`FieldQueryCache` 支持 `Value::BigUint` 参数索引**：新增独立 `biguint_idx`（以 `BigUint` 本体为键，查找零分配），`get_idx`/`try_up_idx`/触顶重置均覆盖 `BigUint`——`ip_to_biguint` 转换结果作为 SQL 参数时本地字段缓存可命中，不再每次重复访问 provider；索引按类型隔离，与 `Chars`/`Digit`/`IpAddr` 不碰撞。关联 wp-labs/warp-parse#359。
@@ -13,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 - 新增 `BigUint` 单/多参数命中与 miss、类型隔离、触顶重置清理与重建，以及 Bool/Float 命中与 miss、文本类（Domain）命中与 Chars 隔离、混合类型多参数与重复 save 幂等（索引号不膨胀）等共 7 个用例。
+
 
 ## [0.16.1]
 

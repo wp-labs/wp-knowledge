@@ -3,6 +3,7 @@ mod fun;
 pub mod intranet_nets;
 pub mod mem;
 mod redis;
+pub mod refresh;
 pub use crate::mem::DBQuery;
 pub use crate::mem::memdb::MDBEnum;
 pub mod cache_util;
