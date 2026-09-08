@@ -226,6 +226,19 @@ pub fn init_postgres_provider_named(
     install_postgres_provider(name, config, name, false)
 }
 
+/// 以命名 provider 安装 PostgreSQL 连接（URI 便捷版，供引擎等外部调用方使用——
+/// `PostgresProviderConfig` 类型不经 pub 面导出）。
+pub fn init_postgres_provider_named_uri(
+    name: &str,
+    connection_uri: &str,
+    pool_size: Option<u32>,
+) -> KnowledgeResult<()> {
+    init_postgres_provider_named(
+        name,
+        PostgresProviderConfig::new(connection_uri).with_pool_size(pool_size),
+    )
+}
+
 fn install_postgres_provider(
     name: &str,
     config: PostgresProviderConfig,
