@@ -19,7 +19,6 @@
 //!   （`facade::query_async_for`；PG/MySQL 供给，异步池查询）。
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -28,32 +27,91 @@ use crate::error::{KnowReason, KnowledgeResult};
 use crate::mem::RowData;
 use orion_error::conversion::ToStructError;
 
-/// 刷新变量提供器（宿主注入）：每次执行 SQL 前现算 `$name → 值` 列表。
-///
-/// 用途：供给查询需要随**当前时刻**变化的参数（如相位供给的 `$cur`/`$next`
-/// ——当前相位由宿主引擎现算），SQL 模板里写 `$name` 占位符，刷新循环执行前
-/// 用返回值做文本替换。语义完全归宿主；本模块只提供"取数 + 替换"两个小能力。
-#[derive(Clone)]
-pub struct RefreshVars(Arc<dyn Fn() -> KnowledgeResult<Vec<(String, String)>> + Send + Sync>);
+/// 刷新 SQL 的 `$name` 变量定义（**静态配置**；值由 knowdb 每次执行前按自身
+/// 时钟现算/透传）。knowdb 拥有 tick 时钟——"当前时刻"派生变量（如相位供给的
+/// `$cur`/`$next`）由 knowdb 计算；语义归宿主配置，本模块提供周期格折叠原语。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshVarDef {
+    /// 周期格变量：`$name = prefix + fold(now + offset_slots*bucket)`，
+    /// `fold(t) = (t mod period) div bucket`（epoch 纳秒折叠、无时区）。
+    /// 示例：`$cur` = offset 0；`$next` = offset +1（周期末自动回绕到首格）。
+    CyclePhase {
+        name: String,
+        period_s: u64,
+        bucket_s: u64,
+        offset_slots: i64,
+        prefix: String,
+    },
+    /// 静态字面量透传：`$name = value`（如 `$max_age = "30 days"`）。
+    Static { name: String, value: String },
+}
 
-impl RefreshVars {
-    /// 以变量计算函数构造（每 tick 调用一次）。
-    pub fn new(
-        f: impl Fn() -> KnowledgeResult<Vec<(String, String)>> + Send + Sync + 'static,
-    ) -> Self {
-        Self(Arc::new(f))
-    }
-
-    /// 现算本次变量（`(name, value)`；替换 `$name`）。
-    pub fn compute(&self) -> KnowledgeResult<Vec<(String, String)>> {
-        (self.0)()
+impl RefreshVarDef {
+    /// 在给定时刻 `now_ns` 计算该变量的值。
+    pub fn value_at(&self, now_ns: u64) -> String {
+        match self {
+            RefreshVarDef::CyclePhase {
+                name: _,
+                period_s,
+                bucket_s,
+                offset_slots,
+                prefix,
+            } => {
+                let period_ns = period_s.saturating_mul(1_000_000_000);
+                let bucket_ns = bucket_s.saturating_mul(1_000_000_000);
+                // 0<桶≤周期 由配置侧保证；此处防御性回退 p0（不 panic）。
+                let idx = if period_ns == 0 || bucket_ns == 0 || bucket_ns > period_ns {
+                    0
+                } else {
+                    let t = if *offset_slots >= 0 {
+                        now_ns.saturating_add((*offset_slots as u64).saturating_mul(bucket_ns))
+                    } else {
+                        now_ns.saturating_sub((-(*offset_slots) as u64).saturating_mul(bucket_ns))
+                    };
+                    (t % period_ns) / bucket_ns
+                };
+                format!("{prefix}{idx}")
+            }
+            RefreshVarDef::Static { value, .. } => value.clone(),
+        }
     }
 }
 
-impl std::fmt::Debug for RefreshVars {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("RefreshVars(..)")
+/// 在给定时刻现算全部变量（`(name, value)`；顺序与 `defs` 一致）。
+pub fn refresh_vars_at(defs: &[RefreshVarDef], now_ns: u64) -> Vec<(String, String)> {
+    defs.iter()
+        .map(|d| {
+            let name = match d {
+                RefreshVarDef::CyclePhase { name, .. } | RefreshVarDef::Static { name, .. } => {
+                    name.clone()
+                }
+            };
+            (name, d.value_at(now_ns))
+        })
+        .collect()
+}
+
+/// 把 `$name` 占位符替换为对应值（文本替换；值不应含 `$`）。
+/// 供刷新循环与宿主 boot 装载共用（boot 与首 refresh 必须同源渲染）。
+pub fn resolve_sql_vars(sql: &str, vars: &[(String, String)]) -> String {
+    let mut out = sql.to_string();
+    for (name, value) in vars {
+        out = out.replace(&format!("${name}"), value);
     }
+    out
+}
+
+/// 在给定时刻渲染 SQL 模板（`$name` → 值）。boot 装载可复用本函数保证同源。
+pub fn render_sql_at(sql: &str, defs: &[RefreshVarDef], now_ns: u64) -> String {
+    resolve_sql_vars(sql, &refresh_vars_at(defs, now_ns))
+}
+
+/// 当前墙钟 epoch 纳秒（变量计算与 boot 渲染的时钟来源）。
+pub fn current_wall_nanos() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 /// 事件通道容量（满则丢弃单次事件，绝不阻塞刷新周期）。
@@ -78,22 +136,13 @@ pub enum RefreshSource {
     NamedSql {
         /// 已注册的 provider 名（`init_*_provider_named`）。
         provider: String,
-        /// 每次刷新执行的 SQL（模板：可含 `$name` 占位符，由 [`RefreshVars`] 替换）。
+        /// 每次刷新执行的 SQL（模板：可含 `$name` 占位符，由 [`RefreshVarDef`]
+        /// 每次执行前现算替换）。
         sql: String,
-        /// 变量计算（宿主）：`Some` 时每次执行前调用并替换 SQL 中的 `$name`；
-        /// `None` = 静态 SQL 直接执行。
-        vars: Option<RefreshVars>,
+        /// 变量定义（静态配置）：`CyclePhase`（按 knowdb 时钟折周期格，如
+        /// `$cur`/`$next`）与 `Static`（字面量透传，如 `$max_age`）；空 = 直接执行。
+        vars: Vec<RefreshVarDef>,
     },
-}
-
-/// 把 `$name` 占位符替换为对应值（文本替换；值不应含 `$`）。
-/// 供刷新循环与宿主 boot 装载共用（boot 与首 refresh 必须同源渲染）。
-pub fn resolve_sql_vars(sql: &str, vars: &[(String, String)]) -> String {
-    let mut out = sql.to_string();
-    for (name, value) in vars {
-        out = out.replace(&format!("${name}"), value);
-    }
-    out
 }
 
 /// 一条定期刷新规格。
@@ -197,12 +246,9 @@ async fn reload(spec: &RefreshSpec) -> KnowledgeResult<Vec<RowData>> {
             sql,
             vars,
         } => {
-            // 变量注入：每次执行前现算并替换 `$name`（如 $cur/$next——当前相位
-            // 宿主现算）；无 vars = 静态 SQL 直接执行。
-            let sql = match vars {
-                Some(v) => resolve_sql_vars(sql, &v.compute()?),
-                None => sql.clone(),
-            };
+            // 变量注入：每次执行前由 knowdb 按自身时钟现算并替换 `$name`
+            // （如 $cur/$next——周期格折叠见 [`RefreshVarDef::CyclePhase`]）。
+            let sql = render_sql_at(sql, vars, current_wall_nanos());
             crate::facade::query_async_for(provider, &sql).await
         }
         RefreshSource::Authority {
@@ -390,6 +436,55 @@ mod tests {
         assert_eq!(resolve_sql_vars(sql, &[]), sql);
     }
 
+    #[test]
+    fn cycle_phase_vars_fold_and_wrap_at_period() {
+        // period=240s/bucket=15s（N=16）：120s → 桶 8；+1 格（135s）→ 桶 9。
+        let ns = |s: u64| s.saturating_mul(1_000_000_000);
+        let defs = vec![
+            RefreshVarDef::CyclePhase {
+                name: "cur".into(),
+                period_s: 240,
+                bucket_s: 15,
+                offset_slots: 0,
+                prefix: "p".into(),
+            },
+            RefreshVarDef::CyclePhase {
+                name: "next".into(),
+                period_s: 240,
+                bucket_s: 15,
+                offset_slots: 1,
+                prefix: "p".into(),
+            },
+            RefreshVarDef::Static {
+                name: "max_age".into(),
+                value: "30 days".into(),
+            },
+        ];
+        assert_eq!(
+            refresh_vars_at(&defs, ns(120)),
+            vec![
+                ("cur".to_string(), "p8".to_string()),
+                ("next".to_string(), "p9".to_string()),
+                ("max_age".to_string(), "30 days".to_string()),
+            ]
+        );
+        // 周期末回绕：225s 末格 cur=p15；+1 格 = 240s → p0。
+        assert_eq!(
+            refresh_vars_at(&defs, ns(225))[0],
+            ("cur".to_string(), "p15".to_string())
+        );
+        assert_eq!(
+            refresh_vars_at(&defs, ns(225))[1],
+            ("next".to_string(), "p0".to_string())
+        );
+        // 周期内推进：120s+225s 已越界 → 校验一个周期后的同相位（360s = 120s+240s
+        // 余 120s → 仍桶 8，周期基线可复现）。
+        assert_eq!(
+            refresh_vars_at(&defs, ns(360))[0],
+            ("cur".to_string(), "p8".to_string())
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn named_sql_spec_substitutes_vars_before_each_query() {
         let _guard = crate::runtime::runtime_test_guard().lock_async().await;
@@ -400,19 +495,17 @@ mod tests {
         db.execute("INSERT INTO refresh_vars_t VALUES ('a', '1'), ('b', '2')")
             .expect("seed");
         crate::facade::init_mem_provider(db).expect("init mem provider");
-        let vars = RefreshVars::new(|| {
-            Ok(vec![
-                ("cur".to_string(), "b".to_string()),
-                ("next".to_string(), "c".to_string()),
-            ])
-        });
+        let vars = vec![RefreshVarDef::Static {
+            name: "cur".into(),
+            value: "b".into(),
+        }];
         let mut service = RefreshService::spawn(vec![RefreshSpec {
             name: "vars_t".into(),
             interval: Duration::from_millis(80),
             source: RefreshSource::NamedSql {
                 provider: "default".to_string(),
                 sql: "SELECT v FROM refresh_vars_t WHERE k = '$cur'".to_string(),
-                vars: Some(vars),
+                vars,
             },
         }]);
         let events = collect(&mut service, 1, Duration::from_millis(1500)).await;
