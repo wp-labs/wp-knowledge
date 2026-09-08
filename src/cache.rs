@@ -481,6 +481,9 @@ impl CacheAble<DataField, Vec<DataField>, 6> for FieldQueryCache {
 }
 
 #[cfg(test)]
+// 测试中单元素 `&[x.clone()]` 是刻意写法：借临时数组避免 move，且后续仍复用 x；
+// clippy 的 from_ref 建议与 `&[T; N]` 定长参数签名不兼容，故整体豁免该 lint
+#[allow(clippy::cloned_ref_to_slice_refs)]
 mod tests {
     use super::*;
     use num_bigint::BigUint;
@@ -640,7 +643,7 @@ mod tests {
             "触顶重置后旧缓存应被清空"
         );
         assert!(
-            cache.biguint_idx.get(&BigUint::from(0u64)).is_none(),
+            !cache.biguint_idx.contains_key(&BigUint::from(0u64)),
             "触顶重置后 BigUint 索引应被清理"
         );
 
