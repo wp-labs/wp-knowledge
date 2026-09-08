@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`FieldQueryCache` 补全其余可作 SQL 参数的类型索引**：新增 `bool_idx`（Bool 参数）、`float_idx`（Float 参数，键 = IEEE-754 bits）、`text_idx`（Symbol/Time/Hex/IpNet/Domain/Url/Email/IdCard/MobilePhone 等按 Text 绑定的文本类参数，与 Chars 同 SQL 语义）；`Null/Ignore`（无缓存价值）与 `Obj/Array`（Debug 文本、罕见参数）保持不缓存。
 
 ### Tests
-- 新增 `BigUint` 单/多参数命中与 miss、类型隔离、触顶重置清理与重建，以及 Bool/Float 命中与 miss、文本类（Domain）命中与 Chars 隔离等共 6 个用例。
+- 新增 `BigUint` 单/多参数命中与 miss、类型隔离、触顶重置清理与重建，以及 Bool/Float 命中与 miss、文本类（Domain）命中与 Chars 隔离、混合类型多参数与重复 save 幂等（索引号不膨胀）等共 7 个用例。
 
 ## [0.16.1 latest]
 
