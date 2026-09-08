@@ -16,6 +16,13 @@ pub struct FieldQueryCache {
     /// BigUint 参数索引：键为规范化十进制字符串（`num_bigint::BigUint::to_string`），
     /// 独立于其它类型表，避免与 Chars/Digit 等发生碰撞（wp-labs/warp-parse#359）
     biguint_idx: HashMap<String, usize>,
+    /// Bool 参数索引（布尔筛选参数）
+    bool_idx: HashMap<bool, usize>,
+    /// Float 参数索引：键为 IEEE-754 bits（`f64::to_bits`），避免 NaN/相等性歧义
+    float_idx: HashMap<u64, usize>,
+    /// 其余文本类参数（Symbol/Time/Hex/IpNet/Domain/Url/Email/IdCard/MobilePhone）统一索引：
+    /// provider 侧均按 Text 绑定，与 Chars 同 SQL 语义；Chars 保留零分配 str_idx
+    text_idx: HashMap<String, usize>,
     cache_data: LruCache<LocalCacheKey, Vec<DataField>>,
     idx_num: usize,
     /// `scope -> generation`：本地缓存按 scope（provider 粒度）跟踪代际，
@@ -39,6 +46,9 @@ impl FieldQueryCache {
             i64_idx: HashMap::new(),
             ip_idx: HashMap::new(),
             biguint_idx: HashMap::new(),
+            bool_idx: HashMap::new(),
+            float_idx: HashMap::new(),
+            text_idx: HashMap::new(),
             cache_data: LruCache::new(NonZeroUsize::new(size).expect("non-zero cache size")),
             idx_num: 0,
             generations: HashMap::new(),
@@ -51,8 +61,30 @@ impl FieldQueryCache {
             Value::Digit(v) => self.i64_idx.get(v).copied(),
             Value::IpAddr(v) => self.ip_idx.get(v).copied(),
             Value::BigUint(v) => self.biguint_idx.get(&v.to_string()).copied(),
+            Value::Bool(v) => self.bool_idx.get(v).copied(),
+            Value::Float(v) => self.float_idx.get(&v.to_bits()).copied(),
+            // 文本类（Symbol/Time/Hex/IpNet/Domain/Url/Email/IdCard/MobilePhone）→ provider 按 Text 绑定
+            Value::Symbol(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::Time(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::Hex(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::IpNet(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::Domain(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::Url(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::Email(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::IdCard(v) => self.text_idx.get(&v.to_string()).copied(),
+            Value::MobilePhone(v) => self.text_idx.get(&v.to_string()).copied(),
             _ => None,
         }
+    }
+
+    /// 文本类参数索引插入/查找：新值分配全局编号（键规范化 to_string）
+    fn up_text_idx(&mut self, key: String) -> Option<usize> {
+        if let Some(idx) = self.text_idx.get(&key) {
+            return Some(*idx);
+        }
+        self.idx_num += 1;
+        self.text_idx.insert(key, self.idx_num);
+        Some(self.idx_num)
     }
 
     fn try_up_idx(&mut self, param: &DataField) -> Option<usize> {
@@ -62,6 +94,9 @@ impl FieldQueryCache {
             self.i64_idx.clear();
             self.ip_idx.clear();
             self.biguint_idx.clear();
+            self.bool_idx.clear();
+            self.float_idx.clear();
+            self.text_idx.clear();
             self.cache_data.clear();
             self.generations.clear();
             self.idx_num = 0;
@@ -104,6 +139,35 @@ impl FieldQueryCache {
                     Some(self.idx_num)
                 }
             }
+            Value::Bool(v) => {
+                if let Some(idx) = self.bool_idx.get(v) {
+                    Some(*idx)
+                } else {
+                    self.idx_num += 1;
+                    self.bool_idx.insert(*v, self.idx_num);
+                    Some(self.idx_num)
+                }
+            }
+            Value::Float(v) => {
+                let key = v.to_bits();
+                if let Some(idx) = self.float_idx.get(&key) {
+                    Some(*idx)
+                } else {
+                    self.idx_num += 1;
+                    self.float_idx.insert(key, self.idx_num);
+                    Some(self.idx_num)
+                }
+            }
+            // 文本类（Symbol/Time/Hex/IpNet/Domain/Url/Email/IdCard/MobilePhone）→ provider 按 Text 绑定
+            Value::Symbol(v) => self.up_text_idx(v.to_string()),
+            Value::Time(v) => self.up_text_idx(v.to_string()),
+            Value::Hex(v) => self.up_text_idx(v.to_string()),
+            Value::IpNet(v) => self.up_text_idx(v.to_string()),
+            Value::Domain(v) => self.up_text_idx(v.to_string()),
+            Value::Url(v) => self.up_text_idx(v.to_string()),
+            Value::Email(v) => self.up_text_idx(v.to_string()),
+            Value::IdCard(v) => self.up_text_idx(v.to_string()),
+            Value::MobilePhone(v) => self.up_text_idx(v.to_string()),
             _ => None,
         }
     }
@@ -481,6 +545,49 @@ mod tests {
         assert_eq!(cache.fetch(&[chars]), Some(&result_row(2)));
         assert_eq!(cache.fetch(&[digit]), Some(&result_row(3)));
         assert_eq!(cache.fetch(&[ip]), Some(&result_row(4)));
+    }
+
+    #[test]
+    fn bool_and_float_param_cache() {
+        let mut cache = FieldQueryCache::default();
+        let b_true = DataField::from_bool("k", true);
+        let f_15 = DataField::from_float("k", 1.5);
+
+        // Bool：同值命中、异值 miss
+        assert!(cache.fetch(&[b_true.clone()]).is_none());
+        cache.save(&[b_true.clone()], result_row(1));
+        assert_eq!(cache.fetch(&[b_true.clone()]), Some(&result_row(1)));
+        assert!(cache.fetch(&[DataField::from_bool("k", false)]).is_none());
+
+        // Float：同值命中、异值 miss
+        assert!(cache.fetch(&[f_15.clone()]).is_none());
+        cache.save(&[f_15.clone()], result_row(2));
+        assert_eq!(cache.fetch(&[f_15.clone()]), Some(&result_row(2)));
+        assert!(cache.fetch(&[DataField::from_float("k", 2.5)]).is_none());
+    }
+
+    #[test]
+    fn text_like_param_cache_and_isolation_from_chars() {
+        let mut cache = FieldQueryCache::default();
+        let domain = DataField::from_domain("k", "example.com");
+        let chars = DataField::from_chars("k", "example.com");
+
+        cache.save(&[domain.clone()], result_row(1));
+        cache.save(&[chars.clone()], result_row(2));
+
+        // 同文本类同值 → 命中
+        assert_eq!(
+            cache.fetch(&[DataField::from_domain("k", "example.com")]),
+            Some(&result_row(1))
+        );
+        // 不同值 → miss
+        assert!(
+            cache
+                .fetch(&[DataField::from_domain("k", "other.com")])
+                .is_none()
+        );
+        // 与 Chars 同文本各自索引，互不碰撞
+        assert_eq!(cache.fetch(&[chars]), Some(&result_row(2)));
     }
 
     #[test]

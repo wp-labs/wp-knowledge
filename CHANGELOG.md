@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **`FieldQueryCache` 支持 `Value::BigUint` 参数索引**：新增独立 `biguint_idx`（键为规范化十进制字符串），`get_idx`/`try_up_idx`/触顶重置均覆盖 `BigUint`——`ip_to_biguint` 转换结果作为 SQL 参数时本地字段缓存可命中，不再每次重复访问 provider；索引按类型隔离，与 `Chars`/`Digit`/`IpAddr` 不碰撞。关联 wp-labs/warp-parse#359。
+- **`FieldQueryCache` 补全其余可作 SQL 参数的类型索引**：新增 `bool_idx`（Bool 参数）、`float_idx`（Float 参数，键 = IEEE-754 bits）、`text_idx`（Symbol/Time/Hex/IpNet/Domain/Url/Email/IdCard/MobilePhone 等按 Text 绑定的文本类参数，与 Chars 同 SQL 语义）；`Null/Ignore`（无缓存价值）与 `Obj/Array`（Debug 文本、罕见参数）保持不缓存。
 
 ### Tests
-- 新增单参数/多参数 `BigUint` 命中与不同值 miss、类型隔离（Chars "1"/Digit 1/BigUint 1/IpAddr 互不碰撞）、索引触顶重置后清理与重建等 4 个用例。
+- 新增 `BigUint` 单/多参数命中与 miss、类型隔离、触顶重置清理与重建，以及 Bool/Float 命中与 miss、文本类（Domain）命中与 Chars 隔离等共 6 个用例。
 
 ## [0.16.1 latest]
 
