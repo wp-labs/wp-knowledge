@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod sql_route;
 pub mod sqlite_ext;
 pub mod telemetry;
+pub mod vel;
 
 #[allow(deprecated)]
 pub use error::{KnowReason, KnowledgeError, KnowledgeResult, Reason};

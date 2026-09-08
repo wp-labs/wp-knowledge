@@ -16,7 +16,8 @@
 //! - [`RefreshSource::Authority`]：KnowDB V2 conf + sqlite 权威库文件单表
 //!   重载（CSV 重读 → 建表/清空/重灌 → 投影行；见 `loader::reload_table_rows`）。
 //! - [`RefreshSource::NamedSql`]：命名 SQL provider 直查重载
-//!   （`facade::query_async_for`；PG/MySQL 供给，异步池查询）。
+//!   （`facade::query_async_for`；PG/MySQL 供给，异步池查询）。SQL 可含 `$name`
+//!   占位符，由表级 **VEL**（变量求值语言，见 [`crate::vel`]）代码每 tick 求值替换。
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,199 +27,6 @@ use tokio::sync::mpsc;
 use crate::error::{KnowReason, KnowledgeResult};
 use crate::mem::RowData;
 use orion_error::conversion::ToStructError;
-
-/// 刷新变量代码：每行一个赋值 `$name = 表达式`，knowdb 每次执行前按自身
-/// tick 时钟求值（语义完全归宿主配置）。表达式 = 字符串字面量（引号内，如
-/// `"2 hours"`）或内建函数调用。
-///
-/// 内建（相位周期格，供基线供给的 `$cur`/`$next` 等使用；参数为**秒**）：
-/// - `cur_phase_bucket(period_s, bucket_s[, prefix])`：当前相位格标签
-///   `prefix + fold(now)`，`fold(t) = (t mod period) div bucket`；prefix 默认 `"p"`；
-/// - `next_phase_bucket(period_s, bucket_s[, prefix])`：下一相位格标签
-///   `fold(now + bucket)`（周期末自动回绕到首格）。
-///
-/// 示例（demo PG 供给）：
-/// ```text
-/// $max_age = "2 hours"
-/// $cur  = cur_phase_bucket(240, 15)
-/// $next = next_phase_bucket(240, 15)
-/// ```
-/// 空代码 = 静态 SQL 直接执行。
-#[derive(Debug, Clone, PartialEq)]
-pub enum RefreshCodeVar {
-    /// 静态字面量透传（如 `$max_age = "2 hours"`）。
-    Static { name: String, value: String },
-    /// 周期格变量（`cur`/`next` 等）：`prefix + fold(now + offset_slots*bucket)`。
-    PhaseBucket {
-        name: String,
-        period_s: u64,
-        bucket_s: u64,
-        offset_slots: i64,
-        prefix: String,
-    },
-}
-
-/// 解析刷新变量代码 → 有序赋值列表（不支持控制流；错误即配置错误）。
-pub fn parse_refresh_code(code: &str) -> KnowledgeResult<Vec<RefreshCodeVar>> {
-    let mut out = Vec::new();
-    for (idx, raw) in code.lines().enumerate() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((lhs, rhs)) = line.split_once('=') else {
-            return err_at(idx, format!("缺 '=' 的赋值行: {line}"));
-        };
-        let name = lhs.trim();
-        if !(name.starts_with('$')
-            && name.len() > 1
-            && name[1..]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        {
-            return err_at(idx, format!("左侧应为 $name，实际 {name}"));
-        }
-        let expr = rhs.trim();
-        let var = parse_code_expr(&name[1..], expr)
-            .map_err(|e| code_err(format!("第{}行: {}", idx + 1, e)))?;
-        out.push(var);
-    }
-    Ok(out)
-}
-
-fn parse_code_expr(name: &str, expr: &str) -> Result<RefreshCodeVar, String> {
-    // 字符串字面量："..."
-    if expr.starts_with('"') {
-        if !expr.ends_with('"') || expr.len() < 2 {
-            return Err(format!("字符串字面量未闭合: {expr}"));
-        }
-        return Ok(RefreshCodeVar::Static {
-            name: name.to_string(),
-            value: expr[1..expr.len() - 1].to_string(),
-        });
-    }
-    // 函数调用：name(a, b, c)
-    if let Some(open) = expr.find('(') {
-        if !expr.ends_with(')') {
-            return Err(format!("函数调用缺右括号: {expr}"));
-        }
-        let fname = expr[..open].trim();
-        let args_raw = expr[open + 1..expr.len() - 1].trim();
-        let args: Vec<&str> = if args_raw.is_empty() {
-            Vec::new()
-        } else {
-            args_raw.split(',').map(|a| a.trim()).collect()
-        };
-        let num = |a: &str| -> Result<u64, String> {
-            a.parse::<u64>()
-                .map_err(|_| format!("{fname}() 参数应为正整数秒，实际 {a:?}"))
-        };
-        match (fname, args.len()) {
-            ("cur_phase_bucket", 2..=3) => Ok(RefreshCodeVar::PhaseBucket {
-                name: name.to_string(),
-                period_s: num(args[0])?,
-                bucket_s: num(args[1])?,
-                offset_slots: 0,
-                prefix: prefix_arg(args.get(2).copied())?,
-            }),
-            ("next_phase_bucket", 2..=3) => Ok(RefreshCodeVar::PhaseBucket {
-                name: name.to_string(),
-                period_s: num(args[0])?,
-                bucket_s: num(args[1])?,
-                offset_slots: 1,
-                prefix: prefix_arg(args.get(2).copied())?,
-            }),
-            ("cur_phase_bucket" | "next_phase_bucket", n) => Err(format!(
-                "{fname}() 需 2~3 参数 (period_s, bucket_s[, prefix])，实际 {n}"
-            )),
-            _ => Err(format!("未知变量函数: {fname}")),
-        }
-    } else {
-        Err(format!(
-            "不支持的表达式: {expr}（支持 字符串字面量 / 变量函数）"
-        ))
-    }
-}
-
-fn prefix_arg(arg: Option<&str>) -> Result<String, String> {
-    match arg {
-        None => Ok("p".to_string()),
-        Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2 => {
-            Ok(a[1..a.len() - 1].to_string())
-        }
-        Some(a) => Err(format!("prefix 应为字符串字面量，实际 {a:?}")),
-    }
-}
-
-fn err_at(idx: usize, msg: String) -> KnowledgeResult<Vec<RefreshCodeVar>> {
-    Err(code_err(format!("第{}行: {}", idx + 1, msg)))
-}
-
-fn code_err(msg: String) -> crate::error::KnowledgeError {
-    KnowReason::from_res()
-        .to_err()
-        .with_detail(format!("refresh code: {msg}"))
-}
-
-/// 在给定时刻现算全部变量（`(name, value)`；按代码行序）。
-pub fn eval_refresh_code(code: &str, now_ns: u64) -> KnowledgeResult<Vec<(String, String)>> {
-    let defs = parse_refresh_code(code)?;
-    let mut out = Vec::with_capacity(defs.len());
-    for d in &defs {
-        match d {
-            RefreshCodeVar::Static { name, value } => out.push((name.clone(), value.clone())),
-            RefreshCodeVar::PhaseBucket {
-                name,
-                period_s,
-                bucket_s,
-                offset_slots,
-                prefix,
-            } => {
-                let period_ns = period_s.saturating_mul(1_000_000_000);
-                let bucket_ns = bucket_s.saturating_mul(1_000_000_000);
-                if period_ns == 0 || bucket_ns == 0 || bucket_ns > period_ns {
-                    return Err(code_err(format!(
-                        "$ {name}: 相位参数非法（须 0<桶≤周期）: period={period_s} bucket={bucket_s}"
-                    )));
-                }
-                let t = if *offset_slots >= 0 {
-                    now_ns.saturating_add((*offset_slots as u64).saturating_mul(bucket_ns))
-                } else {
-                    now_ns.saturating_sub((-(*offset_slots) as u64).saturating_mul(bucket_ns))
-                };
-                let idx = (t % period_ns) / bucket_ns;
-                out.push((name.clone(), format!("{prefix}{idx}")));
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// 把 `$name` 占位符替换为对应值（文本替换；值不应含 `$`）。
-pub fn resolve_sql_vars(sql: &str, vars: &[(String, String)]) -> String {
-    let mut out = sql.to_string();
-    for (name, value) in vars {
-        out = out.replace(&format!("${name}"), value);
-    }
-    out
-}
-
-/// 求值变量代码并渲染 SQL 模板。boot 装载可复用本函数保证与刷新同源。
-pub fn render_refresh_code(sql: &str, code: &str, now_ns: u64) -> KnowledgeResult<String> {
-    if code.trim().is_empty() {
-        return Ok(sql.to_string());
-    }
-    let vars = eval_refresh_code(code, now_ns)?;
-    Ok(resolve_sql_vars(sql, &vars))
-}
-
-/// 当前墙钟 epoch 纳秒（变量计算与 boot 渲染的时钟来源）。
-pub fn current_wall_nanos() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
 
 /// 事件通道容量（满则丢弃单次事件，绝不阻塞刷新周期）。
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
@@ -242,10 +50,10 @@ pub enum RefreshSource {
     NamedSql {
         /// 已注册的 provider 名（`init_*_provider_named`）。
         provider: String,
-        /// 每次刷新执行的 SQL（模板：可含 `$name` 占位符，由 [`eval_refresh_code`]
-        /// 每次执行前现算替换）。
+        /// 每次刷新执行的 SQL（模板：可含 `$name` 占位符，由 VEL（见 [`crate::vel`]）
+        /// 每次执行前求值替换）。
         sql: String,
-        /// 刷新变量代码（见 [`parse_refresh_code`]；空 = 静态 SQL 直接执行）。
+        /// VEL 变量代码（每行 `$name = 字面量/内建函数`；空 = 静态 SQL 直接执行）。
         code: String,
     },
 }
@@ -351,9 +159,9 @@ async fn reload(spec: &RefreshSpec) -> KnowledgeResult<Vec<RowData>> {
             sql,
             code,
         } => {
-            // 变量代码：每次执行前按 knowdb 自身时钟求值并替换 `$name`（如
-            // $cur/$next——见 [`parse_refresh_code`] 内建）。空 = 静态 SQL。
-            let sql = render_refresh_code(sql, code, current_wall_nanos())?;
+            // VEL（变量求值语言）：每次执行前按 knowdb 自身时钟求值并替换 `$name`
+            // （如 $cur/$next——见 [`crate::vel`] 内建）。空 = 静态 SQL。
+            let sql = crate::vel::render(sql, code, crate::vel::current_wall_nanos())?;
             crate::facade::query_async_for(provider, &sql).await
         }
         RefreshSource::Authority {
@@ -518,94 +326,6 @@ mod tests {
         drop(service);
         // drop 后无任务可再发事件：这里主要验证不 panic、干净退出（类型层面
         // receiver 已随 service 一并 drop）。
-    }
-
-    #[test]
-    fn resolve_sql_vars_replaces_placeholders_and_keeps_unknown() {
-        let vars = vec![
-            ("cur".to_string(), "p7".to_string()),
-            ("next".to_string(), "p8".to_string()),
-            ("max_age".to_string(), "30 days".to_string()),
-        ];
-        let sql = "SELECT * FROM t WHERE phase_bucket IN ('$cur','$next') AND win_start >= now() - interval '$max_age'";
-        let out = resolve_sql_vars(sql, &vars);
-        assert_eq!(
-            out,
-            "SELECT * FROM t WHERE phase_bucket IN ('p7','p8') AND win_start >= now() - interval '30 days'"
-        );
-        // 未提供/未用到的占位符保持原样；空变量表 = 原样返回。
-        assert_eq!(
-            resolve_sql_vars("SELECT * FROM t WHERE k = '$ghost'", &vars),
-            "SELECT * FROM t WHERE k = '$ghost'"
-        );
-        assert_eq!(resolve_sql_vars(sql, &[]), sql);
-    }
-
-    #[test]
-    fn refresh_code_evaluates_phase_functions_and_literals() {
-        // period=240s/bucket=15s（N=16）：120s → 桶 8；下一格 135s → 桶 9。
-        let ns = |s: u64| s.saturating_mul(1_000_000_000);
-        let code = r#"
-# 供给变量：静态保留期 + 当前/下一相位格
-$max_age = "2 hours"
-$cur  = cur_phase_bucket(240, 15)
-$next = next_phase_bucket(240, 15)
-"#;
-        assert_eq!(
-            eval_refresh_code(code, ns(120)).unwrap(),
-            vec![
-                ("max_age".to_string(), "2 hours".to_string()),
-                ("cur".to_string(), "p8".to_string()),
-                ("next".to_string(), "p9".to_string()),
-            ]
-        );
-        // 周期末回绕：225s 末格 cur=p15；+1 格 240s → p0。
-        let kv = eval_refresh_code(code, ns(225)).unwrap();
-        let map: std::collections::HashMap<&str, &str> =
-            kv.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert_eq!(map["cur"], "p15");
-        assert_eq!(map["next"], "p0");
-        // 跨周期同相位复现：360s（120+240）→ 仍桶 8。
-        let kv = eval_refresh_code(code, ns(360)).unwrap();
-        assert_eq!(kv[1], ("cur".to_string(), "p8".to_string()));
-    }
-
-    #[test]
-    fn refresh_code_custom_prefix_and_errors() {
-        let ns = |s: u64| s.saturating_mul(1_000_000_000);
-        // 自定义前缀（可选第三参）
-        let kv = eval_refresh_code("$b = cur_phase_bucket(240, 15, \"slot\")", ns(120)).unwrap();
-        assert_eq!(kv, vec![("b".to_string(), "slot8".to_string())]);
-        // 未知函数 / 缺 = / 空代码 → 错误或空
-        assert!(
-            eval_refresh_code("$x = foo(1)", ns(0)).is_err(),
-            "未知函数应报错"
-        );
-        assert!(
-            eval_refresh_code("no_assign", ns(0)).is_err(),
-            "缺 = 应报错"
-        );
-        assert!(eval_refresh_code("", ns(0)).unwrap().is_empty());
-        assert!(eval_refresh_code("# 纯注释", ns(0)).unwrap().is_empty());
-        // 非法相位参数 → 求值报错
-        assert!(eval_refresh_code("$x = cur_phase_bucket(15, 240)", ns(0)).is_err());
-    }
-
-    #[test]
-    fn render_refresh_code_substitutes_and_empty_passes_through() {
-        let ns = |s: u64| s.saturating_mul(1_000_000_000);
-        let code = "$cur = cur_phase_bucket(240, 15)\n$max_age = \"2 hours\"";
-        let sql = "SELECT * FROM t WHERE phase_bucket = '$cur' AND win_start >= now() - interval '$max_age'";
-        assert_eq!(
-            render_refresh_code(sql, code, ns(120)).unwrap(),
-            "SELECT * FROM t WHERE phase_bucket = 'p8' AND win_start >= now() - interval '2 hours'"
-        );
-        // 空代码 = 原样返回
-        assert_eq!(render_refresh_code(sql, "", ns(120)).unwrap(), sql);
-        assert_eq!(
-            render_refresh_code(sql, "  \n# note\n", ns(120)).unwrap(),
-            sql
-        );
     }
 
     #[tokio::test(flavor = "current_thread")]
