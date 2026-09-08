@@ -19,6 +19,7 @@
 //!   （`facade::query_async_for`；PG/MySQL 供给，异步池查询）。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -26,6 +27,34 @@ use tokio::sync::mpsc;
 use crate::error::{KnowReason, KnowledgeResult};
 use crate::mem::RowData;
 use orion_error::conversion::ToStructError;
+
+/// 刷新变量提供器（宿主注入）：每次执行 SQL 前现算 `$name → 值` 列表。
+///
+/// 用途：供给查询需要随**当前时刻**变化的参数（如相位供给的 `$cur`/`$next`
+/// ——当前相位由宿主引擎现算），SQL 模板里写 `$name` 占位符，刷新循环执行前
+/// 用返回值做文本替换。语义完全归宿主；本模块只提供"取数 + 替换"两个小能力。
+#[derive(Clone)]
+pub struct RefreshVars(Arc<dyn Fn() -> KnowledgeResult<Vec<(String, String)>> + Send + Sync>);
+
+impl RefreshVars {
+    /// 以变量计算函数构造（每 tick 调用一次）。
+    pub fn new(
+        f: impl Fn() -> KnowledgeResult<Vec<(String, String)>> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(f))
+    }
+
+    /// 现算本次变量（`(name, value)`；替换 `$name`）。
+    pub fn compute(&self) -> KnowledgeResult<Vec<(String, String)>> {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for RefreshVars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RefreshVars(..)")
+    }
+}
 
 /// 事件通道容量（满则丢弃单次事件，绝不阻塞刷新周期）。
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
@@ -49,9 +78,22 @@ pub enum RefreshSource {
     NamedSql {
         /// 已注册的 provider 名（`init_*_provider_named`）。
         provider: String,
-        /// 每次刷新执行的 SQL。
+        /// 每次刷新执行的 SQL（模板：可含 `$name` 占位符，由 [`RefreshVars`] 替换）。
         sql: String,
+        /// 变量计算（宿主）：`Some` 时每次执行前调用并替换 SQL 中的 `$name`；
+        /// `None` = 静态 SQL 直接执行。
+        vars: Option<RefreshVars>,
     },
+}
+
+/// 把 `$name` 占位符替换为对应值（文本替换；值不应含 `$`）。
+/// 供刷新循环与宿主 boot 装载共用（boot 与首 refresh 必须同源渲染）。
+pub fn resolve_sql_vars(sql: &str, vars: &[(String, String)]) -> String {
+    let mut out = sql.to_string();
+    for (name, value) in vars {
+        out = out.replace(&format!("${name}"), value);
+    }
+    out
 }
 
 /// 一条定期刷新规格。
@@ -150,8 +192,18 @@ async fn run_spec(spec: RefreshSpec, tx: mpsc::Sender<RefreshEvent>) {
 
 async fn reload(spec: &RefreshSpec) -> KnowledgeResult<Vec<RowData>> {
     match &spec.source {
-        RefreshSource::NamedSql { provider, sql } => {
-            crate::facade::query_async_for(provider, sql).await
+        RefreshSource::NamedSql {
+            provider,
+            sql,
+            vars,
+        } => {
+            // 变量注入：每次执行前现算并替换 `$name`（如 $cur/$next——当前相位
+            // 宿主现算）；无 vars = 静态 SQL 直接执行。
+            let sql = match vars {
+                Some(v) => resolve_sql_vars(sql, &v.compute()?),
+                None => sql.clone(),
+            };
+            crate::facade::query_async_for(provider, &sql).await
         }
         RefreshSource::Authority {
             root,
@@ -315,5 +367,60 @@ mod tests {
         drop(service);
         // drop 后无任务可再发事件：这里主要验证不 panic、干净退出（类型层面
         // receiver 已随 service 一并 drop）。
+    }
+
+    #[test]
+    fn resolve_sql_vars_replaces_placeholders_and_keeps_unknown() {
+        let vars = vec![
+            ("cur".to_string(), "p7".to_string()),
+            ("next".to_string(), "p8".to_string()),
+            ("max_age".to_string(), "30 days".to_string()),
+        ];
+        let sql = "SELECT * FROM t WHERE phase_bucket IN ('$cur','$next') AND win_start >= now() - interval '$max_age'";
+        let out = resolve_sql_vars(sql, &vars);
+        assert_eq!(
+            out,
+            "SELECT * FROM t WHERE phase_bucket IN ('p7','p8') AND win_start >= now() - interval '30 days'"
+        );
+        // 未提供/未用到的占位符保持原样；空变量表 = 原样返回。
+        assert_eq!(
+            resolve_sql_vars("SELECT * FROM t WHERE k = '$ghost'", &vars),
+            "SELECT * FROM t WHERE k = '$ghost'"
+        );
+        assert_eq!(resolve_sql_vars(sql, &[]), sql);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn named_sql_spec_substitutes_vars_before_each_query() {
+        let _guard = crate::runtime::runtime_test_guard().lock_async().await;
+        // 准备内存 provider（默认名）：两行 k=a/b，刷新查询按 $cur 过滤。
+        let db = crate::mem::memdb::MemDB::instance();
+        db.execute("CREATE TABLE refresh_vars_t (k TEXT, v TEXT)")
+            .expect("create");
+        db.execute("INSERT INTO refresh_vars_t VALUES ('a', '1'), ('b', '2')")
+            .expect("seed");
+        crate::facade::init_mem_provider(db).expect("init mem provider");
+        let vars = RefreshVars::new(|| {
+            Ok(vec![
+                ("cur".to_string(), "b".to_string()),
+                ("next".to_string(), "c".to_string()),
+            ])
+        });
+        let mut service = RefreshService::spawn(vec![RefreshSpec {
+            name: "vars_t".into(),
+            interval: Duration::from_millis(80),
+            source: RefreshSource::NamedSql {
+                provider: "default".to_string(),
+                sql: "SELECT v FROM refresh_vars_t WHERE k = '$cur'".to_string(),
+                vars: Some(vars),
+            },
+        }]);
+        let events = collect(&mut service, 1, Duration::from_millis(1500)).await;
+        assert_eq!(events.len(), 1, "应出 1 次刷新事件");
+        assert_eq!(events[0].name, "vars_t");
+        assert_eq!(events[0].rows.len(), 1, "$cur→'b' 过滤后应只回 1 行");
+        let field = &events[0].rows[0][0];
+        assert_eq!(field.get_name(), "v");
+        assert_eq!(field.to_string(), "chars(2)");
     }
 }
