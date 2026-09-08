@@ -226,13 +226,13 @@ impl SqlProviderSpec {
                         "provider '{name}': postgres_session is only valid for kind = \"postgres\""
                     )));
                 }
-                if let Some(app) = &session.application_name {
-                    if app.len() > 63 || app.chars().any(|c| c.is_control()) {
-                        return Err(KnowReason::from_conf().to_err().with_detail(format!(
-                            "provider '{name}': postgres_session.application_name invalid \
-                             (≤ 63 bytes, no control characters)"
-                        )));
-                    }
+                if let Some(app) = &session.application_name
+                    && (app.len() > 63 || app.chars().any(|c| c.is_control()))
+                {
+                    return Err(KnowReason::from_conf().to_err().with_detail(format!(
+                        "provider '{name}': postgres_session.application_name invalid \
+                         (≤ 63 bytes, no control characters)"
+                    )));
                 }
             }
         }

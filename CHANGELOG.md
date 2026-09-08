@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2 latest]
+
+### Fixed
+- **`FieldQueryCache` 支持 `Value::BigUint` 参数索引**：新增独立 `biguint_idx`（键为规范化十进制字符串），`get_idx`/`try_up_idx`/触顶重置均覆盖 `BigUint`——`ip_to_biguint` 转换结果作为 SQL 参数时本地字段缓存可命中，不再每次重复访问 provider；索引按类型隔离，与 `Chars`/`Digit`/`IpAddr` 不碰撞。关联 wp-labs/warp-parse#359。
+
+### Tests
+- 新增单参数/多参数 `BigUint` 命中与不同值 miss、类型隔离（Chars "1"/Digit 1/BigUint 1/IpAddr 互不碰撞）、索引触顶重置后清理与重建等 4 个用例。
+
 ## [0.16.1 latest]
 
 ### Added
