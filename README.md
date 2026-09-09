@@ -5,6 +5,7 @@
 [![docs.rs](https://img.shields.io/docsrs/wp-knowledge?logo=docsdotrs)](https://docs.rs/wp-knowledge)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![coverage](https://img.shields.io/badge/coverage-65%25-brightgreen)](docs/coverage.md)
+[![codecov](https://codecov.io/gh/wp-labs/wp-knowledge/branch/main/graph/badge.svg)](https://codecov.io/gh/wp-labs/wp-knowledge)
 
 > 数据驱动的 **KnowDB 查询与 Provider 组件**：一份 `knowdb.toml` 同时定义“数据从哪来、怎么装载、查哪个库”，并以统一查询门面访问 **SQLite（权威库）/ PostgreSQL / MySQL**。
 
