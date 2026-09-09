@@ -57,14 +57,110 @@ $next = phase_next(240, 15)
 用同一 `vel::render` 预渲染一次并 fail-fast**，避免运行期才发现；运行期求值失败 →
 本次跳过（warn）。
 
-## 宿主接入要点
+## 宿主接入（机制到代码）
 
-1. bootstrap：`refresh::register`（仓库内用法见 wf-runtime `lifecycle/provider_refresh`）
-   —— 登记 `RefreshSpec`，NamedSql 的 `code` 用 VEL 文本；boot 装载与刷新**同源
-   渲染**；
-2. daemon：`RefreshService::spawn(specs)` 后循环 `service.events.recv()`，把
-   `RefreshEvent.rows` 转为宿主行并搬入目标；
-3. 退出：drop / `shutdown()` 干净收尾。
+一次接入分三步，且**所有“知道目标是谁、行怎么转”的逻辑都在宿主侧**：
 
-完整可用示例：`wf-examples/baseline` 的 PG 供给（`knowdb.pg.toml` 的 `code` 块 +
-引擎 boot 装载/1s 刷新）。
+### 0. 一表一 spec 的完整生命周期
+
+```text
+宿主 bootstrap                knowdb(RefreshService)                宿主 daemon
+    │                               │                                   │
+    │ 1. 登记 RefreshSpec ─────────▶│                                   │
+    │ 2. 启动装载（自己查一次）       │   每表独立计时（interval）           │
+    │                               │   ├─ 首 tick：跳过                  │
+    │                               │   ├─ tick: reload(spec)            │
+    │                               │   │    ├─ NamedSql: VEL 求值替换      │
+    │                               │   │    │  sql → query_async_for      │
+    │                               │   │    └─ Authority: 重读 CSV 重灌     │
+    │                               │   └─ 成功 → 事件 {name, rows} ──────▶│
+    │                               │        失败 → warn，等下一周期          │ 3. 消费事件：
+    │                               │                                   │    按 name 定位目标，
+    │                               │                                   │    转换 rows 并搬入
+```
+
+### 1. bootstrap：构造 spec 并登记（可先 fail-fast 预渲染一次）
+
+> 下面代码里的 `register_spec` / `take_registered_specs` / `lookup_target` /
+> `convert_row` 是**宿主自己的胶水**——wp_knowledge 只提供 `RefreshSpec`、
+> `RefreshService`、`vel::render` 与事件本体；引擎的真实写法见文末“真实宿主对照”。
+
+```rust
+use wp_knowledge::refresh::{RefreshSource, RefreshSpec};
+
+// NamedSql + VEL：sql 模板含 $name，code 是 VEL 文本（每 tick 由 knowdb 现算）
+let sql = "SELECT * FROM facts WHERE slot IN ('$cur','$next') AND ts >= now() - interval '$max_age'";
+let code = r#"
+$max_age = "30 days"
+$cur  = phase_now(240, 15)
+$next = phase_next(240, 15)
+"#;
+
+// 启动装载：宿主自己先查一次（同一渲染、同源）——VEL 配置错在这里就暴露
+let boot_sql = wp_knowledge::vel::render(sql, code, wp_knowledge::vel::current_wall_nanos())
+    .expect("VEL 配置错误应 fail-fast");
+let rows = wp_knowledge::facade::query_for("engine_pg", &boot_sql)?;
+// 转成宿主行并填入你的目标表/join 窗（启动装载）……
+
+// 登记：interval 到期后由 RefreshService 周期重跑同一查询
+register_spec(RefreshSpec {
+    name: "baseline_ref".into(),          // 事件里带这个名字，宿主据此定位目标
+    interval: std::time::Duration::from_secs(1),
+    source: RefreshSource::NamedSql {
+        provider: "engine_pg".into(),     // facade::init_postgres_provider_named_uri 注册过的名字
+        sql: sql.into(),
+        code: code.into(),
+    },
+});
+
+// Authority 形态（CSV 重灌）则不需要 VEL：
+// RefreshSource::Authority { root, conf, authority_uri, table }
+```
+
+### 2. daemon：启动服务并消费事件（搬数据在你这里）
+
+```rust
+use tokio_util::sync::CancellationToken;
+use wp_knowledge::refresh::RefreshService;
+
+let mut service = RefreshService::spawn(take_registered_specs()); // 空 spec = 无任务、通道即闭
+loop {
+    tokio::select! {
+        _ = cancel.cancelled() => break,
+        ev = service.events.recv() => match ev {
+            Some(event) => apply(event.name.as_str(), event.rows), // ← 宿主搬入
+            None => break,   // 全部任务结束 / 服务被 shutdown → 通道关闭
+        }
+    }
+}
+
+// apply：原生行 → 宿主行 → 覆盖目标（引擎侧 = engine_rows_from_knowdb + Window::load）
+fn apply(name: &str, rows: Vec<wp_knowledge::mem::RowData>) {
+    let target = lookup_target(name);            // 你按 spec.name 维护的目标
+    let mine = rows.into_iter().map(convert_row).collect();
+    target.replace_all(mine);                    // 整表换行 + 重建索引
+}
+```
+
+### 3. 退出
+
+- 任务侧：`service.shutdown()` 中止全部 spec 任务（drop 等价）；事件通道随之关闭，
+  消费循环 `recv()` 返回 `None` 退出；
+- 建议配合 `CancellationToken`（如上）让消费循环与引擎主循环一起收尾。
+
+### 边界语义（务必记住）
+
+- **首 tick 不重载**：启动装载是你自己做的（步骤 1 已查一次）——别在 bootstrap 后
+  立即期待事件；
+- **每 tick 独立**：一表失败只跳过自己（warn），不阻塞其它表；
+- **事件可能被丢弃**：通道满时丢本次事件（不阻塞周期）——你的消费端应能容忍缺一
+  次刷新，以自身周期重查/下次事件自愈；
+- **只搬全表结果**：每次事件是“该表全量行”，语义 = 整表替换，不是增量。
+
+### 真实宿主对照
+
+- 引擎（wf-runtime `lifecycle/provider_refresh.rs`）：登记 spec 静态库 → daemon 启动
+  RefreshService → `apply_event` 把原生行经 `engine_rows_from_knowdb` 转引擎行后
+  `ProviderWindow::load()` 整表替换并重建 join 索引；
+- 完整可跑示例：`wf-examples/baseline` 的 PG 供给（`knowdb.pg.toml` 的 `code` 块 +
+  boot 装载/1s 刷新/`run.sh --pg` 全链）。
