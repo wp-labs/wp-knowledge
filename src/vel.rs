@@ -18,15 +18,15 @@
 //!
 //! | 函数 | 值 |
 //! |---|---|
-//! | `cur_phase_bucket(period_s, bucket_s[, prefix])` | 当前相位格标签 `prefix + fold(now)`，`fold(t) = (t mod period) div bucket` |
-//! | `next_phase_bucket(period_s, bucket_s[, prefix])` | 下一相位格标签 `fold(now + bucket)`（周期末自动回绕首格） |
+//! | `phase_now(period_s, bucket_s[, prefix])` | 当前相位格标签 `prefix + fold(now)`，`fold(t) = (t mod period) div bucket` |
+//! | `phase_next(period_s, bucket_s[, prefix])` | 下一相位格标签 `fold(now + bucket)`（周期末自动回绕首格） |
 //!
 //! 示例（demo PG 供给：基线只取当前/下一相位格在保留期内的收盘）：
 //!
 //! ```text
 //! $max_age = "2 hours"
-//! $cur  = cur_phase_bucket(240, 15)
-//! $next = next_phase_bucket(240, 15)
+//! $cur  = phase_now(240, 15)
+//! $next = phase_next(240, 15)
 //! ```
 //!
 //! 空代码 = 静态 SQL 直接执行。求值时钟见 [`current_wall_nanos`]。
@@ -105,21 +105,21 @@ fn parse_expr(name: &str, expr: &str) -> Result<VarDef, String> {
                 .map_err(|_| format!("{fname}() 参数应为正整数秒，实际 {a:?}"))
         };
         match (fname, args.len()) {
-            ("cur_phase_bucket", 2..=3) => Ok(VarDef::PhaseBucket {
+            ("phase_now", 2..=3) => Ok(VarDef::PhaseBucket {
                 name: name.to_string(),
                 period_s: num(args[0])?,
                 bucket_s: num(args[1])?,
                 offset_slots: 0,
                 prefix: prefix_arg(args.get(2).copied())?,
             }),
-            ("next_phase_bucket", 2..=3) => Ok(VarDef::PhaseBucket {
+            ("phase_next", 2..=3) => Ok(VarDef::PhaseBucket {
                 name: name.to_string(),
                 period_s: num(args[0])?,
                 bucket_s: num(args[1])?,
                 offset_slots: 1,
                 prefix: prefix_arg(args.get(2).copied())?,
             }),
-            ("cur_phase_bucket" | "next_phase_bucket", n) => Err(format!(
+            ("phase_now" | "phase_next", n) => Err(format!(
                 "{fname}() 需 2~3 参数 (period_s, bucket_s[, prefix])，实际 {n}"
             )),
             _ => Err(format!("未知 VEL 函数: {fname}")),
@@ -225,8 +225,8 @@ mod tests {
         let code = r#"
 # 注释 + 空行应忽略
 $max_age = "2 hours"
-$cur  = cur_phase_bucket(240, 15)
-$next = next_phase_bucket(240, 15)
+$cur  = phase_now(240, 15)
+$next = phase_next(240, 15)
 "#;
         assert_eq!(
             eval(code, ns(120)).unwrap(),
@@ -250,7 +250,7 @@ $next = next_phase_bucket(240, 15)
     #[test]
     fn custom_prefix_and_errors() {
         // 自定义前缀（可选第三参）
-        let kv = eval("$b = cur_phase_bucket(240, 15, \"slot\")", ns(120)).unwrap();
+        let kv = eval("$b = phase_now(240, 15, \"slot\")", ns(120)).unwrap();
         assert_eq!(kv, vec![("b".to_string(), "slot8".to_string())]);
         // 未知函数 / 缺 = / 空代码 / 纯注释
         assert!(eval("$x = foo(1)", ns(0)).is_err(), "未知函数应报错");
@@ -258,12 +258,12 @@ $next = next_phase_bucket(240, 15)
         assert!(eval("", ns(0)).unwrap().is_empty());
         assert!(eval("# 纯注释", ns(0)).unwrap().is_empty());
         // 非法相位参数 → 求值报错
-        assert!(eval("$x = cur_phase_bucket(15, 240)", ns(0)).is_err());
+        assert!(eval("$x = phase_now(15, 240)", ns(0)).is_err());
     }
 
     #[test]
     fn render_substitutes_and_empty_passes_through() {
-        let code = "$cur = cur_phase_bucket(240, 15)\n$max_age = \"2 hours\"";
+        let code = "$cur = phase_now(240, 15)\n$max_age = \"2 hours\"";
         let sql = "SELECT * FROM t WHERE phase_bucket = '$cur' AND win_start >= now() - interval '$max_age'";
         assert_eq!(
             render(sql, code, ns(120)).unwrap(),
