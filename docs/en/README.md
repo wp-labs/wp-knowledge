@@ -10,6 +10,7 @@ This index lists English documents only. For Chinese documents, enter `../zh/`.
 ## Guides
 
 - [KnowDB Configuration](./guides/config.md)
+- [Periodic Refresh & VEL](./guides/refresh.md)
 
 ## Architecture
 

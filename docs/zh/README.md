@@ -10,6 +10,7 @@
 ## Guides
 
 - [KnowDB 配置说明](./guides/config.md)
+- [定期刷新与 VEL](./guides/refresh.md)
 
 ## Architecture
 

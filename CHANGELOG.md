@@ -11,10 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **KnowDB 定期刷新异步服务（`refresh::RefreshService`）**：宿主（如主引擎 daemon）启动本服务，knowdb 负责各数据源的周期更新并**并发通知**——每表一条 `RefreshSpec` 独立计时，重载完成即经事件通道发出 `RefreshEvent{ name, rows }`（原生行 `Vec<RowData>`，宿主在边界自行转换/搬入，服务不感知宿主结构）。失败跳周期（warn）、事件通道满丢弃不阻塞刷新周期、drop/`shutdown()` 中止全部任务并关闭通道；首 tick 跳过（宿主已做启动装载）。
 - **数据源 v1**：`RefreshSource::Authority`（KnowDB V2 conf + sqlite 权威库单表重载）与 `RefreshSource::NamedSql`（命名 SQL provider 直查，`facade::query_async_for`）。
 - **`loader::reload_table_rows`**：权威库单表重载并返回类型化投影行（重读 CSV → create/clean/insert 重灌 → `SELECT columns.by_header`），与启动装载同一代码路径；供 refresh 服务与宿主启动装载共用。
+- **NamedSql 表级 VEL 变量代码（`code`）+ 独立 `vel` 模块（变量求值语言）**：`RefreshSource::NamedSql` 的 `sql` 可含 `$name` 占位符，每次执行前由一小段 VEL 代码按 knowdb tick 时钟求值替换。语法 = 每行 `$name = 字符串字面量 | 内建函数`（行尾 `#` 注释；名 `[A-Za-z_][A-Za-z0-9_]*`，重复定义/非法名报错）；内建 `phase_now/phase_next(period_s, bucket_s[, prefix])` 相位格标签（epoch 折桶、周期末回绕，prefix 默认 `p`）；`parse/eval/render/resolve_vars/current_wall_nanos`；空 code = 静态 SQL。渲染为**标识符感知**替换（`$cur` 不误伤 `$cur2`，未知 `$...` 原样保留）。
+- **`facade::init_postgres_provider_named_uri`**：命名 PG provider URI 便捷入口（`provider_exists`/NamedSql provider 名路由配套）。
+
+### Fixed
+- **`resolve_vars` 子串替换越界**：旧实现对 `$cur` 做文本 replace 会误伤 `$cur2`/`$cur_x`；改为按完整变量名（标识符感知）替换，未知/裸 `$` 原样保留。
 
 ### Tests
 - refresh：Authority 源周期出事件且行类型化（TEXT→Chars）、双表独立并发通知、零周期规格跳过、首 interval 前不触发、失败重载跳过且 `shutdown()` 后通道关闭、drop 干净退出。
 - loader：`reload_table_rows` CSV 覆盖后重载反映新文件（3→1 行）与列名/DDL 类型投影；未知表 / 禁用表 / 纯 `by_index` 表错误路径。
+- vel：字面量+相位函数求值（含 240/15 与自定义前缀）、周期末回绕 p15→p0、跨周期同相位复现、period==bucket 单格稳定、eval 随 now 确定性、标识符边界替换（前缀名/相邻/中文/裸 `$`）、重复/非法变量名拒绝、行尾注释与垃圾尾缀拒绝、空代码透传；refresh NamedSql `code` 端到端（mem provider `$cur` 过滤 1 行）。
 
 ## [0.16.3]
 
