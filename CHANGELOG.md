@@ -8,17 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.17.0]
 
 ### Added
-- **KnowDB 定期刷新异步服务（`refresh::RefreshService`）**：宿主（如主引擎 daemon）启动本服务，knowdb 负责各数据源的周期更新并**并发通知**——每表一条 `RefreshSpec` 独立计时，重载完成即经事件通道发出 `RefreshEvent{ name, rows }`（原生行 `Vec<RowData>`，宿主在边界自行转换/搬入，服务不感知宿主结构）。失败跳周期（warn）、事件通道满丢弃不阻塞刷新周期、drop/`shutdown()` 中止全部任务并关闭通道；首 tick 跳过（宿主已做启动装载）。
-- **数据源 v1**：`RefreshSource::Authority`（KnowDB V2 conf + sqlite 权威库单表重载）与 `RefreshSource::NamedSql`（命名 SQL provider 直查，`facade::query_async_for`）。
+- **KnowDB 定期刷新异步服务（`refresh::RefreshService` + `TableStore`）**：宿主（如主引擎 daemon）启动本服务，knowdb 负责各数据源的**周期更新并把最新一代换入自己的表快照库**——每表一条 `RefreshSpec` 独立计时；tick 重载成功 → 锁外整建 `Arc<TableData>` → `TableStore::insert`（O(1) Arc 指针换代）→ 信号通道发 `RefreshSignal{ name }`（**纯信号无数据载荷**）；**交付 = 函数调用**：调用者 `TableStore::snapshot` pull 当前代（Arc 零复制、不可变代共享，失败跳周期 warn、信号通道满丢信号不阻塞、drop/`shutdown()` 中止全部任务并关通道；首 tick 跳过）。配套同步 `load_rows(spec)`（boot 一次装载，与 tick 同一渲染/查询实现，供调用者 seed 同一 store）。
+- **数据源 v1**：`RefreshSource::Authority`（KnowDB V2 conf + sqlite 权威库单表重载）与 `RefreshSource::NamedSql`（命名 SQL provider 直查，`facade::query_async_for`/`query_for`）。
+- **`RefreshService::spawn_with_store(specs, store)`**：与调用者共享同一 `TableStore`——启动 seed 与 daemon 换代同库（启动/刷新同交付面）。
 - **`loader::reload_table_rows`**：权威库单表重载并返回类型化投影行（重读 CSV → create/clean/insert 重灌 → `SELECT columns.by_header`），与启动装载同一代码路径；供 refresh 服务与宿主启动装载共用。
 - **NamedSql 表级 VEL 变量代码（`code`）+ 独立 `vel` 模块（变量求值语言）**：`RefreshSource::NamedSql` 的 `sql` 可含 `$name` 占位符，每次执行前由一小段 VEL 代码按 knowdb tick 时钟求值替换。语法 = 每行 `$name = 字符串字面量 | 内建函数`（行尾 `#` 注释；名 `[A-Za-z_][A-Za-z0-9_]*`，重复定义/非法名报错）；内建 `phase_now/phase_next(period_s, bucket_s[, prefix])` 相位格标签（epoch 折桶、周期末回绕，prefix 默认 `p`）；`parse/eval/render/resolve_vars/current_wall_nanos`；空 code = 静态 SQL。渲染为**标识符感知**替换（`$cur` 不误伤 `$cur2`，未知 `$...` 原样保留）。
 - **`facade::init_postgres_provider_named_uri`**：命名 PG provider URI 便捷入口（`provider_exists`/NamedSql provider 名路由配套）。
 
 ### Fixed
+- **`RefreshService` 同名重复规格**：重复登记同一表会起两个并行 ticker 换代同一
+  store（查询耗时差异会让旧代覆盖新代）——`spawn`/`spawn_with_store` 现在只保留
+  首个同名 spec（warn 提示），一表一条刷新任务。
 - **`resolve_vars` 子串替换越界**：旧实现对 `$cur` 做文本 replace 会误伤 `$cur2`/`$cur_x`；改为按完整变量名（标识符感知）替换，未知/裸 `$` 原样保留。
 
 ### Tests
-- refresh：Authority 源周期出事件且行类型化（TEXT→Chars）、双表独立并发通知、零周期规格跳过、首 interval 前不触发、失败重载跳过且 `shutdown()` 后通道关闭、drop 干净退出。
+- refresh：Authority 源周期换代 store 且行类型化（TEXT→Chars）、双表独立并发信号、
+  零周期规格跳过、首 interval 前不触发、失败重载保留旧代且 `shutdown()` 后通道关闭、
+  drop 干净退出、同名重复 spec 去重；`TableStore` 换代 RCU 语义（旧 Arc 对持有者完整）
+  + 并发换代原子性（写者换入 vs 读者 snapshot）、`spawn_with_store` 覆盖启动 seed 代、
+  坏 VEL 每 tick 跳过且同步 `load_rows` fail-fast、`load_rows`（NamedSql VEL 替换 /
+  Authority 重灌）两臂同步装载。
 - loader：`reload_table_rows` CSV 覆盖后重载反映新文件（3→1 行）与列名/DDL 类型投影；未知表 / 禁用表 / 纯 `by_index` 表错误路径。
 - vel：字面量+相位函数求值（含 240/15 与自定义前缀）、周期末回绕 p15→p0、跨周期同相位复现、period==bucket 单格稳定、eval 随 now 确定性、标识符边界替换（前缀名/相邻/中文/裸 `$`）、重复/非法变量名拒绝、行尾注释与垃圾尾缀拒绝、空代码透传；refresh NamedSql `code` 端到端（mem provider `$cur` 过滤 1 行）。
 

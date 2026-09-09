@@ -9,7 +9,11 @@
 - 读取 `knowdb.toml`，按表配置将 `create.sql`、`insert.sql` 和 `data.csv` 装载为权威 SQLite 库。
 - 提供 `facade` 统一查询接口，支持无参、命名参数和缓存查询。
 - 支持通过 `knowdb.toml` 中的 `[provider]` 切换到外部 PostgreSQL 或 MySQL。
-- **定期刷新服务 `RefreshService`**：宿主启动后按表周期重载（Authority 单表 / NamedSql 直查）并发事件通知；NamedSql 的 SQL 支持 **VEL（变量求值语言）** `code` 每 tick 求值替换 `$name`（如 `phase_now/phase_next`）。
+- **定期刷新服务 `RefreshService`（换代 + 信号 + 函数取数）**：宿主启动后按表周期
+  重载（Authority 单表 / NamedSql 直查），把最新一代换入共享 `TableStore`（O(1)
+  Arc 指针换代）并只发**信号**；调用者以 `store.snapshot` **函数 pull** 当前代（Arc
+  零复制）。同名 spec 只保留首个（去重 warn）。NamedSql 的 SQL 支持 **VEL（变量求值
+  语言）** `code` 每 tick 求值替换 `$name`（如 `phase_now/phase_next`）。
 - 支持线程克隆只读连接与 WAL 文件库两种 Provider 初始化方式。
 - 内置 `ip4_int`、`ip4_between`、`cidr4_contains`、`trim_quotes` 等 SQLite UDF。
 
