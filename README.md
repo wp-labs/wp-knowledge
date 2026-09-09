@@ -1,49 +1,33 @@
 # wp-knowledge
 
-`wp-knowledge` 是一个 KnowDB 查询与 Provider 组件，支持从 `knowdb.toml` 加载知识库定义，并通过统一查询门面访问 SQLite、PostgreSQL 或 MySQL 数据源。
+> 数据驱动的 **KnowDB 查询与 Provider 组件**：一份 `knowdb.toml` 同时定义“数据从哪来、怎么装载、查哪个库”，并以统一查询门面访问 **SQLite（权威库）/ PostgreSQL / MySQL**。
 
-这个目录已经按独立仓库形态整理，可直接作为 `https://github.com/wp-labs/wp-knowledge` 的仓库根使用；保留在 `wp-motor` workspace 内时也可以继续正常构建。
+`wp-knowledge` 既可作为独立仓库使用（`github.com/wp-labs/wp-knowledge`），也保留在 `wp-motor` workspace 内正常构建。
 
-## 能力概览
+| | |
+|---|---|
+| 版本 | `0.17.0`（crate `wp-knowledge`，edition 2024） |
+| 许可证 | Apache-2.0 |
+| 文档 | [Docs Index](docs/README.md) · [中文](docs/zh/README.md) · [English](docs/en/README.md) |
 
-- 读取 `knowdb.toml`，按表配置将 `create.sql`、`insert.sql` 和 `data.csv` 装载为权威 SQLite 库。
-- 提供 `facade` 统一查询接口，支持无参、命名参数和缓存查询。
-- 支持通过 `knowdb.toml` 中的 `[provider]` 切换到外部 PostgreSQL 或 MySQL。
-- **定期刷新服务 `RefreshService`（换代 + 信号 + 函数取数）**：宿主启动后按表周期
-  重载（Authority 单表 / NamedSql 直查），把最新一代换入共享 `TableStore`（O(1)
-  Arc 指针换代）并只发**信号**；调用者以 `store.snapshot` **函数 pull** 当前代（Arc
-  零复制）。同名 spec 只保留首个（去重 warn）。NamedSql 的 SQL 支持 **VEL（变量求值
-  语言）** `code` 每 tick 求值替换 `$name`（如 `phase_now/phase_next`）。
-- 支持线程克隆只读连接与 WAL 文件库两种 Provider 初始化方式。
-- 内置 `ip4_int`、`ip4_between`、`cidr4_contains`、`trim_quotes` 等 SQLite UDF。
+---
 
-## 目录结构
+## ✨ 特性
 
-- `src/`：库实现与单元测试。
-- `tests/`：集成测试。
-- `knowdb/`：随包分发的示例 KnowDB。
-- `docs/`：架构与使用说明。
-- `.github/workflows/ci.yml`：独立仓库可直接使用的 CI。
+- **声明式装载**：读取 `knowdb.toml`，按表配置把 `create.sql / insert.sql / data.csv` 装载为权威 SQLite 库（`loader` 负责类型化重灌与投影）。
+- **统一查询门面 `facade`**：一套 API 覆盖 SQLite / PostgreSQL / MySQL——无参、命名参数、缓存查询；PG 的 `:name` 自动改写为 `$1/$2/...`，MySQL 原生支持 `:name`，业务层不改 SQL。
+- **分层缓存**：`result cache`（结果集，可配容量/TTL）、`local cache`（单次调用局部）、`metadata cache`（列元数据），reload / generation 变化整体失效。
+- **定期刷新（换代 + 信号 + 函数取数）**：`RefreshService` 按表周期重载，把最新一代换入共享 `TableStore`（O(1) Arc 指针换代），只发纯信号 `RefreshSignal`；调用者以 `store.snapshot` 函数 pull，Arc 零复制、丢信号无害。
+- **VEL 变量求值**：NamedSql 的 SQL 模板支持 `$name` 占位符，由 VEL 代码按 knowdb 时钟每 tick 求值替换（如相位标签 `phase_now/phase_next`）。
+- **Provider 初始化两形态**：线程克隆只读连接、WAL 文件库。
+- **内置 SQLite UDF**：`ip4_int`、`ip4_between`、`cidr4_contains`、`trim_quotes` 等。
+- **可观测**：`runtime_snapshot()` 读 provider/generation/缓存计数；telemetry bridge 把 reload / query / cache 事件接到 Prometheus、`wp-stats` 或宿主监控。
 
-## 更多说明 / More Docs
-
-- [文档索引 / Docs Index](docs/README.md)
-- [English Docs Index](docs/en/README.md)
-- [中文文档索引](docs/zh/README.md)
-- [KnowDB 配置说明](docs/zh/guides/config.md)
-- [定期刷新与 VEL](docs/zh/guides/refresh.md)
-- [KnowDB Configuration](docs/en/guides/config.md)
-- [Periodic Refresh & VEL](docs/en/guides/refresh.md)
-- [Provider 与 Cache 架构说明](docs/zh/architecture/provider-cache.md)
-- [Provider and Cache Architecture](docs/en/architecture/provider-cache.md)
-- [Async Provider 性能测试与结论](docs/zh/performance/async-provider.md)
-- [Async Provider Performance](docs/en/performance/async-provider.md)
-
-## 快速开始
+## 📦 快速开始
 
 ```toml
 [dependencies]
-wp-knowledge = "0.11.0"
+wp-knowledge = "0.17.0"
 ```
 
 ```rust
@@ -55,7 +39,7 @@ use wp_knowledge::facade;
 let authority_uri = "file:/tmp/wp-knowledge.sqlite?mode=rwc&uri=true";
 facade::init_thread_cloned_from_knowdb(
     Path::new("."),
-    Path::new("knowdb/knowdb.toml"),
+    Path::new("knowdb/knowdb.toml"), // 仓库自带示例 KnowDB
     authority_uri,
     &EnvDict::new(),
 )?;
@@ -63,19 +47,29 @@ let row = facade::query_row("SELECT COUNT(*) AS total FROM example")?;
 # Ok::<(), wp_error::Error2>(())
 ```
 
-## 外部 PostgreSQL / MySQL
+> 配置语法与完整查询示例见 [配置指南](docs/zh/guides/config.md)（[EN](docs/en/guides/config.md)）。
 
-`wp-knowledge` 现在支持在 `knowdb.toml` 中声明外部 PostgreSQL 或 MySQL provider。配置后：
+## 🧭 核心概念
 
-- 不再构建本地 `authority.sqlite`
-- 推荐通过 `facade::query_fields/cache_query_fields` 使用 provider-neutral 参数接口
-- `facade::query_named/cache_query` 仍保留，作为兼容旧版 SQLite 参数调用方式的 wrapper
-- 可通过 `facade::runtime_snapshot()` 读取当前 provider、generation，以及 result/local/metadata cache 的运行时计数与占用情况
-- 可通过 `facade::install_runtime_telemetry(...)` 安装外部 telemetry bridge，把 reload/cache/query 事件接到 Prometheus、`wp-stats` 或其他宿主监控系统
-- 可通过 `[cache]` 控制 `result cache` 的开关、容量和 TTL；`local cache` 与 `metadata cache` 不受这个配置影响
-- PostgreSQL / MySQL 现在也接入了 `metadata cache` 与对应 telemetry，重复查询相同 SQL 时会记录 metadata cache hit/miss
+```text
+knowdb.toml ──► loader：装载权威 SQLite（create/insert/data.csv）
+                   │
+                   ▼
+            facade（统一查询门面）──► provider
+                                      ├─ SQLite 权威库（默认，本地产物 authority.sqlite）
+                                      ├─ PostgreSQL（命名参数 :name → $1/$2...）
+                                      └─ MySQL（原生 :name）
+```
 
-示例：
+### 数据装载与权威库
+
+`loader` 按 `knowdb.toml` 的表目录生成类型化 SQL 并重灌权威 SQLite 库；每张表可声明
+`refresh` 周期，由刷新服务周期重载（见下）。装载失败/表禁用/空表都有明确错误语义，
+集成在 `loader::reload_table_rows` 单测中覆盖。
+
+### 外部 PostgreSQL / MySQL
+
+在 `knowdb.toml` 声明 `[provider]` 后**不再构建本地 authority.sqlite**：
 
 ```toml
 version = 2
@@ -86,66 +80,29 @@ capacity = 1024
 ttl_ms = 30000
 
 [provider]
-kind = "postgres"
+kind = "postgres"            # 或 "mysql"
 connection_uri = "postgres://user:${SEC_PWD}@127.0.0.1:5432/demo"
 pool_size = 8
 ```
 
-```toml
-version = 2
-
-[cache]
-enabled = true
-capacity = 1024
-ttl_ms = 30000
-
-[provider]
-kind = "mysql"
-connection_uri = "mysql://user:${SEC_PWD}@127.0.0.1:3306/demo"
-pool_size = 8
-```
-
-命名参数在 PostgreSQL 中会自动从 `:name` 重写为 `$1/$2/...`；MySQL provider 原生支持 `:name` 命名参数。调用层都不需要改 SQL 写法。
-
-`[cache]` 目前只有 3 个配置项：
-
-- `enabled`
-  控制 `result cache` 总开关；设为 `false` 后，原本会走 `UseGlobal` 的查询也会被强制降级为 `Bypass`
-- `capacity`
-  控制 `result cache` 最大条目数，单位是 entries，不是字节；`1024` 表示最多缓存 1024 条查询结果
-- `ttl_ms`
-  控制 `result cache` 的 TTL，单位是毫秒；外部 PostgreSQL / MySQL 数据发生变化但宿主没有 reload engine 时，依赖这个 TTL 做兜底失效
-
-3 类 cache 的边界如下：
-
-- `result cache`
-  缓存查询结果集，受 `[cache]` 控制
-- `local cache`
-  历史调用期局部缓存，只在单次调用范围内复用，不受 `[cache]` 控制
-- `metadata cache`
-  缓存列名等元数据，不受 `[cache]` 控制
-
-失效机制说明：
-
-- reload knowdb、替换 provider 或 generation 变化时，`result cache` 会整体失效
-- 外部数据源内容变化但宿主没有 reload 时，`result cache` 依赖 `ttl_ms` 到期后重新取数
-- 当前没有对外部 PostgreSQL / MySQL 自动做 CDC、表版本号探测或事件通知接入
-
-查询示例：
+- 推荐 `facade::query_fields / cache_query_fields`（provider-neutral 参数接口）；
+  `query_named / cache_query` 保留为兼容旧 SQLite 参数的 wrapper。
+- `[cache]` 仅控制 **result cache**：`enabled`（总开关，false → `UseGlobal` 降级
+  `Bypass`）、`capacity`（条目数）、`ttl_ms`（外部数据变化而宿主未 reload 时的兜底失效）。
+  `local cache` 与 `metadata cache` 不受其控制。
+- reload / provider 替换 / generation 变化 → result cache 整体失效；外部数据源目前
+  **不做** CDC、表版本探测或事件通知。
 
 ```rust
 use wp_knowledge::facade;
 use wp_model_core::model::DataField;
 
 let params = [DataField::from_chars(":name".to_string(), "令狐冲".to_string())];
-let row = facade::query_fields(
-    "SELECT pinying FROM example WHERE name=:name",
-    &params,
-)?;
+let row = facade::query_fields("SELECT pinying FROM example WHERE name=:name", &params)?;
 # Ok::<(), wp_error::Error2>(())
 ```
 
-Telemetry bridge 示例：
+#### Telemetry
 
 ```rust
 use std::sync::Arc;
@@ -158,93 +115,73 @@ use wp_knowledge::telemetry::{
 struct MyTelemetry;
 
 impl KnowledgeTelemetry for MyTelemetry {
-    fn on_cache(&self, event: &CacheTelemetryEvent) {
-        let _ = event;
-    }
-
-    fn on_reload(&self, event: &ReloadTelemetryEvent) {
-        let _ = event;
-    }
-
-    fn on_query(&self, event: &QueryTelemetryEvent) {
-        let _ = event;
-    }
+    fn on_cache(&self, event: &CacheTelemetryEvent) { let _ = event; }
+    fn on_reload(&self, event: &ReloadTelemetryEvent) { let _ = event; }
+    fn on_query(&self, event: &QueryTelemetryEvent) { let _ = event; }
 }
 
 let _previous = facade::install_runtime_telemetry(Arc::new(MyTelemetry));
 ```
 
-## 测试外部 Provider
+### 定期刷新：换代、信号与函数取数
 
-仓库里现在内置 PostgreSQL 和 MySQL 的 `ignored` 集成测试。
+```text
+调用者(boot)                    knowdb(RefreshService + TableStore)        调用者(daemon)
+    │  register RefreshSpec ───────────▶│                                      │
+    │  load_rows 同步装载(seed)          ├─ tick: reload(spec)                 │
+    │                                    │   └─ 成功 → store 换代(Arc)          │
+    │                                    │             + 信号 {name} ─────────▶│ snapshot(name)
+    │                                    │                                      │ 函数 pull → 搬入
+```
 
-依赖本机或外部现成 PostgreSQL 的手工测试：
+- 每表一条 `RefreshSpec` 独立计时；tick 重载成功 → `TableStore::insert` **O(1) Arc 换代** → 纯信号；
+- 调用者以 `TableStore::snapshot` **函数取数**（Arc 零复制、不可变代共享、信号可丢无害）；
+- 同名 spec 自动去重（保留首个）；失败跳周期、保留上一代；
+- NamedSql 的 `code` 块用 **VEL** 按 knowdb 时钟求值替换 `$name`（内建 `phase_now/phase_next`）。
+
+> 完整机制、宿主接入样板与边界语义见 [定期刷新与 VEL 指南](docs/zh/guides/refresh.md)（[EN](docs/en/guides/refresh.md)）。
+
+## 📚 文档
+
+| 主题 | 中文 | English |
+|---|---|---|
+| 文档索引 | [docs/zh](docs/zh/README.md) | [docs/en](docs/en/README.md) |
+| KnowDB 配置 | [config](docs/zh/guides/config.md) | [config](docs/en/guides/config.md) |
+| 定期刷新与 VEL | [refresh](docs/zh/guides/refresh.md) | [refresh](docs/en/guides/refresh.md) |
+| Provider 与 Cache 架构 | [provider-cache](docs/zh/architecture/provider-cache.md) | [provider-cache](docs/en/architecture/provider-cache.md) |
+| Async Provider 性能 | [async-provider](docs/zh/performance/async-provider.md) | [async-provider](docs/en/performance/async-provider.md) |
+
+## 🧪 测试外部 Provider
+
+PostgreSQL / MySQL 集成测试默认 `ignored`，需要显式运行。
+
+**自备数据库（任意 host）：**
 
 ```bash
-docker compose -f tests/docker-compose.yml up -d
 export WP_KDB_TEST_POSTGRES_URL='postgres://postgres:demo@127.0.0.1:5432/postgres'
 cargo test --test postgres_provider -- --ignored --nocapture
-docker compose -f tests/docker-compose.yml down -v
-```
 
-这条测试默认是 `ignored`。只有你显式运行它时才会执行；如果环境变量未设置，或者 PostgreSQL 不可达，测试会直接失败并给出明确原因。
-
-如果你要连现成的 PostgreSQL，只需要把 `WP_KDB_TEST_POSTGRES_URL` 替换成自己的连接串。仓库内置 Compose 配置见 [tests/docker-compose.yml](tests/docker-compose.yml)。
-
-也可以直接执行仓库脚本：
-
-```bash
-bash tests/test-postgres-provider-correctness.sh
-bash tests/test-postgres-provider-perf.sh
-```
-
-如果你想沿用旧入口，也可以执行：
-
-```bash
-bash tests/test-postgres-provider.sh
-```
-
-默认会在测试结束后执行 `docker compose down -v`；如果你想保留数据库容器和数据卷，执行 `KEEP_DB=1 bash tests/test-postgres-provider-correctness.sh` 或 `KEEP_DB=1 bash tests/test-postgres-provider-perf.sh`。如果要覆盖默认连接串，执行 `TEST_URL='postgres://user:pass@127.0.0.1:5432/db' bash tests/test-postgres-provider-correctness.sh`。
-
-如果你想并行运行多个 provider 脚本，可以分别覆盖不同的 `COMPOSE_PROJECT_NAME`。
-
-依赖本机或外部现成 MySQL 的手工测试：
-
-```bash
 export WP_KDB_TEST_MYSQL_URL='mysql://root:demo@127.0.0.1:3306/demo'
 cargo test --test mysql_provider -- --ignored --nocapture
 ```
 
-这条测试同样默认是 `ignored`，只在显式执行时运行。
-
-如果你想用仓库内置的 MySQL 容器，也可以直接执行：
+**内置 Compose / 一键脚本（含 PG 与 MySQL 的 correctness / perf）：**
 
 ```bash
+bash tests/test-postgres-provider-correctness.sh
+bash tests/test-postgres-provider-perf.sh
 bash tests/test-mysql-provider-correctness.sh
 bash tests/test-mysql-provider-perf.sh
 ```
 
-如果你想沿用旧入口，也可以执行：
+- 默认结束后 `docker compose down -v`；保留容器/数据卷加 `KEEP_DB=1`，覆盖连接串加
+  `TEST_URL=...`，并行跑多个 provider 用不同 `COMPOSE_PROJECT_NAME`；
+- 自包含 testcontainers：`cargo test --test postgres_testcontainers -- --ignored --test-threads=1`
+  （要求本机 Docker daemon，首次会自动拉取镜像）。
 
-```bash
-bash tests/test-mysql-provider.sh
-```
+## 🔧 开发
 
-默认会在测试结束后执行 `docker compose down -v`；如果你想保留数据库容器和数据卷，执行 `KEEP_DB=1 bash tests/test-mysql-provider-correctness.sh` 或 `KEEP_DB=1 bash tests/test-mysql-provider-perf.sh`。如果要覆盖默认连接串，执行 `TEST_URL='mysql://user:pass@127.0.0.1:3306/db' bash tests/test-mysql-provider-correctness.sh`。
-
-如果你想并行运行多个 provider 脚本，可以分别覆盖不同的 `COMPOSE_PROJECT_NAME`。
-
-自包含的 `testcontainers` 测试：
-
-```bash
-cargo test --test postgres_testcontainers -- --ignored --test-threads=1
-```
-
-这条测试要求本机 Docker daemon 可用；首次执行通常还会拉取 PostgreSQL 镜像，不需要预先安装或手工准备 PostgreSQL。
-
-## 开发
-
-独立仓库下建议执行：
+独立仓库下建议：
 
 ```bash
 cargo fmt --all
@@ -252,6 +189,6 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features -- --test-threads=1
 ```
 
-## 许可证
+## 📄 许可证
 
-Apache-2.0，见 [LICENSE](LICENSE)。
+Apache-2.0，见 [LICENSE](LICENSE)。相关工程：[warp-parse 技术栈](https://github.com/wp-labs)。
