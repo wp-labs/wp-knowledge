@@ -4,6 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/wp-knowledge.svg?logo=rust)](https://crates.io/crates/wp-knowledge)
 [![docs.rs](https://img.shields.io/docsrs/wp-knowledge?logo=docsdotrs)](https://docs.rs/wp-knowledge)
 [![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![coverage](https://img.shields.io/badge/coverage-65%25-brightgreen)](docs/coverage.md)
 
 > 数据驱动的 **KnowDB 查询与 Provider 组件**：一份 `knowdb.toml` 同时定义“数据从哪来、怎么装载、查哪个库”，并以统一查询门面访问 **SQLite（权威库）/ PostgreSQL / MySQL**。
 
@@ -155,6 +156,8 @@ let _previous = facade::install_runtime_telemetry(Arc::new(MyTelemetry));
 | 定期刷新与 VEL | [refresh](docs/zh/guides/refresh.md) | [refresh](docs/en/guides/refresh.md) |
 | Provider 与 Cache 架构 | [provider-cache](docs/zh/architecture/provider-cache.md) | [provider-cache](docs/en/architecture/provider-cache.md) |
 | Async Provider 性能 | [async-provider](docs/zh/performance/async-provider.md) | [async-provider](docs/en/performance/async-provider.md) |
+
+单测覆盖率快照见 [docs/coverage.md](docs/coverage.md)（`cargo llvm-cov --lib` 口径）。
 
 ## 🧪 测试外部 Provider
 
