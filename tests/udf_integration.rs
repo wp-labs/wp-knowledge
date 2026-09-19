@@ -92,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_{table}_end   ON {table}(ip_end_int);
         )],
     )
     .expect("query cidr contains");
-    assert_eq!(rows[0].to_string(), "digit(1)");
+    assert_eq!(rows[0].to_string(), "int(1)");
 
     // 4) cleanup
     let _ = std::fs::remove_dir_all(&root);

@@ -537,7 +537,7 @@ fn bind_postgres_field<'q>(
 ) -> sqlx::query::Query<'q, Postgres, PgArguments> {
     match field.get_value() {
         Value::Bool(value) => query.bind(*value),
-        Value::Digit(value) => query.bind(*value),
+        Value::Int(value) => query.bind(*value),
         // 任意精度整数：绑定为 PostgreSQL numeric（BigDecimal），无精度损失
         Value::BigUint(value) => {
             let dec = BigDecimal::from(BigInt::from_biguint(Sign::Plus, value.clone()));
@@ -848,19 +848,19 @@ fn decode_postgres_integer(
     let field = match ty {
         "INT2" => row
             .try_get::<i16, _>(idx)
-            .map(|value| DataField::from_digit(name.to_string(), i64::from(value)))
+            .map(|value| DataField::from_int(name.to_string(), i64::from(value)))
             .map_err(pg_decode_err)?,
         "INT4" => row
             .try_get::<i32, _>(idx)
-            .map(|value| DataField::from_digit(name.to_string(), i64::from(value)))
+            .map(|value| DataField::from_int(name.to_string(), i64::from(value)))
             .map_err(pg_decode_err)?,
         "INT8" => row
             .try_get::<i64, _>(idx)
-            .map(|value| DataField::from_digit(name.to_string(), value))
+            .map(|value| DataField::from_int(name.to_string(), value))
             .map_err(pg_decode_err)?,
         "OID" => row
             .try_get::<Oid, _>(idx)
-            .map(|value| DataField::from_digit(name.to_string(), i64::from(value.0)))
+            .map(|value| DataField::from_int(name.to_string(), i64::from(value.0)))
             .map_err(pg_decode_err)?,
         _ => return Ok(None),
     };
@@ -1082,7 +1082,7 @@ WHERE id = :id
   -- :ignored
   /* :ignored */
 "#;
-        let params = [DataField::from_digit(":id", 7)];
+        let params = [DataField::from_int(":id", 7)];
         let (rewritten, ordered) = rewrite_sql(sql, &params).expect("rewrite sql");
         assert!(rewritten.contains("payload::jsonb"));
         assert!(rewritten.contains("id = $1"));
@@ -1095,7 +1095,7 @@ WHERE id = :id
     #[test]
     fn rewrite_sql_reuses_same_placeholder_for_duplicate_param() {
         let sql = "SELECT * FROM demo WHERE left_id=:id OR right_id=:id";
-        let params = [DataField::from_digit(":id", 7)];
+        let params = [DataField::from_int(":id", 7)];
         let (rewritten, ordered) = rewrite_sql(sql, &params).expect("rewrite sql");
         assert_eq!(
             rewritten,

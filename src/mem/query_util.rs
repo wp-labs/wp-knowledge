@@ -196,7 +196,7 @@ fn map_row(row: &rusqlite::Row<'_>, col_names: &[String]) -> KnowledgeResult<Row
             rusqlite::types::ValueRef::Null => {
                 DataField::new(model::DataType::default(), col_name, model::Value::Null)
             }
-            rusqlite::types::ValueRef::Integer(v) => DataField::from_digit(col_name, v),
+            rusqlite::types::ValueRef::Integer(v) => DataField::from_int(col_name, v),
             rusqlite::types::ValueRef::Real(v) => DataField::from_float(col_name, v),
             rusqlite::types::ValueRef::Text(v) => DataField::from_chars(
                 col_name,
@@ -447,7 +447,7 @@ mod tests {
 
         let row = query_first_row(&conn, "SELECT id, name FROM test ORDER BY id", []).unwrap();
         assert_eq!(row.len(), 2);
-        assert_eq!(row[0].to_string(), "digit(1)");
+        assert_eq!(row[0].to_string(), "int(1)");
         assert_eq!(row[1].to_string(), "chars(first)");
     }
 

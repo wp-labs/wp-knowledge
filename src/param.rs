@@ -37,7 +37,7 @@ fn data_field_from_sql_output(name: String, output: ToSqlOutput<'_>) -> Knowledg
 fn data_field_from_value_ref(name: String, value: ValueRef<'_>) -> KnowledgeResult<DataField> {
     Ok(match value {
         ValueRef::Null => DataField::new(DataType::default(), name, Value::Null),
-        ValueRef::Integer(value) => DataField::from_digit(name, value),
+        ValueRef::Integer(value) => DataField::from_int(name, value),
         ValueRef::Real(value) => DataField::from_float(name, value),
         ValueRef::Text(value) => DataField::from_chars(
             name,
@@ -56,7 +56,7 @@ fn data_field_from_value_ref(name: String, value: ValueRef<'_>) -> KnowledgeResu
 fn data_field_from_value(name: String, value: SqlValue) -> DataField {
     match value {
         SqlValue::Null => DataField::new(DataType::default(), name, Value::Null),
-        SqlValue::Integer(value) => DataField::from_digit(name, value),
+        SqlValue::Integer(value) => DataField::from_int(name, value),
         SqlValue::Real(value) => DataField::from_float(name, value),
         SqlValue::Text(value) => DataField::from_chars(name, value),
         SqlValue::Blob(value) => {

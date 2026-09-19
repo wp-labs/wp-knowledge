@@ -92,5 +92,5 @@ fn query_zone_table_segments() {
 
     let count = kdb::query_row("SELECT COUNT(*) AS total FROM zone").expect("row count");
     assert_eq!(count.len(), 1);
-    assert_eq!(count[0].to_string(), "digit(4)");
+    assert_eq!(count[0].to_string(), "int(4)");
 }

@@ -1099,7 +1099,7 @@ mod tests {
 
         let row = query_fields_async(
             "SELECT value FROM async_kv WHERE id=:id",
-            &[DataField::from_digit(":id", 1)],
+            &[DataField::from_int(":id", 1)],
         )
         .await
         .expect("query async row");
@@ -1119,8 +1119,8 @@ mod tests {
         (0..ops)
             .map(|idx| {
                 let id = ((idx * 17) % hotset + 1) as i64;
-                let cache_key = [DataField::from_digit("id", id)];
-                let query_params = [DataField::from_digit(":id", id)];
+                let cache_key = [DataField::from_int("id", id)];
+                let query_params = [DataField::from_int(":id", id)];
                 let bypass_req = QueryRequest::first_row(
                     "SELECT value FROM perf_kv WHERE id=:id",
                     fields_to_params(&query_params),
@@ -1470,8 +1470,8 @@ connection_uri = "{connection_uri}"
             .expect("seed table");
         init_mem_provider(db).expect("init provider");
 
-        let key = [DataField::from_digit("id", 1)];
-        let params = [DataField::from_digit(":id", 1)];
+        let key = [DataField::from_int("id", 1)];
+        let params = [DataField::from_int(":id", 1)];
         let mut cache = FieldQueryCache::default();
 
         let first = cache_query_fields_async(
@@ -1505,8 +1505,8 @@ connection_uri = "{connection_uri}"
             .expect("seed db1");
         init_mem_provider(db1).expect("init provider db1");
 
-        let key = [DataField::from_digit("id", 1)];
-        let params = [DataField::from_digit(":id", 1)];
+        let key = [DataField::from_int("id", 1)];
+        let params = [DataField::from_int(":id", 1)];
         let mut cache = FieldQueryCache::default();
         let row = cache_query_fields(
             "SELECT value FROM t WHERE id=:id",
@@ -1548,8 +1548,8 @@ connection_uri = "{connection_uri}"
             .expect("seed t2");
         init_mem_provider(db).expect("init provider");
 
-        let key = [DataField::from_digit("id", 1)];
-        let params = [DataField::from_digit(":id", 1)];
+        let key = [DataField::from_int("id", 1)];
+        let params = [DataField::from_int(":id", 1)];
         let mut cache = FieldQueryCache::default();
 
         let row = cache_query_fields(
@@ -1582,8 +1582,8 @@ connection_uri = "{connection_uri}"
         init_mem_provider(db).expect("init provider");
 
         let mut cache = FieldQueryCache::default();
-        let key = [DataField::from_digit("id", 1)];
-        let params = [DataField::from_digit(":id", 1)];
+        let key = [DataField::from_int("id", 1)];
+        let params = [DataField::from_int(":id", 1)];
         let row = cache_query_fields(
             "SELECT value FROM t WHERE id=:id",
             &key,
@@ -1684,8 +1684,8 @@ connection_uri = "{connection_uri}"
 
         let before = runtime_snapshot();
         let mut cache = FieldQueryCache::default();
-        let key = [DataField::from_digit("id", 1)];
-        let params = [DataField::from_digit(":id", 1)];
+        let key = [DataField::from_int("id", 1)];
+        let params = [DataField::from_int(":id", 1)];
         let row = cache_query_fields(
             "SELECT value FROM t WHERE id=:id",
             &key,
@@ -1724,8 +1724,8 @@ connection_uri = "{connection_uri}"
         init_mem_provider(db).expect("init provider");
 
         let mut cache = FieldQueryCache::default();
-        let key = [DataField::from_digit("id", 1)];
-        let params = [DataField::from_digit(":id", 1)];
+        let key = [DataField::from_int("id", 1)];
+        let params = [DataField::from_int(":id", 1)];
         let row = cache_query_fields(
             "SELECT value FROM t WHERE id=:id",
             &key,
@@ -1829,7 +1829,7 @@ connection_uri = "{connection_uri}"
 
         let req = QueryRequest::first_row(
             "SELECT value FROM example WHERE id=:id",
-            fields_to_params(&[DataField::from_digit(":id", 1)]),
+            fields_to_params(&[DataField::from_int(":id", 1)]),
             CachePolicy::UseGlobal,
         );
         let before = runtime_snapshot();
@@ -1880,7 +1880,7 @@ connection_uri = "{connection_uri}"
 
         let req = QueryRequest::first_row(
             "SELECT value FROM example WHERE id=:id",
-            fields_to_params(&[DataField::from_digit(":id", 1)]),
+            fields_to_params(&[DataField::from_int(":id", 1)]),
             CachePolicy::UseGlobal,
         );
         let before = runtime_snapshot();
@@ -1993,8 +1993,8 @@ connection_uri = "{connection_uri}"
         install_named_mem_provider("geo", db_geo);
 
         let sql = "SELECT value FROM route_t WHERE id=:id";
-        let c_params = [DataField::from_digit("id", 1)];
-        let query_params = [DataField::from_digit(":id", 1)];
+        let c_params = [DataField::from_int("id", 1)];
+        let query_params = [DataField::from_int(":id", 1)];
         let mut cache = FieldQueryCache::default();
 
         let named =
@@ -2036,8 +2036,8 @@ connection_uri = "{connection_uri}"
         install_named_mem_provider("geo", db_geo);
 
         let sql = "SELECT value FROM t WHERE id=:id";
-        let c_params = [DataField::from_digit("id", 1)];
-        let query_params = [DataField::from_digit(":id", 1)];
+        let c_params = [DataField::from_int("id", 1)];
+        let query_params = [DataField::from_int(":id", 1)];
         let mut cache = FieldQueryCache::default();
 
         let before = runtime_snapshot();
@@ -2097,8 +2097,8 @@ connection_uri = "{connection_uri}"
         let _guard = crate::runtime::runtime_test_guard()
             .lock()
             .expect("provider test guard");
-        let c_params = [DataField::from_digit("id", 1)];
-        let query_params = [DataField::from_digit(":id", 1)];
+        let c_params = [DataField::from_int("id", 1)];
+        let query_params = [DataField::from_int(":id", 1)];
         let mut cache = FieldQueryCache::default();
         let out = cache_query_fields_route(
             Some("nope"),

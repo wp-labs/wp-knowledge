@@ -60,7 +60,7 @@ impl FieldQueryCache {
     fn get_idx(&self, param: &DataField) -> Option<usize> {
         match param.get_value() {
             Value::Chars(v) => self.str_idx.get(v).copied(),
-            Value::Digit(v) => self.i64_idx.get(v).copied(),
+            Value::Int(v) => self.i64_idx.get(v).copied(),
             Value::IpAddr(v) => self.ip_idx.get(v).copied(),
             Value::BigUint(v) => self.biguint_idx.get(v).copied(),
             Value::Bool(v) => self.bool_idx.get(v).copied(),
@@ -113,7 +113,7 @@ impl FieldQueryCache {
                     Some(self.idx_num)
                 }
             }
-            Value::Digit(v) => {
+            Value::Int(v) => {
                 if let Some(idx) = self.i64_idx.get(v) {
                     Some(*idx)
                 } else {
@@ -499,7 +499,7 @@ mod tests {
     }
 
     fn result_row(v: u64) -> Vec<DataField> {
-        vec![DataField::from_digit("country_iso_code", v as i64)]
+        vec![DataField::from_int("country_iso_code", v as i64)]
     }
 
     #[test]
@@ -536,7 +536,7 @@ mod tests {
         let mut cache = FieldQueryCache::default();
         let big = biguint_field(1);
         let chars = DataField::from_chars("k", "1");
-        let digit = DataField::from_digit("k", 1);
+        let digit = DataField::from_int("k", 1);
         let ip = DataField::from_ip("k", IpAddr::from([1, 1, 1, 1]));
 
         cache.save(&[big.clone()], result_row(1));

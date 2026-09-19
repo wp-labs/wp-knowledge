@@ -1348,7 +1348,7 @@ fn stable_field_params_hash(params: &[DataField]) -> u64 {
                 1u8.hash(&mut hasher);
                 value.hash(&mut hasher);
             }
-            Value::Digit(value) => {
+            Value::Int(value) => {
                 2u8.hash(&mut hasher);
                 value.hash(&mut hasher);
             }
@@ -1424,7 +1424,7 @@ pub fn fields_to_params(params: &[DataField]) -> Vec<QueryParam> {
             let value = match field.get_value() {
                 Value::Null | Value::Ignore(_) => QueryValue::Null,
                 Value::Bool(value) => QueryValue::Bool(*value),
-                Value::Digit(value) => QueryValue::Int(*value),
+                Value::Int(value) => QueryValue::Int(*value),
                 Value::Float(value) => QueryValue::Float(*value),
                 Value::Chars(value) => QueryValue::Text(value.to_string()),
                 Value::Symbol(value) => QueryValue::Text(value.to_string()),
@@ -1460,7 +1460,7 @@ pub fn params_to_fields(params: &[QueryParam]) -> Vec<DataField> {
             QueryValue::Bool(value) => {
                 DataField::new(DataType::default(), param.name.clone(), Value::Bool(*value))
             }
-            QueryValue::Int(value) => DataField::from_digit(param.name.clone(), *value),
+            QueryValue::Int(value) => DataField::from_int(param.name.clone(), *value),
             QueryValue::Float(value) => DataField::from_float(param.name.clone(), *value),
             QueryValue::Text(value) => DataField::from_chars(param.name.clone(), value.clone()),
         })

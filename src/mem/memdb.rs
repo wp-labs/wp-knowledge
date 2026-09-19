@@ -80,7 +80,7 @@ impl ToSql for SqlNamedParam {
             model::Value::Chars(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
             model::Value::Symbol(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
             model::Value::Time(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
-            model::Value::Digit(v) => Ok(ToSqlOutput::Owned(Value::Integer(*v))),
+            model::Value::Int(v) => Ok(ToSqlOutput::Owned(Value::Integer(*v))),
             // 任意精度整数：超出 i64 范围，以十进制文本绑定；SQLite 数值比较按 affinity 自动转换
             model::Value::BigUint(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
             model::Value::Hex(v) => Ok(ToSqlOutput::Owned(Value::Text(v.to_string()))),
@@ -660,7 +660,7 @@ mod tests {
             let p = [SqlNamedParam(DataField::from_bool(":v", true))];
             db.query_row_params(sql, &p.to_params())?;
             let row = db.query_row("SELECT v FROM p ORDER BY rowid DESC LIMIT 1")?;
-            assert!(matches!(row[0].get_value(), model::Value::Digit(1)));
+            assert!(matches!(row[0].get_value(), model::Value::Int(1)));
         }
         // Null
         {
@@ -717,7 +717,7 @@ mod tests {
         }
         // Array -> text (debug)
         {
-            let arr = vec![DataField::from_chars("", "a"), DataField::from_digit("", 1)];
+            let arr = vec![DataField::from_chars("", "a"), DataField::from_int("", 1)];
             let sql = "INSERT INTO p (v) VALUES (:v)";
             let p = [SqlNamedParam(DataField::from_arr(":v", arr))];
             db.query_row_params(sql, &p.to_params())?;
@@ -780,7 +780,7 @@ mod tests {
         }
         let row = db.query_row("SELECT SUM(v) AS total FROM concur")?;
         // total should be 40
-        assert_eq!(row[0].to_string(), "digit(40)");
+        assert_eq!(row[0].to_string(), "int(40)");
         Ok(())
     }
 

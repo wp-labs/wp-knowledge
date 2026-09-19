@@ -78,7 +78,7 @@ VALUES
 
 fn datafield_digit(field: &DataField) -> i64 {
     match field.get_value() {
-        Value::Digit(value) => *value,
+        Value::Int(value) => *value,
         other => panic!("expected digit field, got {other:?}"),
     }
 }
@@ -280,9 +280,9 @@ fn build_perf_workload(ops: usize, hotset: usize) -> Vec<PerfQuery> {
     (0..ops)
         .map(|idx| {
             let id = ((idx * 17) % hotset + 1) as i64;
-            let cache_key = [DataField::from_digit("id", id)];
-            let query_params = [DataField::from_digit(":id", id)];
-            let bypass_params = [DataField::from_digit(":id".to_string(), id)];
+            let cache_key = [DataField::from_int("id", id)];
+            let query_params = [DataField::from_int(":id", id)];
+            let bypass_params = [DataField::from_int(":id".to_string(), id)];
             let global_req = QueryRequest::first_row(
                 "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
                 fields_to_params(&query_params),
@@ -536,7 +536,7 @@ fn print_concurrent_latency_result(provider: &str, result: &ConcurrentLatencyRes
 
 fn run_postgres_sync_latency(url: &str, workload: &[PerfQuery]) -> LatencyResult {
     kdb::init_postgres_provider(url, Some(8)).expect("init postgres provider for sync latency");
-    let warm = [DataField::from_digit(":id", 1)];
+    let warm = [DataField::from_int(":id", 1)];
     let _ = kdb::query_fields(
         "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
         &warm,
@@ -573,7 +573,7 @@ fn run_postgres_async_latency(url: &str, workload: &[PerfQuery]) -> LatencyResul
     rt.block_on(async {
         kdb::init_postgres_provider(url, Some(8))
             .expect("init postgres provider for async latency");
-        let warm = [DataField::from_digit(":id", 1)];
+        let warm = [DataField::from_int(":id", 1)];
         let _ = kdb::query_fields_async(
             "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
             &warm,
@@ -625,7 +625,7 @@ fn run_postgres_async_cache_concurrency(
     rt.block_on(async move {
         match mode {
             AsyncPerfMode::Bypass => {
-                let warm = [DataField::from_digit(":id", 1)];
+                let warm = [DataField::from_int(":id", 1)];
                 let _ = kdb::query_fields_async(
                     "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
                     &warm,
@@ -636,7 +636,7 @@ fn run_postgres_async_cache_concurrency(
             AsyncPerfMode::GlobalCache => {
                 let req = QueryRequest::first_row(
                     "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
-                    fields_to_params(&[DataField::from_digit(":id", 1)]),
+                    fields_to_params(&[DataField::from_int(":id", 1)]),
                     CachePolicy::UseGlobal,
                 );
                 let _ = runtime()
@@ -646,8 +646,8 @@ fn run_postgres_async_cache_concurrency(
             }
             AsyncPerfMode::LocalCache => {
                 let mut cache = FieldQueryCache::with_capacity(16);
-                let cache_key = [DataField::from_digit("id", 1)];
-                let query_params = [DataField::from_digit(":id", 1)];
+                let cache_key = [DataField::from_int("id", 1)];
+                let query_params = [DataField::from_int(":id", 1)];
                 let _ = kdb::cache_query_fields_async(
                     "SELECT value FROM wp_knowledge_pg_perf_lookup WHERE id=:id",
                     &cache_key,

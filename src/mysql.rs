@@ -603,7 +603,7 @@ fn bind_mysql_field<'q>(
 ) -> sqlx::query::Query<'q, MySql, MySqlArguments> {
     match field.get_value() {
         Value::Bool(value) => query.bind(*value),
-        Value::Digit(value) => query.bind(*value),
+        Value::Int(value) => query.bind(*value),
         // 任意精度整数：绑定为 BigDecimal，MySQL 编码为 DECIMAL 值，无精度损失
         Value::BigUint(value) => {
             let dec = BigDecimal::from(BigInt::from_biguint(Sign::Plus, value.clone()));
@@ -689,10 +689,10 @@ fn decode_mysql_boolean(
     }
 
     row.try_get::<i8, _>(idx)
-        .map(|value| DataField::from_digit(name, i64::from(value)))
+        .map(|value| DataField::from_int(name, i64::from(value)))
         .or_else(|_| {
             row.try_get::<bool, _>(idx)
-                .map(|value| DataField::from_digit(name, if value { 1 } else { 0 }))
+                .map(|value| DataField::from_int(name, if value { 1 } else { 0 }))
         })
         .map(Some)
         .map_err(mysql_decode_err)
@@ -721,7 +721,7 @@ fn decode_mysql_integer(
             .try_get::<u64, _>(idx)
             .map(|value| {
                 if value <= i64::MAX as u64 {
-                    DataField::from_digit(name, value as i64)
+                    DataField::from_int(name, value as i64)
                 } else {
                     DataField::from_chars(name, value.to_string())
                 }
@@ -729,7 +729,7 @@ fn decode_mysql_integer(
             .map_err(mysql_decode_err)?,
         _ => row
             .try_get::<i64, _>(idx)
-            .map(|value| DataField::from_digit(name, value))
+            .map(|value| DataField::from_int(name, value))
             .map_err(mysql_decode_err)?,
     };
 
@@ -853,7 +853,7 @@ fn mysql_type_base_name(ty: &str) -> (&str, bool) {
 
 fn mysql_bit_u64_to_field(name: &str, value: u64) -> DataField {
     if value <= i64::MAX as u64 {
-        DataField::from_digit(name, value as i64)
+        DataField::from_int(name, value as i64)
     } else {
         DataField::from_chars(name, value.to_string())
     }
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn mysql_bit_u64_to_field_maps_small_bits_to_digit() {
         let field = mysql_bit_u64_to_field("flags", 0b1010);
-        assert_eq!(field.get_value(), &Value::Digit(10));
+        assert_eq!(field.get_value(), &Value::Int(10));
     }
 
     #[test]
