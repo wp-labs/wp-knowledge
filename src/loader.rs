@@ -11,6 +11,7 @@ use wp_log::info_ctrl;
 
 use crate::error::{KnowReason, KnowledgeResult};
 use crate::mem::memdb::MemDB;
+use crate::mem::{DBQuery, RowData};
 use orion_error::OperationContext;
 use orion_error::conversion::{SourceErr, SourceRawErr, ToStructError};
 use orion_variate::EnvDict;
@@ -468,6 +469,45 @@ pub fn build_authority_from_knowdb(
     }
     opx.mark_suc();
     Ok(loaded_names)
+}
+
+/// 重载权威库中的单表并返回其全部行（供 refresh 服务与宿主启动装载共用）。
+///
+/// 语义与启动装载一致：解析 `conf_path`（KnowDB V2）→ 打开/创建
+/// `authority_uri`（sqlite 文件）→ 对该表执行 create/clean/insert（重读 CSV）
+/// → `SELECT <columns.by_header> FROM <table>` 返回原生行。列类型由表目录的
+/// `create.sql` DDL 决定（引擎侧消费方在边界按自己的行契约转换，见
+/// wfusion baseline 设计 §11 M3b）。
+///
+/// 要求：`table` 在 conf 中启用，且 `columns.by_header` 非空（refresh 投影
+/// 需要可名列；纯 `by_index` 表请先补 `columns.by_header`）。
+pub fn reload_table_rows(
+    root: &Path,
+    conf_path: &Path,
+    authority_uri: &str,
+    table: &str,
+    dict: &EnvDict,
+) -> KnowledgeResult<Vec<RowData>> {
+    let (conf, _conf_abs, base_dir) = parse_knowdb_conf(root, conf_path, dict)?;
+    let spec = conf
+        .tables
+        .iter()
+        .find(|t| t.enabled && t.name == table)
+        .ok_or_else(|| {
+            KnowReason::from_conf()
+                .to_err()
+                .with_detail(format!("refresh table {table:?} not found or disabled"))
+        })?;
+    if spec.columns.by_header.is_empty() {
+        return Err(KnowReason::from_conf().to_err().with_detail(format!(
+            "refresh table {table:?} requires columns.by_header for row projection"
+        )));
+    }
+    let db = open_authority(authority_uri)?;
+    load_one_table(&db, &base_dir, spec, &conf.csv, &conf.default)?;
+    let cols = spec.columns.by_header.join(", ");
+    let sql = format!("SELECT {cols} FROM {}", spec.name);
+    db.query(&sql)
 }
 
 pub fn parse_knowdb_conf(
@@ -1337,5 +1377,131 @@ key = "app_config"
         let spec = conf.fun.get("app_config").expect("app_config");
         assert!(spec.cache);
         assert!(spec.ttl_ms.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // reload_table_rows（refresh 单表重载：CSV 覆盖 → 重读 → DDL 类型化投影行）
+    // -----------------------------------------------------------------------
+
+    /// 在临时 root 下铺一个可重载的 KnowDB V2 fixture（address 表）。
+    /// `rows_txt` = data.csv 全文（含表头）；DDL/insert 从仓库 knowdb/address 拷贝。
+    fn scaffold_reload_fixture(root: &std::path::Path, rows_txt: &str) {
+        let table_dir = root.join("address");
+        fs::create_dir_all(&table_dir).expect("create table dir");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("knowdb/address");
+        fs::copy(fixture.join("create.sql"), table_dir.join("create.sql")).expect("copy create");
+        fs::copy(fixture.join("insert.sql"), table_dir.join("insert.sql")).expect("copy insert");
+        fs::write(table_dir.join("data.csv"), rows_txt).expect("write data.csv");
+        fs::write(
+            root.join("knowdb.toml"),
+            r#"version = 2
+base_dir = "."
+
+[default]
+on_error = "fail"
+
+[[tables]]
+name = "address"
+dir = "address"
+enabled = true
+columns.by_header = ["value"]
+"#,
+        )
+        .expect("write conf");
+    }
+
+    fn reload_uri(tag: &str) -> String {
+        format!(
+            "file:{}/wf_loader_reload_{}_{}.sqlite",
+            std::env::temp_dir().display(),
+            tag,
+            std::process::id()
+        )
+    }
+
+    #[test]
+    fn reload_table_rows_reflects_csv_overwrite_and_projects_typed_rows() {
+        let root =
+            std::env::temp_dir().join(format!("wf_loader_reload_root_a_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        let dict = EnvDict::default();
+        let conf = PathBuf::from("knowdb.toml");
+
+        // 首次装载：3 行，列名 = value，DDL TEXT → Value::Chars / DataType::Chars
+        scaffold_reload_fixture(&root, "value\nv1\nv2\nv3\n");
+        let rows = reload_table_rows(&root, &conf, &reload_uri("a"), "address", &dict)
+            .expect("first load");
+        assert_eq!(rows.len(), 3);
+        let field = &rows[0][0];
+        assert_eq!(field.get_name(), "value");
+        assert_eq!(field.get_meta(), &wp_model_core::model::DataType::Chars);
+        assert!(matches!(
+            field.get_value(),
+            wp_model_core::model::Value::Chars(_)
+        ));
+
+        // CSV 覆盖 → 重载应反映新文件（3 → 1 行、内容 v9）
+        scaffold_reload_fixture(&root, "value\nv9\n");
+        let rows2 = reload_table_rows(&root, &conf, &reload_uri("a"), "address", &dict)
+            .expect("reload after overwrite");
+        assert_eq!(rows2.len(), 1, "重载应反映覆盖后的文件");
+        let field2 = &rows2[0][0];
+        assert_eq!(field2.get_name(), "value");
+        assert_eq!(field2.get_meta(), &wp_model_core::model::DataType::Chars);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn reload_table_rows_errors_on_unknown_disabled_and_by_index_only_tables() {
+        let root =
+            std::env::temp_dir().join(format!("wf_loader_reload_root_b_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create root");
+        fs::write(
+            root.join("knowdb.toml"),
+            r#"version = 2
+base_dir = "."
+
+[[tables]]
+name = "on"
+dir = "address"
+enabled = true
+columns.by_header = ["value"]
+
+[[tables]]
+name = "off"
+dir = "address"
+enabled = false
+columns.by_header = ["value"]
+
+[[tables]]
+name = "by_index"
+dir = "address"
+enabled = true
+columns.by_index = [0]
+"#,
+        )
+        .expect("write conf");
+        let dict = EnvDict::default();
+        let conf = PathBuf::from("knowdb.toml");
+
+        let err_unknown = reload_table_rows(&root, &conf, &reload_uri("b"), "ghost", &dict)
+            .expect_err("未知表应报错");
+        let msg = format!("{err_unknown}");
+        assert!(msg.contains("not found"), "unknown: {msg}");
+
+        let err_disabled = reload_table_rows(&root, &conf, &reload_uri("b"), "off", &dict)
+            .expect_err("禁用表应报错");
+        let msg = format!("{err_disabled}");
+        assert!(msg.contains("not found"), "disabled: {msg}");
+
+        let err_by_index = reload_table_rows(&root, &conf, &reload_uri("b"), "by_index", &dict)
+            .expect_err("纯 by_index 表应报错");
+        let msg = format!("{err_by_index}");
+        assert!(msg.contains("columns.by_header"), "by_index only: {msg}");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -3,6 +3,7 @@ mod fun;
 pub mod intranet_nets;
 pub mod mem;
 mod redis;
+pub mod refresh;
 pub use crate::mem::DBQuery;
 pub use crate::mem::memdb::MDBEnum;
 pub mod cache_util;
@@ -19,6 +20,7 @@ pub mod runtime;
 pub mod sql_route;
 pub mod sqlite_ext;
 pub mod telemetry;
+pub mod vel;
 
 #[allow(deprecated)]
 pub use error::{KnowReason, KnowledgeError, KnowledgeResult, Reason};
