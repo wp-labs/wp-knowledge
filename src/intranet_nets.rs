@@ -253,8 +253,11 @@ mod tests {
         let set = IntranetNetsSet::builtin();
         assert!(set.contains(&v4([10, 0, 0, 1])));
         assert!(set.contains(&v4([172, 16, 0, 1])));
-        assert!(set.contains(&v4([192, 168, 1, 1])));
         assert!(set.contains(&v4([127, 0, 0, 1])));
+        // RFC1918 192.168.0.0/16：网络地址、典型地址、广播地址均应判定为内网
+        assert!(set.contains(&v4([192, 168, 0, 0])));
+        assert!(set.contains(&v4([192, 168, 1, 1])));
+        assert!(set.contains(&v4([192, 168, 255, 255])));
     }
 
     #[test]
